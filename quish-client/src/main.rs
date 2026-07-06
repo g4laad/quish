@@ -1,11 +1,12 @@
 //! `quish` — the client CLI.
 //!
-//! Milestone 3: parse an ssh-style target, open a QUIC+H3 connection with
+//! Milestone 4: parse an ssh-style target, open a QUIC+H3 connection with
 //! web-PKI→TOFU server verification, authenticate the Extended CONNECT (password
-//! Basic or channel-bound pubkey Bearer), then round-trip one frame through the
-//! server's echo tunnel to prove the authed pipe.
+//! Basic or channel-bound pubkey Bearer), then open a shell (interactive PTY) or
+//! exec channel and pump it to completion, exiting with the remote status.
 
 mod connect;
+mod terminal;
 
 use std::future;
 
@@ -13,7 +14,7 @@ use anyhow::{Context, Result, bail};
 use bytes::Bytes;
 use clap::Parser;
 use h3::ext::Protocol;
-use quish_proto::{ChannelMessage, LEN_PREFIX, parse_len};
+use quish_proto::ChannelOpen;
 use tracing::info;
 
 /// quish client (HTTP/3 remote shell).
@@ -98,10 +99,13 @@ fn build_authorization(
 }
 
 fn main() -> Result<()> {
+    // Logs go to stderr and stay quiet by default: stdout is the remote channel's
+    // stdout (piping `quish host cmd > file` must yield clean output).
     tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "quish=info".into()),
+                .unwrap_or_else(|_| "quish=warn".into()),
         )
         .init();
 
@@ -112,13 +116,18 @@ fn main() -> Result<()> {
     let args = Args::parse();
     let target = parse_target(&args.target)?;
 
-    tokio::runtime::Builder::new_multi_thread()
+    let code = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?
-        .block_on(run(target, args.identity))
+        .block_on(run(target, args.identity, args.command))?;
+    std::process::exit(code);
 }
 
-async fn run(target: Target, identity: Option<std::path::PathBuf>) -> Result<()> {
+async fn run(
+    target: Target,
+    identity: Option<std::path::PathBuf>,
+    command: Vec<String>,
+) -> Result<i32> {
     let host_key = format!("{}:{}", target.host, target.port);
     let addr = tokio::net::lookup_host(&host_key)
         .await
@@ -181,52 +190,26 @@ async fn run(target: Target, identity: Option<std::path::PathBuf>) -> Result<()>
     }
     info!(user = %target.user, "session authenticated");
 
-    // Liveness proof (until M4 real channels): send one frame, expect it back.
-    let msg = ChannelMessage::Data(b"quish echo".to_vec());
-    stream
-        .send_data(Bytes::from(quish_proto::encode(&msg)?))
-        .await
-        .context("sending frame")?;
-    let body = read_frame(&mut stream).await?;
-    let got: ChannelMessage = quish_proto::decode(&body).context("decoding echo")?;
-    if got != msg {
-        bail!("echo mismatch: sent {msg:?}, got {got:?}");
-    }
-    stream.finish().await.context("finishing stream")?;
-    println!("quish: authenticated — CONNECT accepted and frame round-tripped");
+    // Open a channel on the authed stream: shell if no command, else exec.
+    let (send, recv) = stream.split();
+    let interactive = command.is_empty();
+    let (cols, rows) = terminal::winsize();
+    let open = if interactive {
+        ChannelOpen::Shell {
+            term: std::env::var("TERM").unwrap_or_else(|_| "xterm".into()),
+            cols,
+            rows,
+        }
+    } else {
+        ChannelOpen::Exec {
+            command: command.join(" "),
+        }
+    };
+    let code = terminal::run_channel(send, recv, open, interactive).await?;
 
     drop(send_request);
     let _ = drive.await;
-    Ok(())
-}
-
-/// Read exactly one length-prefixed frame body off the tunnel, buffering across
-/// H3 DATA chunks. Enforces the frame cap via [`parse_len`].
-async fn read_frame(
-    stream: &mut h3::client::RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
-) -> Result<Vec<u8>> {
-    use bytes::Buf;
-    let mut buf: Vec<u8> = Vec::new();
-    let mut need = LEN_PREFIX;
-    let mut body_len: Option<usize> = None;
-    loop {
-        while buf.len() >= need {
-            match body_len {
-                None => {
-                    let len = parse_len(buf[..LEN_PREFIX].try_into().unwrap())?;
-                    body_len = Some(len);
-                    need = LEN_PREFIX + len;
-                }
-                Some(len) => return Ok(buf[LEN_PREFIX..LEN_PREFIX + len].to_vec()),
-            }
-        }
-        let mut chunk = stream
-            .recv_data()
-            .await
-            .context("tunnel recv")?
-            .context("stream closed before frame completed")?;
-        buf.extend_from_slice(chunk.copy_to_bytes(chunk.remaining()).as_ref());
-    }
+    Ok(code)
 }
 
 #[cfg(test)]

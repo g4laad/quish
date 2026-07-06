@@ -3,7 +3,7 @@
 use std::{net::SocketAddr, sync::Arc};
 
 use anyhow::{Context, Result};
-use bytes::{Buf, Bytes};
+use bytes::Bytes;
 use h3::ext::Protocol;
 use http::{Method, Response, StatusCode};
 use quinn::crypto::rustls::QuicServerConfig;
@@ -143,21 +143,9 @@ async fn handle_request(
     info!(%user, "quish session authenticated");
     respond(&mut stream, StatusCode::OK).await?;
 
-    match echo_tunnel(&mut stream).await {
-        Ok(()) => Ok(()),
-        // Client hung up gracefully mid-tunnel — expected, not an error.
-        Err(e) if e.is_h3_no_error() => Ok(()),
-        Err(e) => Err(anyhow::anyhow!("tunnel: {e}")),
-    }
-}
-
-/// M2 liveness proof: echo every tunnelled chunk straight back.
-async fn echo_tunnel(stream: &mut ReqStream) -> Result<(), h3::error::StreamError> {
-    while let Some(mut chunk) = stream.recv_data().await? {
-        let bytes = chunk.copy_to_bytes(chunk.remaining());
-        stream.send_data(bytes).await?;
-    }
-    stream.finish().await
+    // The authed CONNECT stream becomes the channel: client sends ChannelOpen,
+    // then we run the PTY shell / exec and tunnel frames until it exits.
+    crate::session::serve(stream, &user).await
 }
 
 async fn respond(stream: &mut ReqStream, status: StatusCode) -> Result<()> {

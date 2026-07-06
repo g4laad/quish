@@ -6,6 +6,7 @@
 //! centralized anti-enumeration floor), then echoes frames to prove the pipe.
 //! Real sessions (M4) and privilege separation + PAM (M5) come later.
 
+mod session;
 mod transport;
 
 use std::{path::PathBuf, sync::Arc, time::Duration};
