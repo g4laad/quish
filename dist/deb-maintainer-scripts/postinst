@@ -1,0 +1,13 @@
+#!/bin/sh
+set -e
+
+# Create the `quish` privsep user from the shipped sysusers.d fragment. On Debian
+# the fragment is otherwise only applied at next boot by systemd-sysusers.service,
+# but quishd needs the account to exist before an admin can start it.
+if [ "$1" = "configure" ] && command -v systemd-sysusers >/dev/null 2>&1; then
+    systemd-sysusers /usr/lib/sysusers.d/quishd.conf >/dev/null 2>&1 || true
+fi
+
+# ponytail: not auto-enabled — quishd needs a host-key dir + config first.
+# Admin runs `systemctl enable --now quishd`. cargo-deb injects daemon-reload here.
+#DEBHELPER#

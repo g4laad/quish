@@ -4,6 +4,16 @@ version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+description = "quish — SSH-like remote shell client over HTTP/3"
+
+[package.metadata.deb]
+name = "quish"
+section = "net"
+priority = "optional"
+assets = [["../target/release/quish", "usr/bin/", "755"]]
+
+[package.metadata.generate-rpm]
+assets = [{ source = "target/release/quish", dest = "/usr/bin/quish", mode = "755" }]
 
 [[bin]]
 name = "quish"

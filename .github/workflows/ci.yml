@@ -61,6 +61,25 @@ jobs:
             target/release/quishd
             target/release/quish
 
+      - name: Install packaging tools
+        run: cargo install --locked cargo-deb cargo-generate-rpm
+
+      # --no-build/--no-strip: binaries are already built above and stripped by
+      # [profile.release] strip = true.
+      - name: Build .deb and .rpm
+        run: |
+          cargo deb --no-build --no-strip -p quish-server
+          cargo deb --no-build --no-strip -p quish-client
+          cargo generate-rpm -p quish-server
+          cargo generate-rpm -p quish-client
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: quish-packages
+          path: |
+            target/debian/*.deb
+            target/generate-rpm/*.rpm
+
   audit:
     runs-on: ubuntu-latest
     steps:

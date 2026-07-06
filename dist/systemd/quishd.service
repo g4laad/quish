@@ -10,7 +10,7 @@ Wants=network-online.target
 # worker, which chroots to RuntimeDirectory, setuids to `quish`, and sets
 # no_new_privs on itself — so the network-facing process is unprivileged.
 Type=simple
-ExecStart=/usr/local/bin/quishd --listen [::]:443 --privsep-user quish --privsep-dir /run/quishd
+ExecStart=/usr/bin/quishd --listen [::]:443 --privsep-user quish --privsep-dir /run/quishd
 User=root
 RuntimeDirectory=quishd
 RuntimeDirectoryMode=0755

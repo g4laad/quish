@@ -4,6 +4,47 @@ version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+description = "quishd — SSH-like remote shell server over HTTP/3"
+
+# Packaging. Build the binary first (`--features pam`), then:
+#   cargo deb --no-build -p quish-server
+#   cargo generate-rpm -p quish-server
+# cargo-deb resolves asset sources relative to this manifest dir; cargo-generate-rpm
+# relative to the workspace root (where it's invoked) — hence the differing prefixes.
+[package.metadata.deb]
+name = "quish-server"
+section = "net"
+priority = "optional"
+depends = "libpam0g, libc6"
+maintainer-scripts = "../dist/deb-maintainer-scripts"
+assets = [
+    ["../target/release/quishd", "usr/bin/", "755"],
+    ["../dist/pam.d/quish", "etc/pam.d/quish", "644"],
+    ["../dist/sysusers.d/quishd.conf", "usr/lib/sysusers.d/quishd.conf", "644"],
+    ["../dist/server.toml", "etc/quish/server.toml", "644"],
+]
+conf-files = ["/etc/pam.d/quish", "/etc/quish/server.toml"]
+
+# Ships the unit but does NOT enable/start it: quishd needs a host-key dir + config
+# first, so the admin runs `systemctl enable --now quishd`. cargo-deb still injects a
+# daemon-reload at #DEBHELPER# in our postinst.
+[package.metadata.deb.systemd-units]
+unit-name = "quishd"
+unit-scripts = "../dist/systemd"
+enable = false
+start = false
+
+[package.metadata.generate-rpm]
+assets = [
+    { source = "target/release/quishd", dest = "/usr/bin/quishd", mode = "755" },
+    { source = "dist/systemd/quishd.service", dest = "/usr/lib/systemd/system/quishd.service", mode = "644" },
+    { source = "dist/pam.d/quish", dest = "/etc/pam.d/quish", mode = "644", config = "noreplace" },
+    { source = "dist/sysusers.d/quishd.conf", dest = "/usr/lib/sysusers.d/quishd.conf", mode = "644" },
+    { source = "dist/server.toml", dest = "/etc/quish/server.toml", mode = "644", config = "noreplace" },
+]
+
+[package.metadata.generate-rpm.requires]
+pam = "*"
 
 [[bin]]
 name = "quishd"
