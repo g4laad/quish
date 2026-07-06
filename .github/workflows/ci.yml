@@ -37,6 +37,30 @@ jobs:
       - name: Test
         run: cargo test --workspace
 
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # quishd links PAM (real deploy build); needs libpam headers + libclang.
+      - name: Install system deps
+        run: sudo apt-get update && sudo apt-get install -y clang libclang-dev libpam0g-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build release binaries
+        run: |
+          cargo build --release -p quish-server --features pam
+          cargo build --release -p quish-client
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: quish-linux-x86_64
+          path: |
+            target/release/quishd
+            target/release/quish
+
   audit:
     runs-on: ubuntu-latest
     steps:
