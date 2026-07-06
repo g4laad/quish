@@ -85,8 +85,9 @@ fn parse_target(s: &str) -> Result<Target> {
     })
 }
 
-/// `host:port` for the resolver + TOFU pin key, bracketing IPv6 literals so
-/// `tokio::net::lookup_host` accepts them (`[::1]:4433`).
+/// `host:port` for the resolver, the TOFU pin key, and the CONNECT URI
+/// authority, bracketing IPv6 literals so `tokio::net::lookup_host` and
+/// `http::Uri` accept them (`[::1]:4433`). All three uses must stay identical.
 fn socket_target(host: &str, port: u16) -> String {
     if host.contains(':') {
         format!("[{host}]:{port}")
@@ -192,8 +193,9 @@ async fn run(
     let req = http::Request::builder()
         .method(http::Method::CONNECT)
         .uri(format!(
-            "https://{}:{}{}",
-            target.host, target.port, target.path
+            "https://{}{}",
+            socket_target(&target.host, target.port),
+            target.path
         ))
         .header(
             quish_proto::HEADER_VERSION,
@@ -297,5 +299,15 @@ mod tests {
         assert_eq!(socket_target("::1", 4433), "[::1]:4433");
         assert_eq!(socket_target("example.com", 22), "example.com:22");
         assert_eq!(socket_target("10.0.0.1", 22), "10.0.0.1:22");
+    }
+
+    #[test]
+    fn connect_uri_authority_is_bracketed_for_ipv6() {
+        let uri: http::Uri = format!("https://{}{}", socket_target("::1", 4433), "/quish")
+            .parse()
+            .unwrap();
+        assert_eq!(uri.host(), Some("[::1]"));
+        assert_eq!(uri.port_u16(), Some(4433));
+        assert_eq!(uri.path(), "/quish");
     }
 }
