@@ -1,0 +1,64 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # PAM backend needs libpam headers + libclang (bindgen).
+      - name: Install system deps
+        run: sudo apt-get update && sudo apt-get install -y clang libclang-dev libpam0g-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      - name: Clippy (default features)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Clippy (server, --features pam)
+        run: cargo clippy -p quish-server --features pam --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test --workspace
+
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: cargo-audit
+        run: |
+          cargo install --locked cargo-audit
+          # RUSTSEC-2023-0071: rsa is an optional, never-enabled ssh-key dep (see deny.toml).
+          cargo audit --ignore RUSTSEC-2023-0071
+      - name: cargo-deny
+        run: |
+          cargo install --locked cargo-deny
+          cargo deny check
+
+  fuzz:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+      - name: Smoke-fuzz the frame decoder
+        run: |
+          cargo install --locked cargo-fuzz
+          cargo +nightly fuzz run decode --fuzz-dir quish-proto/fuzz -- -max_total_time=60

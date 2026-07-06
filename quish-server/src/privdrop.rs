@@ -37,6 +37,11 @@ pub fn drop_to_worker(chroot_dir: &str, username: &str) -> Result<()> {
 
     nix::sys::prctl::set_no_new_privs().context("set_no_new_privs")?;
 
+    // Die with the monitor: if the root parent goes away, the kernel SIGKILLs us
+    // so an orphaned worker can't linger holding the port. Must be set *after*
+    // the credential change (setuid clears PR_SET_PDEATHSIG).
+    nix::sys::prctl::set_pdeathsig(nix::sys::signal::Signal::SIGKILL).context("set_pdeathsig")?;
+
     // Sanity: privilege must be unrecoverable.
     if setuid(Uid::from_raw(0)).is_ok() {
         bail!("worker could still regain root — aborting");

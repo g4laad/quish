@@ -47,9 +47,17 @@ pub fn endpoint(host_key: String) -> Result<quinn::Endpoint> {
 
     let quic = quinn::crypto::rustls::QuicClientConfig::try_from(tls)
         .context("quinn rustls client config")?;
+
+    // Keep-alive under the server's idle timeout so an idle interactive shell
+    // (no keystrokes) isn't reaped as a dead connection.
+    let mut transport = quinn::TransportConfig::default();
+    transport.keep_alive_interval(Some(std::time::Duration::from_secs(15)));
+    let mut client_config = quinn::ClientConfig::new(Arc::new(quic));
+    client_config.transport_config(Arc::new(transport));
+
     let mut endpoint =
         quinn::Endpoint::client("[::]:0".parse().unwrap()).context("binding client endpoint")?;
-    endpoint.set_default_client_config(quinn::ClientConfig::new(Arc::new(quic)));
+    endpoint.set_default_client_config(client_config);
     Ok(endpoint)
 }
 

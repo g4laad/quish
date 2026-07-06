@@ -1,0 +1,35 @@
+# cargo-deny configuration. Run: `cargo deny check`.
+
+[advisories]
+version = 2
+yanked = "deny"
+# Note: cargo-deny walks the real dependency graph, so it never sees the optional,
+# never-enabled `rsa` (ssh-key `crypto` feature) that `cargo audit` flags from the
+# raw lockfile — RUSTSEC-2023-0071 is ignored only in the `cargo audit` invocation.
+ignore = []
+
+[licenses]
+version = 2
+confidence-threshold = 0.9
+# Permissive licenses only — this is a security daemon; no copyleft surprises.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "Zlib",
+    "MPL-2.0",
+    "CDLA-Permissive-2.0",
+]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

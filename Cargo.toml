@@ -5,7 +5,7 @@ members = ["quish-proto", "quish-auth", "quish-server", "quish-client"]
 [workspace.package]
 edition = "2024"
 license = "MIT OR Apache-2.0"
-rust-version = "1.85"
+rust-version = "1.88"
 
 [workspace.lints.rust]
 unsafe_code = "deny"

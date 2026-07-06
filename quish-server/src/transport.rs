@@ -4,7 +4,8 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use bytes::Bytes;
@@ -14,10 +15,32 @@ use quinn::crypto::rustls::QuicServerConfig;
 use quish_auth::{ConnInfo, Registry, Verdict};
 use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
 use sha2::{Digest, Sha256};
-use tokio::time::Instant;
+use tokio::time::{Instant, timeout};
 use tracing::{info, warn};
 
+use crate::ratelimit::RateLimiter;
 use crate::worker::{MonitorClient, serve_channel};
+
+/// QUIC idle timeout: reaps dead connections. Interactive shells survive it
+/// because the client sends keep-alives well under this interval.
+const IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+/// Max concurrent channels (bidi request streams) per connection.
+const MAX_CHANNELS_PER_CONN: u32 = 16;
+/// A fresh connection must send its first request within this window.
+const FIRST_REQUEST_DEADLINE: Duration = Duration::from_secs(30);
+/// Hard ceiling on how long one auth attempt may take (guards a hung monitor).
+const AUTH_DEADLINE: Duration = Duration::from_secs(30);
+/// Failed auths tolerated on one connection before further attempts are cheap-
+/// rejected (the connection stays up; anti-enumeration is preserved).
+const MAX_AUTH_FAILS_PER_CONN: u32 = 6;
+
+/// QUIC transport limits shared by dev and privsep endpoints.
+pub fn transport_config() -> Arc<quinn::TransportConfig> {
+    let mut t = quinn::TransportConfig::default();
+    t.max_idle_timeout(Some(IDLE_TIMEOUT.try_into().expect("valid idle timeout")));
+    t.max_concurrent_bidi_streams(MAX_CHANNELS_PER_CONN.into());
+    Arc::new(t)
+}
 
 /// How auth + session spawning are satisfied.
 pub enum Backend {
@@ -90,21 +113,32 @@ pub fn dev_endpoint(listen: SocketAddr) -> Result<quinn::Endpoint> {
     tls.alpn_protocols = vec![quish_proto::ALPN.to_vec()];
 
     let quic = QuicServerConfig::try_from(tls).context("quinn rustls config")?;
-    quinn::Endpoint::server(quinn::ServerConfig::with_crypto(Arc::new(quic)), listen)
-        .context("binding endpoint")
+    let mut sc = quinn::ServerConfig::with_crypto(Arc::new(quic));
+    sc.transport_config(transport_config());
+    quinn::Endpoint::server(sc, listen).context("binding endpoint")
 }
 
 /// Serve until the endpoint is closed.
 pub async fn run(endpoint: quinn::Endpoint, path: String, backend: Arc<Backend>) -> Result<()> {
     info!(addr = ?endpoint.local_addr().ok(), %path, "quishd listening");
 
+    let limiter = Arc::new(RateLimiter::default());
     static NEXT_CONN: AtomicU64 = AtomicU64::new(1);
     while let Some(incoming) = endpoint.accept().await {
+        // Per-IP connection cap: reject before the handshake if over the limit.
+        let Some(guard) = limiter.admit(incoming.remote_address().ip()) else {
+            incoming.refuse();
+            continue;
+        };
         let path = path.clone();
         let backend = backend.clone();
+        let limiter = limiter.clone();
         let conn_id = NEXT_CONN.fetch_add(1, Ordering::Relaxed);
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(incoming, path, backend.clone(), conn_id).await {
+            let _guard = guard; // released when the connection ends
+            if let Err(e) =
+                handle_connection(incoming, path, backend.clone(), limiter, conn_id).await
+            {
                 warn!(error = %e, "connection ended with error");
             }
             backend.close(conn_id).await;
@@ -117,6 +151,7 @@ async fn handle_connection(
     incoming: quinn::Incoming,
     path: String,
     backend: Arc<Backend>,
+    limiter: Arc<RateLimiter>,
     conn_id: u64,
 ) -> Result<()> {
     let conn = incoming.await.context("QUIC handshake")?;
@@ -141,15 +176,32 @@ async fn handle_connection(
         .await
         .context("h3 handshake")?;
 
+    let conn_fails = Arc::new(AtomicU32::new(0));
+    let mut first = true;
     loop {
-        match h3conn.accept().await {
+        // Reap connect-and-idle: the first request must arrive promptly.
+        let accepted = if first {
+            match timeout(FIRST_REQUEST_DEADLINE, h3conn.accept()).await {
+                Ok(r) => r,
+                Err(_) => return Ok(()), // no request in time: drop quietly
+            }
+        } else {
+            h3conn.accept().await
+        };
+        first = false;
+
+        match accepted {
             Ok(Some(resolver)) => {
                 let path = path.clone();
                 let backend = backend.clone();
+                let limiter = limiter.clone();
                 let conn_info = conn_info.clone();
+                let conn_fails = conn_fails.clone();
                 tokio::spawn(async move {
-                    if let Err(e) =
-                        handle_request(resolver, path, backend, conn_info, conn_id).await
+                    if let Err(e) = handle_request(
+                        resolver, path, backend, limiter, conn_info, conn_id, conn_fails,
+                    )
+                    .await
                     {
                         warn!(error = %e, "request ended with error");
                     }
@@ -164,12 +216,15 @@ async fn handle_connection(
 
 type ReqStream = h3::server::RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>;
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_request(
     resolver: h3::server::RequestResolver<h3_quinn::Connection, Bytes>,
     path: String,
     backend: Arc<Backend>,
+    limiter: Arc<RateLimiter>,
     conn_info: ConnInfo,
     conn_id: u64,
+    conn_fails: Arc<AtomicU32>,
 ) -> Result<()> {
     let (req, mut stream) = resolver
         .resolve_request()
@@ -184,18 +239,36 @@ async fn handle_request(
         return stream.finish().await.map_err(Into::into);
     }
 
+    let ip = conn_info.peer_addr.ip();
+
+    // A connection that keeps failing auth gets cheap 401s (no monitor round-trip)
+    // once over the cap — bounds spam without dropping the connection.
+    if conn_fails.load(Ordering::Relaxed) >= MAX_AUTH_FAILS_PER_CONN {
+        respond(&mut stream, StatusCode::UNAUTHORIZED).await?;
+        return stream.finish().await.map_err(Into::into);
+    }
+
+    // Escalating per-IP backoff before the attempt, then a hard deadline.
+    tokio::time::sleep(limiter.backoff(ip)).await;
     let authorization = req
         .headers()
         .get(quish_proto::HEADER_AUTHORIZATION)
         .and_then(|v| v.to_str().ok());
-    if !backend
-        .authenticate(conn_id, authorization, &conn_info)
-        .await
-    {
+    let allow = timeout(
+        AUTH_DEADLINE,
+        backend.authenticate(conn_id, authorization, &conn_info),
+    )
+    .await
+    .unwrap_or(false);
+
+    if !allow {
+        limiter.record_failure(ip);
+        conn_fails.fetch_add(1, Ordering::Relaxed);
         info!(%conn_id, peer = %conn_info.peer_addr, "auth failed");
         respond(&mut stream, StatusCode::UNAUTHORIZED).await?;
         return stream.finish().await.map_err(Into::into);
     }
+    limiter.record_success(ip);
 
     info!(%conn_id, "quish session authenticated");
     respond(&mut stream, StatusCode::OK).await?;

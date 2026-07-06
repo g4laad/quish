@@ -1,1 +1,6 @@
 /target
+
+# cargo-fuzz artifacts (keep targets + Cargo.toml, drop generated data)
+/quish-proto/fuzz/target
+/quish-proto/fuzz/corpus
+/quish-proto/fuzz/artifacts

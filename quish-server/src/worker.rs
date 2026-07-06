@@ -70,9 +70,9 @@ pub fn run() -> Result<()> {
 
         let quic = quinn::crypto::rustls::QuicServerConfig::try_from(tls)
             .context("quinn rustls config")?;
-        let endpoint =
-            quinn::Endpoint::server(quinn::ServerConfig::with_crypto(Arc::new(quic)), listen)
-                .context("binding endpoint")?;
+        let mut sc = quinn::ServerConfig::with_crypto(Arc::new(quic));
+        sc.transport_config(crate::transport::transport_config());
+        let endpoint = quinn::Endpoint::server(sc, listen).context("binding endpoint")?;
 
         let client = Arc::new(MonitorClient::new(ctrl));
         let backend = Arc::new(crate::transport::Backend::Privsep { client });

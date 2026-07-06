@@ -13,6 +13,7 @@
 mod ipc;
 mod monitor;
 mod privdrop;
+mod ratelimit;
 mod session;
 mod signproxy;
 mod transport;
@@ -50,6 +51,11 @@ struct Args {
     /// Unprivileged user the worker drops to (privsep mode).
     #[arg(long, default_value = "quish")]
     privsep_user: String,
+
+    /// Persist the host key (DER) here; generated on first use. Without it the
+    /// key is ephemeral and the fingerprint changes on every restart.
+    #[arg(long, value_name = "PATH")]
+    host_key: Option<PathBuf>,
 
     /// Internal: run as the privilege-dropped worker (spawned by the monitor).
     #[arg(long, hide = true)]
@@ -92,6 +98,7 @@ fn main() -> anyhow::Result<()> {
         path: args.path,
         chroot_dir: args.privsep_dir,
         worker_user: args.privsep_user,
+        host_key: args.host_key,
     })
 }
 
