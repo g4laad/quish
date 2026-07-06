@@ -53,9 +53,26 @@ fn parse_target(s: &str) -> Result<Target> {
         Some((hp, p)) => (hp, format!("/{p}")),
         None => (rest, quish_proto::DEFAULT_PATH.to_string()),
     };
-    let (host, port) = match hostport.rsplit_once(':') {
-        Some((h, p)) => (h.to_string(), p.parse().context("invalid port")?),
-        None => (hostport.to_string(), 4433),
+    let (host, port) = if let Some(rest) = hostport.strip_prefix('[') {
+        // Bracketed IPv6: [addr] or [addr]:port
+        let (addr, after) = rest
+            .split_once(']')
+            .context("missing closing ']' in IPv6 target")?;
+        let port = match after.strip_prefix(':') {
+            Some(p) => p.parse().context("invalid port")?,
+            None if after.is_empty() => 4433,
+            None => bail!("unexpected text after ']' in target `{s}`"),
+        };
+        (addr.to_string(), port)
+    } else if let Some((h, p)) = hostport.rsplit_once(':') {
+        if h.contains(':') {
+            // Bare IPv6 literal (multiple colons, no brackets): no port present.
+            (hostport.to_string(), 4433)
+        } else {
+            (h.to_string(), p.parse().context("invalid port")?)
+        }
+    } else {
+        (hostport.to_string(), 4433)
     };
     if host.is_empty() {
         bail!("missing host in target `{s}`");
@@ -66,6 +83,16 @@ fn parse_target(s: &str) -> Result<Target> {
         port,
         path,
     })
+}
+
+/// `host:port` for the resolver + TOFU pin key, bracketing IPv6 literals so
+/// `tokio::net::lookup_host` accepts them (`[::1]:4433`).
+fn socket_target(host: &str, port: u16) -> String {
+    if host.contains(':') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    }
 }
 
 fn whoami() -> String {
@@ -128,7 +155,7 @@ async fn run(
     identity: Option<std::path::PathBuf>,
     command: Vec<String>,
 ) -> Result<i32> {
-    let host_key = format!("{}:{}", target.host, target.port);
+    let host_key = socket_target(&target.host, target.port);
     let addr = tokio::net::lookup_host(&host_key)
         .await
         .context("resolving host")?
@@ -241,5 +268,35 @@ mod tests {
     #[test]
     fn rejects_bad_port() {
         assert!(parse_target("host:notaport").is_err());
+    }
+
+    #[test]
+    fn parses_bracketed_ipv6() {
+        let t = parse_target("alice@[2001:db8::1]:22/x").unwrap();
+        assert_eq!(t.user, "alice");
+        assert_eq!(t.host, "2001:db8::1");
+        assert_eq!(t.port, 22);
+        assert_eq!(t.path, "/x");
+    }
+
+    #[test]
+    fn bracketed_ipv6_default_port() {
+        let t = parse_target("[::1]").unwrap();
+        assert_eq!(t.host, "::1");
+        assert_eq!(t.port, 4433);
+    }
+
+    #[test]
+    fn bare_ipv6_defaults_port() {
+        let t = parse_target("::1").unwrap();
+        assert_eq!(t.host, "::1");
+        assert_eq!(t.port, 4433);
+    }
+
+    #[test]
+    fn socket_target_brackets_ipv6_only() {
+        assert_eq!(socket_target("::1", 4433), "[::1]:4433");
+        assert_eq!(socket_target("example.com", 22), "example.com:22");
+        assert_eq!(socket_target("10.0.0.1", 22), "10.0.0.1:22");
     }
 }
