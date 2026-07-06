@@ -7,6 +7,7 @@ rust-version.workspace = true
 description = "quish — SSH-like remote shell client over HTTP/3"
 
 [package.metadata.deb]
+maintainer = "quish project <quish@users.noreply.github.com>"
 name = "quish"
 section = "net"
 priority = "optional"

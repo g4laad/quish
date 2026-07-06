@@ -12,10 +12,11 @@ description = "quishd — SSH-like remote shell server over HTTP/3"
 # cargo-deb resolves asset sources relative to this manifest dir; cargo-generate-rpm
 # relative to the workspace root (where it's invoked) — hence the differing prefixes.
 [package.metadata.deb]
+maintainer = "quish project <quish@users.noreply.github.com>"
 name = "quish-server"
 section = "net"
 priority = "optional"
-depends = "libpam0g, libc6"
+depends = "libpam0g, libc6, systemd"
 maintainer-scripts = "../dist/deb-maintainer-scripts"
 assets = [
     ["../target/release/quishd", "usr/bin/", "755"],
@@ -42,9 +43,17 @@ assets = [
     { source = "dist/sysusers.d/quishd.conf", dest = "/usr/lib/sysusers.d/quishd.conf", mode = "644" },
     { source = "dist/server.toml", dest = "/etc/quish/server.toml", mode = "644", config = "noreplace" },
 ]
+# Create the quish user + register the unit, mirroring the deb postinst. Fedora's
+# sysusers/systemd filetriggers would normally do this, but don't fire everywhere
+# (minimal images), so we do it explicitly. Not enabled/started — admin does that.
+post_install_script = '''
+command -v systemd-sysusers >/dev/null 2>&1 && systemd-sysusers /usr/lib/sysusers.d/quishd.conf || :
+[ -d /run/systemd/system ] && systemctl daemon-reload || :
+'''
 
 [package.metadata.generate-rpm.requires]
 pam = "*"
+systemd = "*"
 
 [[bin]]
 name = "quishd"
