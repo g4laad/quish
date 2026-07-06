@@ -25,6 +25,16 @@ pub const HEADER_VERSION: &str = "quish-version";
 /// Default secret path; anything else gets a generic 404 before quish logic runs.
 pub const DEFAULT_PATH: &str = "/quish";
 
+/// TLS-exporter label both sides feed to `Connection::export_keying_material` to
+/// derive the 32-byte channel binding that pubkey tokens are signed over.
+pub const CHANNEL_BINDING_LABEL: &[u8] = b"quish channel binding";
+
+/// Length of the exported channel binding.
+pub const CHANNEL_BINDING_LEN: usize = 32;
+
+/// HTTP header carrying credentials (`Basic ` password / `Bearer ` pubkey token).
+pub const HEADER_AUTHORIZATION: &str = "authorization";
+
 /// Hard cap on a single frame body (postcard-encoded, before the length prefix).
 /// Bounds the pre-auth parser. 64 KiB comfortably fits a PTY write plus overhead.
 pub const MAX_FRAME_LEN: usize = 64 * 1024;

@@ -1,8 +1,9 @@
 //! `quish` — the client CLI.
 //!
-//! Milestone 2: parse an ssh-style target, open a QUIC+H3 connection with
-//! web-PKI→TOFU server verification, do the Extended CONNECT to the secret path,
-//! and round-trip one frame through the server's echo tunnel to prove the pipe.
+//! Milestone 3: parse an ssh-style target, open a QUIC+H3 connection with
+//! web-PKI→TOFU server verification, authenticate the Extended CONNECT (password
+//! Basic or channel-bound pubkey Bearer), then round-trip one frame through the
+//! server's echo tunnel to prove the authed pipe.
 
 mod connect;
 
@@ -21,6 +22,11 @@ use tracing::info;
 struct Args {
     /// Target as `[user@]host[:port][/path]`.
     target: String,
+
+    /// OpenSSH ed25519 private key for pubkey auth. Without it, password auth is
+    /// used (prompted, or read from `QUISH_PASSWORD`).
+    #[arg(short, long)]
+    identity: Option<std::path::PathBuf>,
 
     /// Command to run (unused until M4; parsed now for the final CLI shape).
     #[arg(trailing_var_arg = true)]
@@ -65,6 +71,32 @@ fn whoami() -> String {
     std::env::var("USER").unwrap_or_else(|_| "root".into())
 }
 
+/// Build the `Authorization` header value. With `--identity`, mint a channel-bound
+/// pubkey token (Bearer); otherwise use a password (Basic), read from
+/// `QUISH_PASSWORD` for scripted runs or prompted interactively.
+fn build_authorization(
+    user: &str,
+    identity: Option<&std::path::Path>,
+    binding: &[u8; 32],
+) -> Result<String> {
+    match identity {
+        Some(path) => {
+            let key = std::fs::read(path)
+                .with_context(|| format!("reading identity {}", path.display()))?;
+            let token = quish_auth::pubkey::build_token(&key, user, binding)?;
+            Ok(quish_auth::bearer_header(&token))
+        }
+        None => {
+            let password = match std::env::var("QUISH_PASSWORD") {
+                Ok(p) => p,
+                Err(_) => rpassword::prompt_password(format!("{user}'s password: "))
+                    .context("reading password")?,
+            };
+            Ok(quish_auth::basic_header(user, &password))
+        }
+    }
+}
+
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -83,10 +115,10 @@ fn main() -> Result<()> {
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?
-        .block_on(run(target))
+        .block_on(run(target, args.identity))
 }
 
-async fn run(target: Target) -> Result<()> {
+async fn run(target: Target, identity: Option<std::path::PathBuf>) -> Result<()> {
     let host_key = format!("{}:{}", target.host, target.port);
     let addr = tokio::net::lookup_host(&host_key)
         .await
@@ -101,6 +133,13 @@ async fn run(target: Target) -> Result<()> {
         .await
         .context("connecting")?;
     info!(%addr, "connected");
+
+    // Channel binding for pubkey tokens: export before `conn` moves into h3. Must
+    // match the server's label byte-for-byte.
+    let mut binding = [0u8; quish_proto::CHANNEL_BINDING_LEN];
+    conn.export_keying_material(&mut binding, quish_proto::CHANNEL_BINDING_LABEL, &[])
+        .map_err(|e| anyhow::anyhow!("exporting channel binding: {e:?}"))?;
+    let authorization = build_authorization(&target.user, identity.as_deref(), &binding)?;
 
     let (mut driver, mut send_request) = h3::client::builder()
         .enable_extended_connect(true)
@@ -125,6 +164,7 @@ async fn run(target: Target) -> Result<()> {
             quish_proto::HEADER_VERSION,
             quish_proto::PROTOCOL_VERSION.to_string(),
         )
+        .header(quish_proto::HEADER_AUTHORIZATION, &authorization)
         .extension(Protocol::WEB_TRANSPORT)
         .body(())
         .expect("valid request");
@@ -134,13 +174,15 @@ async fn run(target: Target) -> Result<()> {
         .await
         .context("sending CONNECT")?;
     let resp = stream.recv_response().await.context("awaiting response")?;
-    if resp.status() != http::StatusCode::OK {
-        bail!("server rejected session: HTTP {}", resp.status());
+    match resp.status() {
+        http::StatusCode::OK => {}
+        http::StatusCode::UNAUTHORIZED => bail!("authentication failed"),
+        s => bail!("server rejected session: HTTP {s}"),
     }
-    info!(user = %target.user, "session established");
+    info!(user = %target.user, "session authenticated");
 
-    // M2 echo check: send one frame, expect the same bytes back.
-    let msg = ChannelMessage::Data(b"quish M2 echo".to_vec());
+    // Liveness proof (until M4 real channels): send one frame, expect it back.
+    let msg = ChannelMessage::Data(b"quish echo".to_vec());
     stream
         .send_data(Bytes::from(quish_proto::encode(&msg)?))
         .await
@@ -151,7 +193,7 @@ async fn run(target: Target) -> Result<()> {
         bail!("echo mismatch: sent {msg:?}, got {got:?}");
     }
     stream.finish().await.context("finishing stream")?;
-    println!("quish: transport OK — CONNECT accepted and frame round-tripped");
+    println!("quish: authenticated — CONNECT accepted and frame round-tripped");
 
     drop(send_request);
     let _ = drive.await;

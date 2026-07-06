@@ -7,19 +7,21 @@ use bytes::{Buf, Bytes};
 use h3::ext::Protocol;
 use http::{Method, Response, StatusCode};
 use quinn::crypto::rustls::QuicServerConfig;
+use quish_auth::{ConnInfo, Registry, Verdict};
 use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
 use sha2::{Digest, Sha256};
 use tracing::{info, warn};
 
 /// Build a dev endpoint with a fresh self-signed cert and serve until cancelled.
-pub async fn run(listen: SocketAddr, path: String) -> Result<()> {
+pub async fn run(listen: SocketAddr, path: String, registry: Arc<Registry>) -> Result<()> {
     let endpoint = build_endpoint(listen)?;
     info!(%listen, %path, "quishd listening (dev mode)");
 
     while let Some(incoming) = endpoint.accept().await {
         let path = path.clone();
+        let registry = registry.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(incoming, path).await {
+            if let Err(e) = handle_connection(incoming, path, registry).await {
                 warn!(error = %e, "connection ended with error");
             }
         });
@@ -49,9 +51,28 @@ fn build_endpoint(listen: SocketAddr) -> Result<quinn::Endpoint> {
     quinn::Endpoint::server(server_config, listen).context("binding endpoint")
 }
 
-async fn handle_connection(incoming: quinn::Incoming, path: String) -> Result<()> {
+async fn handle_connection(
+    incoming: quinn::Incoming,
+    path: String,
+    registry: Arc<Registry>,
+) -> Result<()> {
     let conn = incoming.await.context("QUIC handshake")?;
-    info!(peer = %conn.remote_address(), "connection established");
+    let peer_addr = conn.remote_address();
+    info!(peer = %peer_addr, "connection established");
+
+    // Derive the channel binding once per connection, before the quinn handle is
+    // moved into h3. Pubkey tokens are signed over this exact value.
+    let mut channel_binding = [0u8; quish_proto::CHANNEL_BINDING_LEN];
+    conn.export_keying_material(
+        &mut channel_binding,
+        quish_proto::CHANNEL_BINDING_LABEL,
+        &[],
+    )
+    .map_err(|e| anyhow::anyhow!("exporting channel binding: {e:?}"))?;
+    let conn_info = ConnInfo {
+        peer_addr,
+        channel_binding,
+    };
 
     let mut h3conn = h3::server::builder()
         .enable_extended_connect(true)
@@ -63,8 +84,10 @@ async fn handle_connection(incoming: quinn::Incoming, path: String) -> Result<()
         match h3conn.accept().await {
             Ok(Some(resolver)) => {
                 let path = path.clone();
+                let registry = registry.clone();
+                let conn_info = conn_info.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = handle_request(resolver, path).await {
+                    if let Err(e) = handle_request(resolver, path, registry, conn_info).await {
                         warn!(error = %e, "request ended with error");
                     }
                 });
@@ -82,6 +105,8 @@ type ReqStream = h3::server::RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>;
 async fn handle_request(
     resolver: h3::server::RequestResolver<h3_quinn::Connection, Bytes>,
     path: String,
+    registry: Arc<Registry>,
+    conn_info: ConnInfo,
 ) -> Result<()> {
     let (req, mut stream) = resolver
         .resolve_request()
@@ -98,12 +123,24 @@ async fn handle_request(
         return stream.finish().await.map_err(Into::into);
     }
 
-    let user = req
+    // Authenticate the session. The registry owns anti-enumeration: every failure
+    // is an identical 401 padded to a constant-time floor. We keep the connection
+    // up (just end this stream) so a failure is indistinguishable from any other.
+    let authorization = req
         .headers()
-        .get(quish_proto::HEADER_USERNAME)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("<none>");
-    info!(%user, "quish session established (auth deferred to M3)");
+        .get(quish_proto::HEADER_AUTHORIZATION)
+        .and_then(|v| v.to_str().ok());
+    let user = match registry.authenticate(authorization, &conn_info).await {
+        Verdict::Allow { user } => user,
+        Verdict::Deny => {
+            info!(peer = %conn_info.peer_addr, "auth failed");
+            respond(&mut stream, StatusCode::UNAUTHORIZED).await?;
+            return stream.finish().await.map_err(Into::into);
+        }
+    };
+
+    // Identity is the *authenticated* user, never a client-supplied header.
+    info!(%user, "quish session authenticated");
     respond(&mut stream, StatusCode::OK).await?;
 
     match echo_tunnel(&mut stream).await {

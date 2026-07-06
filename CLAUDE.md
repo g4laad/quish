@@ -68,6 +68,12 @@ authed connection. Server identity: web PKI if the cert validates, else TOFU pin
 - **Testing uses podman** (not docker) — needed for root + real PAM + PTY e2e.
 - Dev-mode e2e without root: server `--dev-insecure-user <name>` (any password, no
   privdrop, single process); client reads `QUISH_PASSWORD` for non-interactive runs.
+- **`quish-auth`'s `pam` feature is off by default** (only the monitor links PAM).
+  Default builds/clippy/tests need no C toolchain. Building `--features pam` on this
+  host needs bindgen hints (libclang ships as `libclang-21.so.21`, no clang headers):
+  `LIBCLANG_PATH=~/.local/libclang` (a `libclang.so` symlink) +
+  `BINDGEN_EXTRA_CLANG_ARGS=-I/usr/lib/gcc/x86_64-linux-gnu/15/include`. Podman/CI
+  install `clang`/`libclang-dev` instead and need neither.
 
 ## Stack
 
