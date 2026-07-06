@@ -97,10 +97,12 @@ jobs:
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
+        # quish-packages keeps target/{debian,generate-rpm}/ subdirs, so glob one
+        # level deeper to match files, not the directories.
         run: >
           gh release create "$GITHUB_REF_NAME"
           --repo "$GITHUB_REPOSITORY" --generate-notes
-          artifacts/quish-linux-x86_64/* artifacts/quish-packages/*
+          artifacts/quish-linux-x86_64/* artifacts/quish-packages/*/*
 
   audit:
     runs-on: ubuntu-latest
