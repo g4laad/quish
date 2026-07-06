@@ -19,12 +19,13 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
-type FullStream = h3::server::RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>;
-type SendHalf = h3::server::RequestStream<h3_quinn::SendStream<Bytes>, Bytes>;
-type RecvHalf = h3::server::RequestStream<h3_quinn::RecvStream, Bytes>;
+pub(crate) type FullStream = h3::server::RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>;
+pub(crate) type SendHalf = h3::server::RequestStream<h3_quinn::SendStream<Bytes>, Bytes>;
+pub(crate) type RecvHalf = h3::server::RequestStream<h3_quinn::RecvStream, Bytes>;
 
-/// Read the opening frame and dispatch to the requested channel type.
-pub async fn serve(stream: FullStream, user: &str) -> Result<()> {
+/// Read the opening frame and dispatch to the requested channel type (dev mode:
+/// spawns the process locally via portable-pty).
+pub async fn serve(stream: FullStream) -> Result<()> {
     let (send, recv) = stream.split();
     let mut reader = FrameReader::new(recv);
 
@@ -34,11 +35,11 @@ pub async fn serve(stream: FullStream, user: &str) -> Result<()> {
     };
     match quish_proto::decode::<ChannelOpen>(&body).context("decoding ChannelOpen")? {
         ChannelOpen::Shell { term, cols, rows } => {
-            info!(%user, %cols, %rows, "shell channel");
+            info!(%cols, %rows, "shell channel");
             shell(send, reader, term, cols, rows).await
         }
         ChannelOpen::Exec { command } => {
-            info!(%user, %command, "exec channel");
+            info!(%command, "exec channel");
             exec(send, reader, command).await
         }
     }
@@ -215,7 +216,7 @@ async fn exec(mut send: SendHalf, reader: FrameReader, command: String) -> Resul
 
 /// Encode + send one frame. `Ok(false)` means the client hung up gracefully
 /// (H3_NO_ERROR) — the caller should stop, not treat it as an error.
-async fn send_msg(send: &mut SendHalf, msg: &ChannelMessage) -> Result<bool> {
+pub(crate) async fn send_msg(send: &mut SendHalf, msg: &ChannelMessage) -> Result<bool> {
     match send.send_data(Bytes::from(quish_proto::encode(msg)?)).await {
         Ok(()) => Ok(true),
         Err(e) if e.is_h3_no_error() => Ok(false),
@@ -224,13 +225,13 @@ async fn send_msg(send: &mut SendHalf, msg: &ChannelMessage) -> Result<bool> {
 }
 
 /// Owns the recv half, spooling H3 DATA into complete frame bodies.
-struct FrameReader {
+pub(crate) struct FrameReader {
     recv: RecvHalf,
     buf: Vec<u8>,
 }
 
 impl FrameReader {
-    fn new(recv: RecvHalf) -> Self {
+    pub(crate) fn new(recv: RecvHalf) -> Self {
         Self {
             recv,
             buf: Vec::new(),
@@ -238,7 +239,7 @@ impl FrameReader {
     }
 
     /// Next complete frame body, or `None` at clean end of stream.
-    async fn next_frame(&mut self) -> Result<Option<Vec<u8>>> {
+    pub(crate) async fn next_frame(&mut self) -> Result<Option<Vec<u8>>> {
         loop {
             if self.buf.len() >= LEN_PREFIX {
                 let len = parse_len(self.buf[..LEN_PREFIX].try_into().unwrap())?;
@@ -264,7 +265,7 @@ impl FrameReader {
 
 /// Dedicated reader task: decode frames off the recv half into an mpsc so the
 /// session loop never `select!`s a non-cancel-safe `recv_data` directly.
-fn spawn_frame_reader(mut reader: FrameReader) -> mpsc::Receiver<ChannelMessage> {
+pub(crate) fn spawn_frame_reader(mut reader: FrameReader) -> mpsc::Receiver<ChannelMessage> {
     let (tx, rx) = mpsc::channel(64);
     tokio::spawn(async move {
         loop {

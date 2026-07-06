@@ -1,0 +1,7 @@
+# PAM policy for quish (service name "quish"; install to /etc/pam.d/quish).
+#
+# `nodelay`: quish enforces its OWN centralized constant-time failure floor in
+# the auth registry, so pam_unix's built-in random delay is both redundant and
+# would leak timing variance the registry works to erase. Leave it off.
+auth       required   pam_unix.so nodelay
+account    required   pam_unix.so

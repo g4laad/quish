@@ -80,17 +80,28 @@ impl Registry {
     /// returns an identical `Deny` and blocks until `started + fail_delay`.
     pub async fn authenticate(&self, authorization: Option<&str>, conn: &ConnInfo) -> Verdict {
         let started = Instant::now();
-
-        let verdict = match parse_authorization(authorization) {
-            Some(creds) => self.dispatch(&creds, conn).await,
-            None => Verdict::Deny,
-        };
-
+        let verdict = self.verdict(authorization, conn).await;
         if verdict == Verdict::Deny {
             // Pad to the floor. Backends already returned; timing carries no signal.
             tokio::time::sleep_until(started + self.fail_delay).await;
         }
         verdict
+    }
+
+    /// Raw verdict without the timing floor. Used across the privsep boundary: the
+    /// monitor returns this, and the worker applies [`Self::fail_delay`] itself so
+    /// a slow PAM never stalls the monitor's serial RPC loop. Still uniform in
+    /// outcome — the caller maps every `Deny` to the same 401.
+    pub async fn verdict(&self, authorization: Option<&str>, conn: &ConnInfo) -> Verdict {
+        match parse_authorization(authorization) {
+            Some(creds) => self.dispatch(&creds, conn).await,
+            None => Verdict::Deny,
+        }
+    }
+
+    /// The constant-time failure floor (for callers applying it themselves).
+    pub fn fail_delay(&self) -> Duration {
+        self.fail_delay
     }
 
     async fn dispatch(&self, creds: &Credentials, conn: &ConnInfo) -> Verdict {

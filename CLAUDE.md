@@ -30,22 +30,32 @@ Full design + milestones: `~/.claude/plans/plan-a-new-project-gentle-charm.md`.
   size caps, header/status/version consts. Shared, no I/O.
 - `quish-auth` — `AuthBackend` trait, `Credentials`, the registry, `pam.rs`, `pubkey.rs`.
   Adding an auth method = new module impl'ing the trait + one registry match arm.
-- `quish-server` — `quishd`: `main` (sync, forks pre-tokio), `monitor.rs`, `worker.rs`,
-  `session.rs` (PTY/exec), `ratelimit.rs`, `config.rs`.
-- `quish-client` — `quish` CLI: `connect.rs` (cert verifier + TOFU pinning), terminal
-  raw mode, channel pump.
-- `dist/` — `server.toml`, systemd unit, `pam.d/quish` (`pam_unix ... nodelay`),
-  `sysusers.d/quishd.conf`.
+- `quish-server` — `quishd`: `main` (sync mode dispatch), `monitor.rs`, `worker.rs`,
+  `session.rs` (dev-mode PTY/exec), `ipc.rs` (control + signing wire types/framing),
+  `privdrop.rs` (chroot/setuid + session helper), `signproxy.rs` (rustls signing
+  proxy), `transport.rs` (`Backend` seam). `ratelimit.rs`/`config.rs` land in M6
+  (config is CLI flags for now).
+- `quish-client` — `quish` CLI: `connect.rs` (cert verifier + TOFU pinning),
+  `terminal.rs` (raw mode + channel pump).
+- `dist/` — `systemd/quishd.service`, `pam.d/quish` (`pam_unix ... nodelay`),
+  `sysusers.d/quishd.conf`. (`server.toml` deferred with `config.rs`.)
 
 ## Architecture in one paragraph
 
-`quishd` starts root, binds UDP, then **forks before tokio**. The **worker** (child:
-chroot to `/run/quishd`, setuid `quish`, `no_new_privs`) runs all quinn/h3/rustls and
-untrusted parsing, pre- and post-auth. The **monitor** (root parent) holds the auth
-registry (PAM needs root), the host key, and session spawning. They talk over two
-`SOCK_SEQPACKET` socketpairs (async postcard RPC + sync signing); PTY/exec fds pass to
-the worker via `SCM_RIGHTS`. A fully compromised worker still can't read the host key,
-forge an identity, or setuid.
+`quishd` starts root and **re-execs a privilege-separated worker** (`nix::fork` is
+`unsafe`; `std::process::Command` forks+execs safely and gives the worker a fresh
+address space). The **worker** (child: binds UDP as root, then `chroot`s to
+`/run/quishd`, `setuid`s to `quish`, sets `no_new_privs`) runs all quinn/h3/rustls
+and untrusted parsing, pre- and post-auth. The **monitor** (root parent) holds the
+auth registry (PAM needs root), the host key, and session spawning. They talk over
+two `SOCK_SEQPACKET` socketpairs — a control RPC (auth / spawn / reap) and a
+dedicated signing channel — both request/response and blocking (run off the reactor
+via `spawn_blocking`); session PTY/pipe fds pass to the worker via `SCM_RIGHTS`.
+Received fds are used as `RawFd` + blocking reader/writer threads (never wrapped in
+an `OwnedFd`, which needs `unsafe`). Sessions themselves are spawned by the monitor
+via a `--run-session` re-exec that `setgid`/`initgroups`/`setuid`s to the target
+user before exec. A fully compromised worker still can't read the host key, forge an
+identity, or setuid.
 
 Session setup is an H3 Extended CONNECT on the configured secret `path` (default
 `/quish`; any other path → generic 404 before quish logic). The `:protocol`

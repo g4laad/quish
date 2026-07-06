@@ -1,0 +1,24 @@
+[Unit]
+Description=quish — SSH-like remote shell over HTTP/3
+Documentation=https://github.com/quish/quish
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# The monitor must run as root: PAM, the host private key, and setuid'ing each
+# session to its authenticated user all require it. The monitor re-execs the
+# worker, which chroots to RuntimeDirectory, setuids to `quish`, and sets
+# no_new_privs on itself — so the network-facing process is unprivileged.
+Type=simple
+ExecStart=/usr/local/bin/quishd --listen [::]:443 --privsep-user quish --privsep-dir /run/quishd
+User=root
+RuntimeDirectory=quishd
+RuntimeDirectoryMode=0755
+Restart=on-failure
+RestartSec=2
+
+# Do NOT add ProtectHome / ProtectSystem=strict here: the monitor legitimately
+# spawns login shells in users' home directories, which those would break.
+
+[Install]
+WantedBy=multi-user.target

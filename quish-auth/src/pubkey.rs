@@ -92,22 +92,40 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
-/// Verifies signed tokens against an `authorized_keys` file.
-#[derive(Debug)]
+/// Resolves a username to its `authorized_keys` path. Lets the monitor point at
+/// the *target* user's home (`~alice/.config/quish/authorized_keys`) while dev
+/// mode uses one fixed file.
+pub type KeysResolver = Box<dyn Fn(&str) -> Option<PathBuf> + Send + Sync>;
+
+/// Verifies signed tokens against a per-user `authorized_keys` file.
 pub struct PubkeyBackend {
-    authorized_keys: PathBuf,
+    resolver: KeysResolver,
+}
+
+impl std::fmt::Debug for PubkeyBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PubkeyBackend").finish()
+    }
 }
 
 impl PubkeyBackend {
-    /// `authorized_keys` is the OpenSSH-format file listing accepted public keys.
+    /// One fixed `authorized_keys` file for every user (dev / single-home setups).
     /// Deliberately separate from `~/.ssh/authorized_keys`.
     pub fn new(authorized_keys: PathBuf) -> Self {
-        Self { authorized_keys }
+        Self::with_resolver(Box::new(move |_| Some(authorized_keys.clone())))
     }
 
-    /// Is `pubkey` present in the authorized_keys file? Unreadable file → no.
-    fn is_authorized(&self, pubkey: &[u8; 32]) -> bool {
-        let Ok(contents) = std::fs::read_to_string(&self.authorized_keys) else {
+    /// Resolve the `authorized_keys` path per target username.
+    pub fn with_resolver(resolver: KeysResolver) -> Self {
+        Self { resolver }
+    }
+
+    /// Is `pubkey` in `user`'s authorized_keys? Unresolved/unreadable file → no.
+    fn is_authorized(&self, user: &str, pubkey: &[u8; 32]) -> bool {
+        let Some(path) = (self.resolver)(user) else {
+            return false;
+        };
+        let Ok(contents) = std::fs::read_to_string(&path) else {
             return false;
         };
         contents.lines().any(|line| {
@@ -143,8 +161,8 @@ impl AuthBackend for PubkeyBackend {
         if tok.timestamp.abs_diff(now) > TIMESTAMP_WINDOW_SECS {
             return Verdict::Deny;
         }
-        // Key must be explicitly authorized.
-        if !self.is_authorized(&tok.pubkey) {
+        // Key must be explicitly authorized for the claimed user.
+        if !self.is_authorized(&tok.username, &tok.pubkey) {
             return Verdict::Deny;
         }
         // Signature must cover this connection's binding.

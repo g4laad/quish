@@ -11,21 +11,30 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1.0.103"
+base64 = "0.22.1"
 bytes = "1.12.0"
 clap = { version = "4.6.1", features = ["derive"] }
 h3 = "0.0.8"
 h3-quinn = "0.0.10"
 http = "1.4.2"
+nix = { version = "0.31.3", features = ["fs", "user", "process", "socket", "term", "signal"] }
 portable-pty = "0.9.0"
+postcard = { version = "1.1.3", default-features = false, features = ["use-std"] }
 quinn = "0.11.11"
 quish-auth = { version = "0.1.0", path = "../quish-auth", default-features = false }
 quish-proto = { version = "0.1.0", path = "../quish-proto" }
 rcgen = "0.14.7"
+rustix = { version = "1.1.4", features = ["termios", "pty"] }
 rustls = { version = "0.23.41", default-features = false, features = ["ring"] }
+serde = { version = "1.0.228", features = ["derive"] }
 sha2 = "0.11.0"
 tokio = { version = "1.52.3", features = ["full"] }
+tokio-seqpacket = "0.9.0"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
 [lints]
 workspace = true
+
+[features]
+pam = ["quish-auth/pam"]
