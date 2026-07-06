@@ -27,7 +27,7 @@ use clap::Parser;
 use quish_auth::{AuthBackend, DevInsecureBackend, Registry, pubkey::PubkeyBackend};
 
 /// Constant-time floor every auth failure is padded to (anti-enumeration).
-const FAIL_DELAY: Duration = Duration::from_secs(1);
+pub(crate) const FAIL_DELAY: Duration = Duration::from_secs(1);
 
 /// quish server (HTTP/3 remote shell).
 #[derive(Parser, Debug)]

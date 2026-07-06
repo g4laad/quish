@@ -109,7 +109,7 @@ impl MonitorClient {
     fn new(sock: UnixSeqpacket) -> Self {
         Self {
             sock: Mutex::new(sock),
-            fail_delay: Duration::from_secs(1),
+            fail_delay: crate::FAIL_DELAY,
         }
     }
 

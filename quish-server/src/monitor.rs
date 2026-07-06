@@ -27,9 +27,6 @@ use tracing::{info, warn};
 
 use crate::ipc::{self, Request, Response, SignRequest, SignResponse};
 
-/// Constant-time failure floor (worker applies it; kept here for parity/config).
-const FAIL_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
-
 /// Monitor configuration, from CLI/args.
 pub struct Config {
     pub listen: SocketAddr,
@@ -150,7 +147,7 @@ fn build_registry() -> Arc<Registry> {
     ];
     #[cfg(not(feature = "pam"))]
     let backends = vec![pubkey];
-    Arc::new(Registry::new(backends, FAIL_DELAY))
+    Arc::new(Registry::new(backends, crate::FAIL_DELAY))
 }
 
 /// Resolve a user's `~/.config/quish/authorized_keys` (root reads any home).
