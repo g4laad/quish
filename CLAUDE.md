@@ -47,8 +47,12 @@ registry (PAM needs root), the host key, and session spawning. They talk over tw
 the worker via `SCM_RIGHTS`. A fully compromised worker still can't read the host key,
 forge an identity, or setuid.
 
-Session setup is an H3 Extended CONNECT (`:protocol = quish`) on the configured secret
-`path` (default `/quish`; any other path → generic 404 before quish logic). Auth rides
+Session setup is an H3 Extended CONNECT on the configured secret `path` (default
+`/quish`; any other path → generic 404 before quish logic). The `:protocol`
+pseudo-header is `webtransport` — h3 0.0.8's `Protocol` is a closed enum, so a custom
+`quish` value is impossible without forking; the secret path + `quish-version` header
+are the real quish discriminators. Channel frames tunnel over H3 DATA on the CONNECT
+stream (not raw QUIC streams). Auth rides
 the `Authorization` header: Basic → PAM password, Bearer → signed-token pubkey (OpenSSH
 ed25519, `~/.config/quish/authorized_keys`, channel-bound via TLS keying-material export
 + timestamp). Each further channel (shell, exec) is its own Extended CONNECT on the same
