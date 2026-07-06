@@ -195,7 +195,6 @@ async fn run(
             "https://{}:{}{}",
             target.host, target.port, target.path
         ))
-        .header(quish_proto::HEADER_USERNAME, &target.user)
         .header(
             quish_proto::HEADER_VERSION,
             quish_proto::PROTOCOL_VERSION.to_string(),

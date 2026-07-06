@@ -13,12 +13,6 @@ pub const PROTOCOL_VERSION: u32 = 1;
 /// ALPN for the QUIC/TLS handshake. quish speaks HTTP/3, so this is `h3`.
 pub const ALPN: &[u8] = b"h3";
 
-/// `:protocol` pseudo-header value that marks an Extended CONNECT as a quish request.
-pub const PROTOCOL_QUISH: &str = "quish";
-
-/// Header carrying the target username (auth verdict still binds it server-side).
-pub const HEADER_USERNAME: &str = "quish-username";
-
 /// Header carrying [`PROTOCOL_VERSION`] as a decimal string.
 pub const HEADER_VERSION: &str = "quish-version";
 
