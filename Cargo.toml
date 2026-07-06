@@ -1,0 +1,14 @@
+[workspace]
+resolver = "3"
+members = ["quish-proto", "quish-auth", "quish-server", "quish-client"]
+
+[workspace.package]
+edition = "2024"
+license = "MIT OR Apache-2.0"
+rust-version = "1.85"
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
