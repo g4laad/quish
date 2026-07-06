@@ -16,6 +16,13 @@ pub const ALPN: &[u8] = b"h3";
 /// Header carrying [`PROTOCOL_VERSION`] as a decimal string.
 pub const HEADER_VERSION: &str = "quish-version";
 
+/// Whether a `quish-version` header value names a protocol version this build
+/// speaks. `None` (header absent) and any unparseable/mismatched value are
+/// unsupported. Kept here so server and client agree on the rule.
+pub fn version_supported(header: Option<&str>) -> bool {
+    matches!(header.and_then(|s| s.trim().parse::<u32>().ok()), Some(v) if v == PROTOCOL_VERSION)
+}
+
 /// Default secret path; anything else gets a generic 404 before quish logic runs.
 pub const DEFAULT_PATH: &str = "/quish";
 
@@ -141,5 +148,16 @@ mod tests {
     fn garbage_body_errs_not_panics() {
         // Fuzz-target invariant: decode never panics on arbitrary bytes.
         let _: Result<ChannelMessage, _> = decode(&[0xff, 0xff, 0xff, 0xff]);
+    }
+
+    #[test]
+    fn version_supported_accepts_current_rejects_others() {
+        assert!(version_supported(Some(&PROTOCOL_VERSION.to_string())));
+        // Literal "1" tracks PROTOCOL_VERSION == 1; update if the version is bumped.
+        assert!(version_supported(Some("1")));
+        assert!(!version_supported(None));
+        assert!(!version_supported(Some("2")));
+        assert!(!version_supported(Some("abc")));
+        assert!(!version_supported(Some("")));
     }
 }

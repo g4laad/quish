@@ -239,6 +239,19 @@ async fn handle_request(
         return stream.finish().await.map_err(Into::into);
     }
 
+    // Documented discriminator: reject an unsupported protocol version with a
+    // clear status, before any auth work. Placed AFTER the secret-path check so
+    // a wrong path still gets the generic 404 (path stays unguessable).
+    let version = req
+        .headers()
+        .get(quish_proto::HEADER_VERSION)
+        .and_then(|v| v.to_str().ok());
+    if !quish_proto::version_supported(version) {
+        warn!(%conn_id, ?version, "unsupported quish-version");
+        respond(&mut stream, StatusCode::UPGRADE_REQUIRED).await?;
+        return stream.finish().await.map_err(Into::into);
+    }
+
     let ip = conn_info.peer_addr.ip();
 
     // A connection that keeps failing auth gets cheap 401s (no monitor round-trip)

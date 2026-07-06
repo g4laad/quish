@@ -214,6 +214,12 @@ async fn run(
     match resp.status() {
         http::StatusCode::OK => {}
         http::StatusCode::UNAUTHORIZED => bail!("authentication failed"),
+        http::StatusCode::UPGRADE_REQUIRED => {
+            bail!(
+                "server rejected our protocol version (quish-version {}); client/server mismatch",
+                quish_proto::PROTOCOL_VERSION
+            )
+        }
         s => bail!("server rejected session: HTTP {s}"),
     }
     info!(user = %target.user, "session authenticated");
