@@ -33,12 +33,12 @@ Full design + milestones: `~/.claude/plans/plan-a-new-project-gentle-charm.md`.
 - `quish-server` — `quishd`: `main` (sync mode dispatch), `monitor.rs`, `worker.rs`,
   `session.rs` (dev-mode PTY/exec), `ipc.rs` (control + signing wire types/framing),
   `privdrop.rs` (chroot/setuid + session helper), `signproxy.rs` (rustls signing
-  proxy), `transport.rs` (`Backend` seam). `ratelimit.rs`/`config.rs` land in M6
-  (config is CLI flags for now).
+  proxy), `transport.rs` (`Backend` seam), `ratelimit.rs` (per-IP DoS caps),
+  `config.rs` (TOML file; CLI flags override).
 - `quish-client` — `quish` CLI: `connect.rs` (cert verifier + TOFU pinning),
   `terminal.rs` (raw mode + channel pump).
 - `dist/` — `systemd/quishd.service`, `pam.d/quish` (`pam_unix ... nodelay`),
-  `sysusers.d/quishd.conf`. (`server.toml` deferred with `config.rs`.)
+  `sysusers.d/quishd.conf`, `server.toml`.
 
 ## Architecture in one paragraph
 

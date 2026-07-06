@@ -1,0 +1,20 @@
+# quish server configuration. Pass with `quishd --config /etc/quish/server.toml`.
+# Every field is optional; a CLI flag of the same name overrides what's here.
+
+# UDP address to listen on. Privileged ports (<1024) are supported: the worker
+# binds while still root, then drops privileges.
+listen = "[::]:443"
+
+# Secret request path. Any other path returns a generic 404 before quish logic
+# runs, so an unknown scanner just sees an ordinary web server.
+path = "/quish"
+
+# Unprivileged account the network-facing worker chroots + setuids to.
+privsep_user = "quish"
+
+# Empty directory the worker chroots into (systemd RuntimeDirectory=quishd).
+privsep_dir = "/run/quishd"
+
+# Persist the host key here so the fingerprint is stable across restarts (clients
+# pin it TOFU-style). Generated with 0600 perms on first start.
+host_key = "/var/lib/quishd/host_key.der"

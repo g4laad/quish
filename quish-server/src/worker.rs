@@ -56,6 +56,10 @@ pub fn run() -> Result<()> {
             .context("connect ctrl socket")?;
         let sign_stream = UnixStream::connect(&sign_path).context("connect sign socket")?;
 
+        // Bind the UDP socket while still root so privileged ports (<1024) work;
+        // quinn then adopts this already-bound socket after we drop privileges.
+        let socket = std::net::UdpSocket::bind(listen).context("binding UDP socket")?;
+
         // Irrevocably drop privileges.
         crate::privdrop::drop_to_worker(&chroot_dir, &worker_user)?;
         info!(user = %worker_user, "worker privilege-dropped");
@@ -72,7 +76,10 @@ pub fn run() -> Result<()> {
             .context("quinn rustls config")?;
         let mut sc = quinn::ServerConfig::with_crypto(Arc::new(quic));
         sc.transport_config(crate::transport::transport_config());
-        let endpoint = quinn::Endpoint::server(sc, listen).context("binding endpoint")?;
+        let runtime = quinn::default_runtime().context("no async runtime for quinn")?;
+        let endpoint =
+            quinn::Endpoint::new(quinn::EndpointConfig::default(), Some(sc), socket, runtime)
+                .context("building endpoint from bound socket")?;
 
         let client = Arc::new(MonitorClient::new(ctrl));
         let backend = Arc::new(crate::transport::Backend::Privsep { client });

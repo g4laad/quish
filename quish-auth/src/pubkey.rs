@@ -258,6 +258,36 @@ mod tests {
         ));
     }
 
+    // An OpenSSH ed25519 private key + its authorized_keys line. Verifies the
+    // `build_token` path (ssh-key parses the private key without its dalek-backed
+    // `ed25519` feature; we sign with ed25519-dalek directly).
+    const TEST_OPENSSH_KEY: &str = "-----BEGIN OPENSSH PRIVATE KEY-----\n\
+b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW\n\
+QyNTUxOQAAACCICKPLeQiyQYZ/bpQyvnn5XIXQiUXY9nNnD5GQWsQLrQAAAJBJxtGBScbR\n\
+gQAAAAtzc2gtZWQyNTUxOQAAACCICKPLeQiyQYZ/bpQyvnn5XIXQiUXY9nNnD5GQWsQLrQ\n\
+AAAEBb/hbmL0QEfMX72P8ScsZvhOKZZ4a8yZ9GWUC7sgS8NIgIo8t5CLJBhn9ulDK+eflc\n\
+hdCJRdj2c2cPkZBaxAutAAAAB2ZpeHR1cmUBAgMEBQY=\n\
+-----END OPENSSH PRIVATE KEY-----\n";
+    const TEST_OPENSSH_PUB: &str =
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIIgIo8t5CLJBhn9ulDK+eflchdCJRdj2c2cPkZBaxAut fixture";
+
+    #[tokio::test]
+    async fn openssh_private_key_builds_a_valid_token() {
+        let dir = std::env::temp_dir().join(format!("quish-bt-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("authorized_keys");
+        std::fs::write(&path, TEST_OPENSSH_PUB).unwrap();
+        let backend = PubkeyBackend::new(path);
+        let binding = [11u8; 32];
+
+        let b64 = build_token(TEST_OPENSSH_KEY.as_bytes(), "dave", &binding).unwrap();
+        let creds = Credentials::SignedToken(parse_token(&b64).unwrap());
+        assert!(matches!(
+            backend.authenticate(&conn(binding), &creds).await,
+            Verdict::Allow { user } if user == "dave"
+        ));
+    }
+
     #[tokio::test]
     async fn stale_timestamp_is_denied() {
         let signing = ed25519_dalek::SigningKey::from_bytes(&[8u8; 32]);

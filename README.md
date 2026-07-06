@@ -66,6 +66,10 @@ sudo quishd --listen 127.0.0.1:4433 \
 Pass `--host-key <path>` to persist the host identity; without it the key is
 ephemeral and clients see a host-key mismatch after every restart.
 
+Instead of flags you can use a TOML config (`quishd --config /etc/quish/server.toml`,
+see `dist/server.toml`); any CLI flag overrides the file. Privileged ports (`<1024`)
+work — the worker binds while still root, then drops privileges.
+
 ## Client auth
 
 - **Password** (default): prompted, or `QUISH_PASSWORD` for scripts.

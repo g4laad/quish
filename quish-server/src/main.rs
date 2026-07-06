@@ -10,6 +10,7 @@
 //!   * **dev** (`--dev-insecure-user`): single process, in-process auth, no
 //!     privilege drop — for root-free local e2e.
 
+mod config;
 mod ipc;
 mod monitor;
 mod privdrop;
@@ -19,6 +20,7 @@ mod signproxy;
 mod transport;
 mod worker;
 
+use std::net::SocketAddr;
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use clap::Parser;
@@ -31,26 +33,30 @@ const FAIL_DELAY: Duration = Duration::from_secs(1);
 #[derive(Parser, Debug)]
 #[command(name = "quishd", version)]
 struct Args {
-    /// UDP address to listen on.
-    #[arg(long, default_value = "[::]:4433")]
-    listen: std::net::SocketAddr,
+    /// TOML config file (see dist/server.toml). CLI flags override its values.
+    #[arg(long, value_name = "PATH")]
+    config: Option<PathBuf>,
 
-    /// Secret request path; any other path gets a generic 404.
-    #[arg(long, default_value = quish_proto::DEFAULT_PATH)]
-    path: String,
+    /// UDP address to listen on. [default: [::]:4433]
+    #[arg(long)]
+    listen: Option<SocketAddr>,
+
+    /// Secret request path; any other path gets a generic 404. [default: /quish]
+    #[arg(long)]
+    path: Option<String>,
 
     /// Dev mode: accept any password for this user, single process, no privilege
     /// drop — root-free local e2e.
     #[arg(long, value_name = "USER")]
     dev_insecure_user: Option<String>,
 
-    /// Chroot directory for the worker (privsep mode).
-    #[arg(long, default_value = "/run/quishd")]
-    privsep_dir: String,
+    /// Chroot directory for the worker (privsep mode). [default: /run/quishd]
+    #[arg(long)]
+    privsep_dir: Option<String>,
 
-    /// Unprivileged user the worker drops to (privsep mode).
-    #[arg(long, default_value = "quish")]
-    privsep_user: String,
+    /// Unprivileged user the worker drops to (privsep mode). [default: quish]
+    #[arg(long)]
+    privsep_user: Option<String>,
 
     /// Persist the host key (DER) here; generated on first use. Without it the
     /// key is ephemeral and the fingerprint changes on every restart.
@@ -90,20 +96,42 @@ fn main() -> anyhow::Result<()> {
     if args.internal_worker {
         return worker::run();
     }
+
+    // Merge: CLI flag → config file → built-in default.
+    let file = match &args.config {
+        Some(p) => config::FileConfig::load(p)?,
+        None => config::FileConfig::default(),
+    };
+    let listen = args
+        .listen
+        .or(file.listen)
+        .unwrap_or_else(|| "[::]:4433".parse().unwrap());
+    let path = args
+        .path
+        .or(file.path)
+        .unwrap_or_else(|| quish_proto::DEFAULT_PATH.to_string());
+    let host_key = args.host_key.or(file.host_key);
+
     if let Some(dev_user) = args.dev_insecure_user {
-        return run_dev(args.listen, args.path, dev_user);
+        return run_dev(listen, path, dev_user);
     }
     monitor::run(monitor::Config {
-        listen: args.listen,
-        path: args.path,
-        chroot_dir: args.privsep_dir,
-        worker_user: args.privsep_user,
-        host_key: args.host_key,
+        listen,
+        path,
+        chroot_dir: args
+            .privsep_dir
+            .or(file.privsep_dir)
+            .unwrap_or_else(|| "/run/quishd".to_string()),
+        worker_user: args
+            .privsep_user
+            .or(file.privsep_user)
+            .unwrap_or_else(|| "quish".to_string()),
+        host_key,
     })
 }
 
 /// Single-process dev server: in-process registry + local session spawning.
-fn run_dev(listen: std::net::SocketAddr, path: String, dev_user: String) -> anyhow::Result<()> {
+fn run_dev(listen: SocketAddr, path: String, dev_user: String) -> anyhow::Result<()> {
     let backends: Vec<Box<dyn AuthBackend>> = vec![
         Box::new(DevInsecureBackend::new(dev_user)),
         Box::new(PubkeyBackend::new(authorized_keys_path()?)),
