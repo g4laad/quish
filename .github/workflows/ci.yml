@@ -38,6 +38,17 @@ jobs:
       - name: Test
         run: cargo test --workspace
 
+  e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build workspace (both binaries)
+        run: cargo build --workspace
+      - name: Dev-mode e2e
+        run: cargo test -p quish-server --test e2e -- --ignored --nocapture
+
   build:
     runs-on: ubuntu-latest
     steps:
