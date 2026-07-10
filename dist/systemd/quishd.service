@@ -14,6 +14,8 @@ ExecStart=/usr/bin/quishd --listen [::]:443 --privsep-user quish --privsep-dir /
 User=root
 RuntimeDirectory=quishd
 RuntimeDirectoryMode=0755
+# The control/signing sockets are NOT placed here: the monitor creates them in a
+# root-only sibling dir (/run/quishd.sock.d-<pid>) — do not relocate RuntimeDirectory to a shared path.
 Restart=on-failure
 RestartSec=2
 

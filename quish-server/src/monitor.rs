@@ -5,7 +5,7 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::os::fd::AsFd;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -49,10 +49,11 @@ pub fn run(cfg: Config) -> Result<()> {
     let fingerprint = quish_proto::cert_fingerprint(&cert_der);
     info!(%fingerprint, "host certificate SHA-256 (pin as: localhost:PORT <fingerprint>)");
 
-    // Private socket directory (root, 0700).
-    let sock_dir = std::env::temp_dir().join(format!("quishd-{}", std::process::id()));
-    std::fs::create_dir_all(&sock_dir).context("socket dir")?;
-    std::fs::set_permissions(&sock_dir, std::fs::Permissions::from_mode(0o700))?;
+    // Root-only socket dir: a sibling of the chroot dir so it isn't exposed inside
+    // the chroot. Created exclusively (fails if it already exists) so a local
+    // attacker can't pre-create it and own the path our sockets live in.
+    let sock_dir = socket_dir_for(&cfg.chroot_dir);
+    prepare_socket_dir(&sock_dir)?;
     let ctrl_path = sock_dir.join("ctrl");
     let sign_path = sock_dir.join("sign");
 
@@ -97,6 +98,45 @@ pub fn run(cfg: Config) -> Result<()> {
 
     let _ = std::fs::remove_dir_all(&sock_dir);
     result
+}
+
+/// Sibling-of-chroot socket dir, pid-suffixed to avoid colliding with a
+/// concurrent instance. Absolute so the pre-chroot worker can reach it.
+fn socket_dir_for(chroot_dir: &str) -> PathBuf {
+    PathBuf::from(format!(
+        "{}.sock.d-{}",
+        chroot_dir.trim_end_matches('/'),
+        std::process::id()
+    ))
+}
+
+/// Create `dir` exclusively, 0700, and verify it is root-owned. Fails closed if
+/// the path already exists (a pre-existing dir is untrusted) unless it is a
+/// root-owned dir left by a crashed prior run (then clear+recreate), or if it
+/// isn't root-owned after creation.
+fn prepare_socket_dir(dir: &Path) -> Result<()> {
+    if dir.exists() {
+        let meta = std::fs::symlink_metadata(dir).context("stat existing socket dir")?;
+        if meta.uid() != 0 || !meta.file_type().is_dir() {
+            anyhow::bail!(
+                "socket dir {} exists and is not a root-owned directory; refusing",
+                dir.display()
+            );
+        }
+        std::fs::remove_dir_all(dir).context("clearing stale socket dir")?;
+    }
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(dir) // NOT recursive: fails if it already exists (exclusive)
+        .with_context(|| format!("exclusively creating socket dir {}", dir.display()))?;
+    let meta = std::fs::symlink_metadata(dir).context("stat new socket dir")?;
+    if meta.uid() != 0 {
+        anyhow::bail!(
+            "socket dir {} is not root-owned after creation",
+            dir.display()
+        );
+    }
+    Ok(())
 }
 
 /// Load the persisted host key + cert (DER), or generate and persist a fresh
@@ -464,5 +504,24 @@ mod tests {
     fn take_conn_unknown_is_empty() {
         let mut idx = SessionIndex::default();
         assert!(idx.take_conn(99).is_empty());
+    }
+
+    #[test]
+    fn exclusive_create_rejects_existing() {
+        let d = std::env::temp_dir().join(format!("quish-sockdir-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::DirBuilder::new().mode(0o700).create(&d).unwrap();
+        // Second exclusive create must fail (EEXIST) — the anti-race guard.
+        assert!(std::fs::DirBuilder::new().mode(0o700).create(&d).is_err());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn socket_dir_is_sibling_of_chroot() {
+        let d = socket_dir_for("/run/quishd");
+        let s = d.to_string_lossy();
+        assert!(s.starts_with("/run/quishd.sock.d-"), "got {s}");
+        // A sibling, not a child of the chroot dir.
+        assert_ne!(d.parent(), Some(Path::new("/run/quishd")));
     }
 }
