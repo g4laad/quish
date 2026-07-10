@@ -221,12 +221,7 @@ async fn serve_control(mut listener: UnixSeqpacketListener, registry: Arc<Regist
                 ipc::ctrl_send(&sock, &Response::Verdict(allow), &[]).await?;
             }
 
-            Request::SpawnShell {
-                conn_id,
-                term,
-                cols: _,
-                rows: _,
-            } => {
+            Request::SpawnShell { conn_id, term } => {
                 let reply = match st.users.get(&conn_id).cloned() {
                     Some(user) => match spawn_shell(&user, &term) {
                         Ok((child, master)) => {

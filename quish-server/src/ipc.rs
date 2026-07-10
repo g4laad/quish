@@ -57,12 +57,7 @@ pub enum Request {
         channel_binding: [u8; 32],
     },
     /// Open a PTY shell for `conn_id`'s authed user (response passes the master fd).
-    SpawnShell {
-        conn_id: u64,
-        term: String,
-        cols: u16,
-        rows: u16,
-    },
+    SpawnShell { conn_id: u64, term: String },
     /// Run a command for `conn_id`'s authed user (response passes stdin/out/err fds).
     SpawnExec { conn_id: u64, command: String },
     /// Wait for a spawned session and return its exit code.

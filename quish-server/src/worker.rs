@@ -139,19 +139,11 @@ impl MonitorClient {
         }
     }
 
-    async fn spawn_shell(
-        &self,
-        conn_id: u64,
-        term: &str,
-        cols: u16,
-        rows: u16,
-    ) -> Result<(u64, OwnedFd)> {
+    async fn spawn_shell(&self, conn_id: u64, term: &str) -> Result<(u64, OwnedFd)> {
         let (resp, mut fds) = self
             .call(&Request::SpawnShell {
                 conn_id,
                 term: term.to_string(),
-                cols,
-                rows,
             })
             .await?;
         match resp {
@@ -201,7 +193,7 @@ pub async fn serve_channel(client: &MonitorClient, conn_id: u64, stream: FullStr
     match quish_proto::decode::<ChannelOpen>(&body).context("decoding ChannelOpen")? {
         ChannelOpen::Shell { term, cols, rows } => {
             info!(%conn_id, %cols, %rows, "shell channel");
-            let (session_id, master) = client.spawn_shell(conn_id, &term, cols, rows).await?;
+            let (session_id, master) = client.spawn_shell(conn_id, &term).await?;
             run_shell(client, session_id, master, cols, rows, send, reader).await
         }
         ChannelOpen::Exec { command } => {
