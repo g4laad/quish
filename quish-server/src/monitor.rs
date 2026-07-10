@@ -186,6 +186,53 @@ fn sign_with(key: &Arc<dyn SigningKey>, scheme: u16, message: &[u8]) -> Option<V
     signer.sign(message).ok()
 }
 
+/// Reverse index: which session ids belong to which connection. Kept separate
+/// from the `Child` store so the bookkeeping is unit-testable without spawning.
+#[derive(Default)]
+struct SessionIndex {
+    sessions_by_conn: HashMap<u64, Vec<u64>>,
+}
+
+impl SessionIndex {
+    /// Record that `session_id` belongs to `conn_id`.
+    fn insert(&mut self, conn_id: u64, session_id: u64) {
+        self.sessions_by_conn
+            .entry(conn_id)
+            .or_default()
+            .push(session_id);
+    }
+
+    /// Drain and return every session id tied to `conn_id`.
+    fn take_conn(&mut self, conn_id: u64) -> Vec<u64> {
+        self.sessions_by_conn.remove(&conn_id).unwrap_or_default()
+    }
+
+    /// Remove `session_id` from its connection's list (a normal reap).
+    fn forget(&mut self, session_id: u64) {
+        for sids in self.sessions_by_conn.values_mut() {
+            sids.retain(|&s| s != session_id);
+        }
+    }
+}
+
+/// Terminate (if still alive) and reap a session child, returning its exit code.
+/// Never blocks indefinitely: a child that closed its pipes but is still running
+/// is signalled first, so the subsequent wait returns promptly.
+async fn reap_child(mut child: Child) -> i32 {
+    let pid = child.id();
+    tokio::task::spawn_blocking(move || {
+        if let Ok(Some(status)) = child.try_wait() {
+            return status.code().unwrap_or(-1);
+        }
+        let p = nix::unistd::Pid::from_raw(pid as i32);
+        let _ = nix::sys::signal::kill(p, nix::sys::signal::Signal::SIGHUP);
+        let _ = nix::sys::signal::kill(p, nix::sys::signal::Signal::SIGKILL);
+        child.wait().map(|s| s.code().unwrap_or(-1)).unwrap_or(-1)
+    })
+    .await
+    .unwrap_or(-1)
+}
+
 /// State the monitor keeps for the (single) worker connection.
 #[derive(Default)]
 struct State {
@@ -193,6 +240,8 @@ struct State {
     users: HashMap<u64, String>,
     /// session_id → spawned child (for reaping).
     sessions: HashMap<u64, Child>,
+    /// conn_id → its live session ids (for kill-on-close).
+    conn_sessions: SessionIndex,
     next_session: u64,
 }
 
@@ -232,7 +281,7 @@ async fn serve_control(mut listener: UnixSeqpacketListener, registry: Arc<Regist
                 let reply = match st.users.get(&conn_id).cloned() {
                     Some(user) => match spawn_shell(&user, &term) {
                         Ok((child, master)) => {
-                            let id = st.alloc(child);
+                            let id = st.alloc(conn_id, child);
                             ipc::ctrl_send(
                                 &sock,
                                 &Response::Spawned { session_id: id },
@@ -256,7 +305,7 @@ async fn serve_control(mut listener: UnixSeqpacketListener, registry: Arc<Regist
                 let reply = match st.users.get(&conn_id).cloned() {
                     Some(user) => match spawn_exec(&user, &command) {
                         Ok((child, io)) => {
-                            let id = st.alloc(child);
+                            let id = st.alloc(conn_id, child);
                             let [i, o, e] = &io;
                             ipc::ctrl_send(
                                 &sock,
@@ -279,13 +328,11 @@ async fn serve_control(mut listener: UnixSeqpacketListener, registry: Arc<Regist
 
             Request::Reap { session_id } => {
                 let reply = match st.sessions.remove(&session_id) {
-                    Some(mut child) => {
-                        let code = tokio::task::spawn_blocking(move || {
-                            child.wait().map(|s| s.code().unwrap_or(-1)).unwrap_or(-1)
-                        })
-                        .await
-                        .unwrap_or(-1);
-                        Response::Exited(code)
+                    Some(child) => {
+                        // child already taken from `sessions`; drop it from the
+                        // reverse index too so `Close` doesn't double-reap.
+                        st.forget_session(session_id);
+                        Response::Exited(reap_child(child).await)
                     }
                     None => Response::Failed,
                 };
@@ -294,6 +341,11 @@ async fn serve_control(mut listener: UnixSeqpacketListener, registry: Arc<Regist
 
             Request::Close { conn_id } => {
                 st.users.remove(&conn_id);
+                for sid in st.conn_sessions.take_conn(conn_id) {
+                    if let Some(child) = st.sessions.remove(&sid) {
+                        let _ = reap_child(child).await;
+                    }
+                }
                 ipc::ctrl_send(&sock, &Response::Closed, &[]).await?;
             }
         }
@@ -304,11 +356,18 @@ async fn serve_control(mut listener: UnixSeqpacketListener, registry: Arc<Regist
 }
 
 impl State {
-    fn alloc(&mut self, child: Child) -> u64 {
+    fn alloc(&mut self, conn_id: u64, child: Child) -> u64 {
         self.next_session += 1;
         let id = self.next_session;
         self.sessions.insert(id, child);
+        self.conn_sessions.insert(conn_id, id);
         id
+    }
+
+    /// Remove a reaped session from both the child store and the reverse index.
+    fn forget_session(&mut self, session_id: u64) {
+        self.sessions.remove(&session_id);
+        self.conn_sessions.forget(session_id);
     }
 }
 
@@ -374,4 +433,36 @@ fn session_command(u: &User) -> Command {
         .env(ipc::ENV_SESS_HOME, u.dir.display().to_string())
         .env(ipc::ENV_SESS_SHELL, shell);
     cmd
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn take_conn_returns_all_sessions() {
+        let mut idx = SessionIndex::default();
+        idx.insert(1, 10);
+        idx.insert(1, 11);
+        let mut got = idx.take_conn(1);
+        got.sort_unstable();
+        assert_eq!(got, vec![10, 11]);
+        // draining removes the entry
+        assert!(idx.take_conn(1).is_empty());
+    }
+
+    #[test]
+    fn forget_removes_session_from_conn() {
+        let mut idx = SessionIndex::default();
+        idx.insert(1, 10);
+        idx.insert(1, 11);
+        idx.forget(10);
+        assert_eq!(idx.take_conn(1), vec![11]);
+    }
+
+    #[test]
+    fn take_conn_unknown_is_empty() {
+        let mut idx = SessionIndex::default();
+        assert!(idx.take_conn(99).is_empty());
+    }
 }
