@@ -3,6 +3,7 @@
 //! thread so they never stall the async runtime.
 
 use pam_client::{Context, Flag, conv_mock::Conversation};
+use zeroize::Zeroizing;
 
 use crate::{AuthBackend, ConnInfo, Credentials, Verdict};
 
@@ -28,14 +29,18 @@ impl AuthBackend for PamBackend {
             return Verdict::Deny;
         };
         let username = username.clone();
-        let password = password.to_string();
+        let password = Zeroizing::new(password.to_string());
 
         // PAM is blocking C; keep it off the reactor.
         let ok = tokio::task::spawn_blocking(move || {
             let mut ctx = match Context::new(
                 SERVICE,
                 None,
-                Conversation::with_credentials(username.clone(), password),
+                // Borrow the inner String for the C conversation; `password`
+                // (Zeroizing) is moved into the closure and wiped when it drops
+                // at closure end. pam_client takes an owned copy it may not
+                // scrub — residual outside our control.
+                Conversation::with_credentials(username.clone(), &*password),
             ) {
                 Ok(c) => c,
                 Err(_) => return false,
