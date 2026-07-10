@@ -1500,6 +1500,7 @@ dependencies = [
  "async-trait",
  "base64",
  "ed25519-dalek",
+ "libc",
  "pam-client",
  "postcard",
  "serde",
