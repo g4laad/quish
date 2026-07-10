@@ -85,6 +85,9 @@ fn main() -> anyhow::Result<()> {
     }
 
     tracing_subscriber::fmt()
+        // tracing-subscriber never tty-detects; without this, ANSI escapes land
+        // in piped logs (journald, the e2e harness) and break `field=` parsing.
+        .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stdout()))
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| "quishd=info".into()),
