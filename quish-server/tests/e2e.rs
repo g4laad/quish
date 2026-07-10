@@ -44,11 +44,18 @@ fn extract_addr(line: &str) -> Option<SocketAddr> {
     None
 }
 
+/// Pull the hex fingerprint out of quishd's `... fingerprint=<hex>` startup log.
+fn extract_fingerprint(line: &str) -> Option<String> {
+    line.split_whitespace()
+        .find_map(|tok| tok.strip_prefix("fingerprint=").map(str::to_string))
+}
+
 /// A running dev-mode `quishd`, killed on drop so no daemon leaks if a test
 /// panics.
 struct DevServer {
     child: Child,
     addr: SocketAddr,
+    fingerprint: String,
 }
 
 impl DevServer {
@@ -70,23 +77,27 @@ impl DevServer {
         let (tx, rx) = mpsc::channel();
         thread::spawn(move || {
             let reader = BufReader::new(stdout);
+            let mut fingerprint: Option<String> = None;
             for line in reader.lines() {
                 let line = match line {
                     Ok(l) => l,
                     Err(_) => break,
                 };
+                if let Some(fp) = extract_fingerprint(&line) {
+                    fingerprint = Some(fp);
+                }
                 if line.contains("quishd listening")
                     && let Some(addr) = extract_addr(&line)
                 {
-                    let _ = tx.send(addr);
+                    let _ = tx.send((addr, fingerprint.clone()));
                 }
                 // Keep draining after the match (loop to EOF) so quishd's later
                 // per-connection log lines can't fill the pipe and block it.
             }
         });
 
-        let addr = match rx.recv_timeout(Duration::from_secs(10)) {
-            Ok(addr) => addr,
+        let (addr, fingerprint) = match rx.recv_timeout(Duration::from_secs(10)) {
+            Ok(ready) => ready,
             Err(_) => {
                 // Don't leak the child: Drop hasn't taken ownership yet.
                 let _ = child.kill();
@@ -94,8 +105,14 @@ impl DevServer {
                 panic!("quishd did not report a listen address within 10s");
             }
         };
+        let fingerprint =
+            fingerprint.expect("quishd logged a listen address but no certificate fingerprint");
 
-        DevServer { child, addr }
+        DevServer {
+            child,
+            addr,
+            fingerprint,
+        }
     }
 }
 
@@ -106,9 +123,10 @@ impl Drop for DevServer {
     }
 }
 
-/// Run the real `quish` client binary against `server`. `_server` ties the
-/// borrow so callers can't run a client after the server has been dropped.
-fn run_client(_server: &DevServer, args: &[&str], password: Option<&str>) -> Output {
+/// Run the real `quish` client binary against `server`. The `server` borrow ties
+/// the lifetime (so callers can't run a client after the server is dropped) and
+/// supplies the cert fingerprint we pre-trust below.
+fn run_client(server: &DevServer, args: &[&str], password: Option<&str>) -> Output {
     let quishd = PathBuf::from(env!("CARGO_BIN_EXE_quishd"));
     let quish = quishd.with_file_name("quish");
     if !quish.exists() {
@@ -119,6 +137,16 @@ fn run_client(_server: &DevServer, args: &[&str], password: Option<&str>) -> Out
     }
 
     let home = fresh_temp_dir("quish-client-home");
+    // Pre-trust the dev server's ephemeral cert: the client now prompts on the
+    // controlling terminal for unknown host keys (StrictHostKeyChecking=ask), so
+    // seed known_hosts to keep these non-interactive runs from blocking.
+    let kh_dir = home.join(".config/quish");
+    std::fs::create_dir_all(&kh_dir).unwrap();
+    std::fs::write(
+        kh_dir.join("known_hosts"),
+        format!("{} {}\n", server.addr, server.fingerprint),
+    )
+    .unwrap();
     let mut cmd = Command::new(&quish);
     cmd.args(args).env("HOME", &home);
     if let Some(p) = password {

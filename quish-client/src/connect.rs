@@ -2,8 +2,9 @@
 //!
 //! Identity policy: try the web PKI first (a real cert on a real hostname just
 //! works, no ceremony). On failure, fall back to SSH-style trust-on-first-use —
-//! pin the cert's SHA-256 in `~/.config/quish/known_hosts` and hard-fail on any
-//! later mismatch. This is `StrictHostKeyChecking=accept-new` semantics.
+//! prompt the user before pinning the cert's SHA-256 in
+//! `~/.config/quish/known_hosts`, then hard-fail on any later mismatch. This is
+//! `StrictHostKeyChecking=ask` semantics.
 
 use std::{
     fs,
@@ -105,6 +106,12 @@ impl ServerCertVerifier for TofuVerifier {
                 self.host_key
             ))),
             None => {
+                if !prompt_accept(&self.host_key, &fp) {
+                    return Err(rustls::Error::General(format!(
+                        "host key verification failed for {} (not accepted)",
+                        self.host_key
+                    )));
+                }
                 pin(&self.known_hosts, &self.host_key, &fp)
                     .map_err(|e| rustls::Error::General(format!("pinning host key: {e}")))?;
                 eprintln!(
@@ -151,6 +158,60 @@ impl ServerCertVerifier for TofuVerifier {
     }
 }
 
+/// Ask on the controlling terminal whether to trust an unknown host key
+/// (ssh `StrictHostKeyChecking=ask`). Reads `/dev/tty` directly so piped stdin is
+/// left intact, and refuses (never auto-accepts) when no terminal is available.
+fn prompt_accept(host: &str, fp: &str) -> bool {
+    let (Ok(w), Ok(r)) = (
+        fs::OpenOptions::new().write(true).open("/dev/tty"),
+        fs::File::open("/dev/tty"),
+    ) else {
+        eprintln!(
+            "quish: host key for {host} is unknown and no terminal is available \
+             to confirm it; refusing to connect"
+        );
+        return false;
+    };
+    decide(std::io::BufReader::new(r), w, host, fp)
+}
+
+/// Interactive accept / abort / show-fingerprint loop, split from the terminal
+/// I/O so it can be driven by tests. `yes` accepts and pins, `no` aborts,
+/// `fingerprint` prints the SHA-256 and re-asks; EOF or a read error aborts.
+fn decide(mut reader: impl std::io::BufRead, mut w: impl Write, host: &str, fp: &str) -> bool {
+    let _ = writeln!(
+        w,
+        "The authenticity of host '{host}' can't be established.\n\
+         It has no entry in your known_hosts file."
+    );
+    let mut line = String::new();
+    loop {
+        let _ = write!(w, "Accept host key (yes/no/fingerprint)? ");
+        let _ = w.flush();
+        line.clear();
+        match reader.read_line(&mut line) {
+            Ok(0) | Err(_) => {
+                let _ = writeln!(w, "\nHost key verification aborted.");
+                return false;
+            }
+            Ok(_) => {}
+        }
+        match line.trim().to_ascii_lowercase().as_str() {
+            "yes" | "y" => return true,
+            "no" | "n" => {
+                let _ = writeln!(w, "Host key verification aborted.");
+                return false;
+            }
+            "fingerprint" | "fp" | "f" => {
+                let _ = writeln!(w, "SHA-256 fingerprint: {fp}");
+            }
+            _ => {
+                let _ = writeln!(w, "Please type 'yes', 'no', or 'fingerprint'.");
+            }
+        }
+    }
+}
+
 /// Look up the pinned fingerprint for `host` in a `known_hosts` file.
 fn lookup(path: &PathBuf, host: &str) -> Option<String> {
     let contents = fs::read_to_string(path).ok()?;
@@ -187,5 +248,63 @@ mod tests {
         assert_eq!(lookup(&path, "h:1"), Some("deadbeef".into()));
         assert_eq!(lookup(&path, "other:1"), None);
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    // Drive `decide` with an in-memory reader/writer, returning its verdict and
+    // everything it printed so tests can assert on both.
+    fn run_decide(input: &[u8], fp: &str) -> (bool, String) {
+        let mut out = Vec::new();
+        let accepted = decide(
+            std::io::Cursor::new(input.to_vec()),
+            &mut out,
+            "host:443",
+            fp,
+        );
+        (accepted, String::from_utf8(out).unwrap())
+    }
+
+    #[test]
+    fn accepts_on_yes_or_y() {
+        assert!(run_decide(b"yes\n", "aa:bb:cc").0);
+        assert!(run_decide(b"y\n", "aa:bb:cc").0);
+    }
+
+    #[test]
+    fn aborts_on_no_or_n() {
+        assert!(!run_decide(b"no\n", "aa:bb:cc").0);
+        assert!(!run_decide(b"n\n", "aa:bb:cc").0);
+    }
+
+    #[test]
+    fn accepts_after_trimming_and_lowercasing() {
+        assert!(run_decide(b"  YES \n", "aa:bb:cc").0);
+    }
+
+    #[test]
+    fn fingerprint_command_shows_fp_then_re_prompts_and_accepts() {
+        let (accepted, out) = run_decide(b"fingerprint\nyes\n", "aa:bb:cc");
+        assert!(accepted);
+        assert!(out.contains("aa:bb:cc"), "fingerprint not displayed: {out}");
+    }
+
+    #[test]
+    fn fingerprint_aliases_show_fp() {
+        for alias in [&b"f\nno\n"[..], &b"fp\nno\n"[..]] {
+            let (accepted, out) = run_decide(alias, "aa:bb:cc");
+            assert!(!accepted);
+            assert!(out.contains("aa:bb:cc"), "alias did not display fp: {out}");
+        }
+    }
+
+    #[test]
+    fn invalid_answer_re_prompts_without_accepting() {
+        let (accepted, out) = run_decide(b"maybe\nno\n", "aa:bb:cc");
+        assert!(!accepted);
+        assert!(out.contains("Please type"), "no re-prompt hint: {out}");
+    }
+
+    #[test]
+    fn eof_aborts_without_accepting() {
+        assert!(!run_decide(b"", "aa:bb:cc").0);
     }
 }
