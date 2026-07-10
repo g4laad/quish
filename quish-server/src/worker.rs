@@ -4,7 +4,6 @@
 //! fds. Auth verdicts are the monitor's; the worker only sees allow/deny.
 
 use std::fs::File;
-use std::io::{Read, Write};
 use std::os::fd::OwnedFd;
 use std::os::unix::net::UnixStream;
 use std::sync::Arc;
@@ -24,7 +23,9 @@ use tokio_seqpacket::UnixSeqpacket;
 use tracing::info;
 
 use crate::ipc::{self, Request, Response};
-use crate::session::{FrameReader, FullStream, SendHalf, send_msg, spawn_frame_reader};
+use crate::session::{
+    FrameReader, FullStream, SendHalf, read_loop, send_msg, spawn_frame_reader, write_loop,
+};
 use crate::signproxy::ProxySigningKey;
 
 /// `--internal-worker` entry. Connects to the monitor, drops privileges, then
@@ -313,30 +314,6 @@ async fn run_exec(
     let code = client.reap(session_id).await;
     send_msg(&mut send, &ChannelMessage::ExitStatus(code)).await?;
     send.finish().await.map_err(Into::into)
-}
-
-/// Blocking fd → mpsc (session output). Ends on EOF/error.
-fn read_loop(mut file: File, tx: mpsc::Sender<Vec<u8>>) {
-    let mut buf = [0u8; 8192];
-    loop {
-        match file.read(&mut buf) {
-            Ok(0) | Err(_) => break,
-            Ok(n) => {
-                if tx.blocking_send(buf[..n].to_vec()).is_err() {
-                    break;
-                }
-            }
-        }
-    }
-}
-
-/// Blocking mpsc → fd (session input). Ends when the sender drops (stdin EOF).
-fn write_loop(mut file: File, mut rx: mpsc::Receiver<Vec<u8>>) {
-    while let Some(bytes) = rx.blocking_recv() {
-        if file.write_all(&bytes).is_err() || file.flush().is_err() {
-            break;
-        }
-    }
 }
 
 fn env(key: &str) -> Result<String> {

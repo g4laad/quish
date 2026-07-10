@@ -68,33 +68,15 @@ async fn shell(
     drop(pair.slave); // parent doesn't hold the slave side
 
     // PTY output → mpsc (blocking read thread; portable-pty is std::io).
-    let mut pty_out = pair.master.try_clone_reader().context("pty reader")?;
+    let pty_out = pair.master.try_clone_reader().context("pty reader")?;
     let (out_tx, mut out_rx) = mpsc::channel::<Vec<u8>>(64);
-    std::thread::spawn(move || {
-        let mut buf = [0u8; 8192];
-        loop {
-            match pty_out.read(&mut buf) {
-                Ok(0) | Err(_) => break,
-                Ok(n) => {
-                    if out_tx.blocking_send(buf[..n].to_vec()).is_err() {
-                        break;
-                    }
-                }
-            }
-        }
-    });
+    std::thread::spawn(move || read_loop(pty_out, out_tx));
 
     // stdin mpsc → PTY writer (blocking write thread). Dropping in_tx closes the
     // shell's stdin (EOF) — that's how a client hangup ends e.g. `cat`.
-    let mut pty_in = pair.master.take_writer().context("pty writer")?;
-    let (in_tx, mut in_rx) = mpsc::channel::<Vec<u8>>(64);
-    std::thread::spawn(move || {
-        while let Some(bytes) = in_rx.blocking_recv() {
-            if pty_in.write_all(&bytes).is_err() || pty_in.flush().is_err() {
-                break;
-            }
-        }
-    });
+    let pty_in = pair.master.take_writer().context("pty writer")?;
+    let (in_tx, in_rx) = mpsc::channel::<Vec<u8>>(64);
+    std::thread::spawn(move || write_loop(pty_in, in_rx));
 
     // Child reaper → oneshot exit code.
     let (exit_tx, mut exit_rx) = tokio::sync::oneshot::channel::<i32>();
@@ -290,4 +272,31 @@ pub(crate) fn spawn_frame_reader(mut reader: FrameReader) -> mpsc::Receiver<Chan
         }
     });
     rx
+}
+
+/// Blocking reader → mpsc: forwards 8 KiB chunks until EOF/error, stopping early
+/// if the receiver is dropped. Runs on a dedicated `std::thread` (blocking I/O).
+/// Shared by dev-mode PTY output and the privsep worker's session fds.
+pub(crate) fn read_loop<R: std::io::Read>(mut reader: R, tx: mpsc::Sender<Vec<u8>>) {
+    let mut buf = [0u8; 8192];
+    loop {
+        match reader.read(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                if tx.blocking_send(buf[..n].to_vec()).is_err() {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+/// Blocking mpsc → writer: drains the channel until the sender is dropped (EOF)
+/// or a write fails. Runs on a dedicated `std::thread`.
+pub(crate) fn write_loop<W: std::io::Write>(mut writer: W, mut rx: mpsc::Receiver<Vec<u8>>) {
+    while let Some(bytes) = rx.blocking_recv() {
+        if writer.write_all(&bytes).is_err() || writer.flush().is_err() {
+            break;
+        }
+    }
 }
