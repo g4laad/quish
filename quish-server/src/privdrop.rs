@@ -53,11 +53,11 @@ pub fn drop_to_worker(chroot_dir: &str, username: &str) -> Result<()> {
 /// (login shell, or `shell -c <command>` for exec channels). Never returns on
 /// success (the process image is replaced).
 pub fn run_session_helper() -> Result<()> {
-    let uid = Uid::from_raw(env_u32(ipc::ENV_SESS_UID)?);
-    let gid = Gid::from_raw(env_u32(ipc::ENV_SESS_GID)?);
-    let user = env_str(ipc::ENV_SESS_USER)?;
-    let home = env_str(ipc::ENV_SESS_HOME)?;
-    let shell = env_str(ipc::ENV_SESS_SHELL)?;
+    let uid = Uid::from_raw(ipc::env_u32(ipc::ENV_SESS_UID)?);
+    let gid = Gid::from_raw(ipc::env_u32(ipc::ENV_SESS_GID)?);
+    let user = ipc::env(ipc::ENV_SESS_USER)?;
+    let home = ipc::env(ipc::ENV_SESS_HOME)?;
+    let shell = ipc::env(ipc::ENV_SESS_SHELL)?;
     let term = std::env::var(ipc::ENV_SESS_TERM).unwrap_or_else(|_| "xterm".into());
     let command = std::env::var(ipc::ENV_SESS_COMMAND).ok();
 
@@ -114,12 +114,4 @@ pub fn run_session_helper() -> Result<()> {
 
     execve(&shell_c, &argv, &envp).context("exec shell")?;
     unreachable!("execve returned without error")
-}
-
-fn env_str(key: &str) -> Result<String> {
-    std::env::var(key).with_context(|| format!("missing env {key}"))
-}
-
-fn env_u32(key: &str) -> Result<u32> {
-    env_str(key)?.parse().with_context(|| format!("bad {key}"))
 }

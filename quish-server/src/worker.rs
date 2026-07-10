@@ -31,16 +31,16 @@ use crate::signproxy::ProxySigningKey;
 /// `--internal-worker` entry. Connects to the monitor, drops privileges, then
 /// serves QUIC/H3.
 pub fn run() -> Result<()> {
-    let ctrl_path = env(ipc::ENV_CTRL_PATH)?;
-    let sign_path = env(ipc::ENV_SIGN_PATH)?;
-    let listen: std::net::SocketAddr = env(ipc::ENV_LISTEN)?.parse().context("listen addr")?;
-    let path = env(ipc::ENV_PATH)?;
-    let chroot_dir = env(ipc::ENV_CHROOT)?;
-    let worker_user = env(ipc::ENV_USER)?;
-    let scheme = SignatureScheme::from(env(ipc::ENV_SIGN_SCHEME)?.parse::<u16>()?);
+    let ctrl_path = ipc::env(ipc::ENV_CTRL_PATH)?;
+    let sign_path = ipc::env(ipc::ENV_SIGN_PATH)?;
+    let listen: std::net::SocketAddr = ipc::env(ipc::ENV_LISTEN)?.parse().context("listen addr")?;
+    let path = ipc::env(ipc::ENV_PATH)?;
+    let chroot_dir = ipc::env(ipc::ENV_CHROOT)?;
+    let worker_user = ipc::env(ipc::ENV_USER)?;
+    let scheme = SignatureScheme::from(ipc::env(ipc::ENV_SIGN_SCHEME)?.parse::<u16>()?);
     let cert_der = CertificateDer::from(
         BASE64_STANDARD
-            .decode(env(ipc::ENV_CERT)?)
+            .decode(ipc::env(ipc::ENV_CERT)?)
             .context("decode cert")?,
     );
 
@@ -314,8 +314,4 @@ async fn run_exec(
     let code = client.reap(session_id).await;
     send_msg(&mut send, &ChannelMessage::ExitStatus(code)).await?;
     send.finish().await.map_err(Into::into)
-}
-
-fn env(key: &str) -> Result<String> {
-    std::env::var(key).with_context(|| format!("missing env {key}"))
 }

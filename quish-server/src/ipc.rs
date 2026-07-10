@@ -45,6 +45,17 @@ pub const ENV_SESS_COMMAND: &str = "QUISH_SESS_COMMAND";
 /// after `setsid` to acquire the controlling terminal.
 pub const ENV_SESS_TTY: &str = "QUISH_SESS_TTY";
 
+/// Read a required handoff env var (set by the monitor on the worker/session
+/// re-exec), or an error naming it.
+pub fn env(key: &str) -> Result<String> {
+    std::env::var(key).with_context(|| format!("missing env {key}"))
+}
+
+/// [`env`] parsed as a `u32`.
+pub fn env_u32(key: &str) -> Result<u32> {
+    env(key)?.parse().with_context(|| format!("bad {key}"))
+}
+
 /// Control-channel request (worker → monitor).
 #[derive(Debug, Serialize, serde::Deserialize)]
 pub enum Request {
