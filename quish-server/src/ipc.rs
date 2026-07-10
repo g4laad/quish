@@ -16,9 +16,10 @@ use anyhow::{Context, Result, bail};
 use serde::{Serialize, de::DeserializeOwned};
 use tokio_seqpacket::UnixSeqpacket;
 use tokio_seqpacket::ancillary::{AncillaryMessageWriter, OwnedAncillaryMessage};
+use tracing::warn;
 
 /// Cap on a single IPC message body.
-const IPC_CAP: usize = 64 * 1024;
+pub(crate) const IPC_CAP: usize = 64 * 1024;
 /// Ancillary buffer big enough for a few fds.
 const ANC_CAP: usize = 64;
 
@@ -129,10 +130,21 @@ pub async fn ctrl_send<T: Serialize>(
     Ok(())
 }
 
-/// Receive one control message plus any passed fds. `Ok(None)` = peer closed.
-pub async fn ctrl_recv<T: DeserializeOwned>(
-    sock: &UnixSeqpacket,
-) -> Result<Option<(T, Vec<OwnedFd>)>> {
+/// Outcome of one control-channel receive.
+pub enum Recv<T> {
+    /// A decoded message plus any passed fds.
+    Msg(T, Vec<OwnedFd>),
+    /// The frame could not be decoded (oversized/truncated/garbled). The caller
+    /// should skip it and keep serving.
+    Bad,
+    /// Peer closed the channel cleanly.
+    Closed,
+}
+
+/// Receive one control message plus any passed fds. A malformed frame yields
+/// [`Recv::Bad`] instead of an error so a single bad request can't tear down the
+/// control loop; a genuine socket error still propagates.
+pub async fn ctrl_recv<T: DeserializeOwned>(sock: &UnixSeqpacket) -> Result<Recv<T>> {
     let mut buf = vec![0u8; IPC_CAP];
     let mut anc_buf = [0u8; ANC_CAP];
     let mut iov = [IoSliceMut::new(&mut buf)];
@@ -149,10 +161,17 @@ pub async fn ctrl_recv<T: DeserializeOwned>(
     }
     let n = info.bytes_read();
     if n == 0 && fds.is_empty() {
-        return Ok(None);
+        return Ok(Recv::Closed);
     }
-    let msg = postcard::from_bytes(&buf[..n]).context("decode ipc")?;
-    Ok(Some((msg, fds)))
+    match postcard::from_bytes(&buf[..n]) {
+        Ok(msg) => Ok(Recv::Msg(msg, fds)),
+        Err(e) => {
+            // A bad request gets no session: drop any received fds (they close
+            // on drop) and skip the frame rather than killing the loop.
+            warn!(n, error = %e, "undecodable ipc frame; skipping");
+            Ok(Recv::Bad)
+        }
+    }
 }
 
 // ---- signing channel (blocking, length-prefixed, no fds) ----------------
@@ -185,4 +204,40 @@ pub fn sign_read<T: DeserializeOwned>(stream: &mut impl Read) -> Result<Option<T
     let mut body = vec![0u8; n];
     stream.read_exact(&mut body).context("sign read body")?;
     Ok(Some(postcard::from_bytes(&body).context("decode sign")?))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn ctrl_recv_decodes_valid_message() {
+        let (a, b) = UnixSeqpacket::pair().unwrap();
+        ctrl_send(&a, &Response::Exited(42), &[]).await.unwrap();
+        match ctrl_recv::<Response>(&b).await.unwrap() {
+            Recv::Msg(Response::Exited(42), fds) => assert!(fds.is_empty()),
+            _ => panic!("expected Msg(Exited(42))"),
+        }
+    }
+
+    #[tokio::test]
+    async fn ctrl_recv_skips_undecodable_frame() {
+        let (a, b) = UnixSeqpacket::pair().unwrap();
+        // A lone 0x7f varint selects Response variant 127, which does not exist.
+        a.send(&[0x7fu8]).await.unwrap();
+        assert!(matches!(
+            ctrl_recv::<Response>(&b).await.unwrap(),
+            Recv::Bad
+        ));
+    }
+
+    #[tokio::test]
+    async fn ctrl_recv_reports_clean_close() {
+        let (a, b) = UnixSeqpacket::pair().unwrap();
+        drop(a);
+        assert!(matches!(
+            ctrl_recv::<Response>(&b).await.unwrap(),
+            Recv::Closed
+        ));
+    }
 }

@@ -200,7 +200,12 @@ async fn serve_control(mut listener: UnixSeqpacketListener, registry: Arc<Regist
     let sock = listener.accept().await.context("accept worker ctrl")?;
     let mut st = State::default();
 
-    while let Some((req, _fds)) = ipc::ctrl_recv::<Request>(&sock).await? {
+    loop {
+        let req = match ipc::ctrl_recv::<Request>(&sock).await? {
+            ipc::Recv::Closed => break,
+            ipc::Recv::Bad => continue, // skip a malformed request; keep serving
+            ipc::Recv::Msg(req, _fds) => req,
+        };
         match req {
             Request::Authenticate {
                 conn_id,

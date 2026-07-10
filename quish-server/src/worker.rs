@@ -20,13 +20,24 @@ use rustls::server::ResolvesServerCert;
 use rustls::sign::CertifiedKey;
 use tokio::sync::{Mutex, mpsc};
 use tokio_seqpacket::UnixSeqpacket;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::ipc::{self, Request, Response};
 use crate::session::{
     FrameReader, FullStream, SendHalf, read_loop, send_msg, spawn_frame_reader, write_loop,
 };
 use crate::signproxy::ProxySigningKey;
+
+/// Max byte length of a client-supplied command/term forwarded to the monitor.
+/// Kept well below ipc::IPC_CAP so the wrapped Request (enum tag + conn_id +
+/// length varints) can never overflow the monitor's recv buffer — an overflow
+/// would truncate the SEQPACKET message and fail decode.
+const MAX_SPAWN_ARG_LEN: usize = 60 * 1024;
+
+/// Whether a client-supplied spawn arg (command/term) length is within cap.
+fn spawn_arg_ok(len: usize) -> bool {
+    len <= MAX_SPAWN_ARG_LEN
+}
 
 /// `--internal-worker` entry. Connects to the monitor, drops privileges, then
 /// serves QUIC/H3.
@@ -120,9 +131,10 @@ impl MonitorClient {
     async fn call(&self, req: &Request) -> Result<(Response, Vec<OwnedFd>)> {
         let sock = self.sock.lock().await;
         ipc::ctrl_send(&sock, req, &[]).await?;
-        ipc::ctrl_recv::<Response>(&sock)
-            .await?
-            .context("monitor closed control channel")
+        match ipc::ctrl_recv::<Response>(&sock).await? {
+            ipc::Recv::Msg(resp, fds) => Ok((resp, fds)),
+            ipc::Recv::Bad | ipc::Recv::Closed => bail!("monitor closed control channel"),
+        }
     }
 
     pub async fn authenticate(
@@ -196,11 +208,19 @@ pub async fn serve_channel(client: &MonitorClient, conn_id: u64, stream: FullStr
     };
     match quish_proto::decode::<ChannelOpen>(&body).context("decoding ChannelOpen")? {
         ChannelOpen::Shell { term, cols, rows } => {
+            if !spawn_arg_ok(term.len()) {
+                warn!(%conn_id, len = term.len(), "rejecting over-length term");
+                return Ok(());
+            }
             info!(%conn_id, %cols, %rows, "shell channel");
             let (session_id, master) = client.spawn_shell(conn_id, &term).await?;
             run_shell(client, session_id, master, cols, rows, send, reader).await
         }
         ChannelOpen::Exec { command } => {
+            if !spawn_arg_ok(command.len()) {
+                warn!(%conn_id, len = command.len(), "rejecting over-length command");
+                return Ok(());
+            }
             info!(%conn_id, %command, "exec channel");
             let (session_id, io) = client.spawn_exec(conn_id, &command).await?;
             run_exec(client, session_id, io, send, reader).await
@@ -317,4 +337,16 @@ async fn run_exec(
     let code = client.reap(session_id).await;
     send_msg(&mut send, &ChannelMessage::ExitStatus(code)).await?;
     send.finish().await.map_err(Into::into)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn spawn_arg_boundary() {
+        assert!(spawn_arg_ok(MAX_SPAWN_ARG_LEN));
+        assert!(!spawn_arg_ok(MAX_SPAWN_ARG_LEN + 1));
+        const { assert!(MAX_SPAWN_ARG_LEN < super::ipc::IPC_CAP) };
+    }
 }
