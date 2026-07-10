@@ -259,23 +259,16 @@ async fn run_shell(
     std::thread::spawn(move || write_loop(in_file, in_rx));
 
     let mut frames = spawn_frame_reader(reader);
-    let mut in_tx = Some(in_tx);
-    let mut frames_done = false;
 
     loop {
         tokio::select! {
-            msg = frames.recv(), if !frames_done => match msg {
+            msg = frames.recv() => match msg {
                 Some(ChannelMessage::Data(d)) => {
-                    if let Some(tx) = in_tx.as_ref() {
-                        let _ = tx.send(d).await;
-                    }
+                    let _ = in_tx.send(d).await;
                 }
                 Some(ChannelMessage::Resize { cols, rows }) => set_winsize(&master, cols, rows),
                 Some(_) => {}
-                None => {
-                    frames_done = true;
-                    in_tx = None; // EOF the shell's stdin
-                }
+                None => break, // client hung up: stop the session
             },
             out = out_rx.recv() => match out {
                 Some(bytes) => {
@@ -288,6 +281,8 @@ async fn run_shell(
         }
     }
 
+    drop(in_tx); // EOF the shell's stdin so the write thread exits
+    drop(master); // release the winsize handle; reap will kill the child
     let code = client.reap(session_id).await;
     send_msg(&mut send, &ChannelMessage::ExitStatus(code)).await?;
     send.finish().await.map_err(Into::into)
