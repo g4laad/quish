@@ -14,7 +14,6 @@ use http::{Method, Response, StatusCode};
 use quinn::crypto::rustls::QuicServerConfig;
 use quish_auth::{ConnInfo, Registry, Verdict};
 use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
-use sha2::{Digest, Sha256};
 use tokio::time::{Instant, timeout};
 use tracing::{info, warn};
 
@@ -103,7 +102,7 @@ pub fn dev_endpoint(listen: SocketAddr) -> Result<quinn::Endpoint> {
     let cert_der = cert.cert.der().clone();
     let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der()));
 
-    let fingerprint = hex(&Sha256::digest(&cert_der));
+    let fingerprint = quish_proto::cert_fingerprint(&cert_der);
     info!(%fingerprint, "server certificate SHA-256 (pin as: localhost:PORT <fingerprint>)");
 
     let mut tls = rustls::ServerConfig::builder()
@@ -294,14 +293,4 @@ async fn respond(stream: &mut ReqStream, status: StatusCode) -> Result<()> {
         .body(())
         .expect("valid response");
     stream.send_response(resp).await.context("send response")
-}
-
-fn hex(bytes: &[u8]) -> String {
-    use std::fmt::Write;
-    bytes
-        .iter()
-        .fold(String::with_capacity(bytes.len() * 2), |mut s, b| {
-            let _ = write!(s, "{b:02x}");
-            s
-        })
 }

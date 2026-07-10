@@ -20,7 +20,6 @@ use rustls::{
     crypto::CryptoProvider,
     pki_types::{CertificateDer, ServerName, UnixTime},
 };
-use sha2::{Digest, Sha256};
 
 /// Build a client endpoint that verifies the server via web PKI → TOFU pinning.
 /// `host_key` is the `host:port` string the fingerprint is pinned under.
@@ -97,7 +96,7 @@ impl ServerCertVerifier for TofuVerifier {
         }
 
         // 2. TOFU: pin the end-entity fingerprint.
-        let fp = hex(&Sha256::digest(end_entity));
+        let fp = quish_proto::cert_fingerprint(end_entity);
         let _guard = LOCK.lock().unwrap();
         match lookup(&self.known_hosts, &self.host_key) {
             Some(pinned) if pinned == fp => Ok(ServerCertVerified::assertion()),
@@ -172,16 +171,6 @@ fn pin(path: &PathBuf, host: &str, fp: &str) -> Result<()> {
         .open(path)?;
     writeln!(f, "{host} {fp}")?;
     Ok(())
-}
-
-fn hex(bytes: &[u8]) -> String {
-    use std::fmt::Write;
-    bytes
-        .iter()
-        .fold(String::with_capacity(bytes.len() * 2), |mut s, b| {
-            let _ = write!(s, "{b:02x}");
-            s
-        })
 }
 
 #[cfg(test)]

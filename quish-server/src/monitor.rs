@@ -21,7 +21,6 @@ use quish_auth::{AuthBackend, ConnInfo, Registry, Verdict};
 use rustls::SignatureScheme;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::sign::SigningKey;
-use sha2::{Digest, Sha256};
 use tokio_seqpacket::UnixSeqpacketListener;
 use tracing::{info, warn};
 
@@ -46,7 +45,7 @@ pub fn run(cfg: Config) -> Result<()> {
         .context("loading host signing key")?;
     let scheme = SignatureScheme::ECDSA_NISTP256_SHA256;
 
-    let fingerprint = hex(&Sha256::digest(&cert_der));
+    let fingerprint = quish_proto::cert_fingerprint(&cert_der);
     info!(%fingerprint, "host certificate SHA-256 (pin as: localhost:PORT <fingerprint>)");
 
     // Private socket directory (root, 0700).
@@ -373,14 +372,4 @@ fn session_command(u: &User) -> Command {
         .env(ipc::ENV_SESS_HOME, u.dir.display().to_string())
         .env(ipc::ENV_SESS_SHELL, shell);
     cmd
-}
-
-fn hex(bytes: &[u8]) -> String {
-    use std::fmt::Write;
-    bytes
-        .iter()
-        .fold(String::with_capacity(bytes.len() * 2), |mut s, b| {
-            let _ = write!(s, "{b:02x}");
-            s
-        })
 }

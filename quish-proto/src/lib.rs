@@ -33,6 +33,21 @@ pub const CHANNEL_BINDING_LABEL: &[u8] = b"quish channel binding";
 /// Length of the exported channel binding.
 pub const CHANNEL_BINDING_LEN: usize = 32;
 
+/// Lowercase-hex SHA-256 of a DER certificate — the host-identity fingerprint.
+/// The single source of truth for the TOFU pin string: the server logs it and
+/// the client pins/compares it in `known_hosts`, so both sides MUST derive it
+/// here (identical bytes in, identical string out).
+pub fn cert_fingerprint(cert_der: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    use std::fmt::Write;
+    Sha256::digest(cert_der)
+        .iter()
+        .fold(String::with_capacity(64), |mut s, b| {
+            let _ = write!(s, "{b:02x}");
+            s
+        })
+}
+
 /// HTTP header carrying credentials (`Basic ` password / `Bearer ` pubkey token).
 pub const HEADER_AUTHORIZATION: &str = "authorization";
 
@@ -116,6 +131,16 @@ mod tests {
         assert_eq!(len, frame.len() - LEN_PREFIX);
         let got: ChannelMessage = decode(&frame[LEN_PREFIX..]).unwrap();
         assert_eq!(got, msg);
+    }
+
+    #[test]
+    fn cert_fingerprint_is_lowercase_hex_sha256() {
+        // Known vector: SHA-256("") — locks the exact TOFU pin string both the
+        // server (log) and client (known_hosts) must agree on.
+        assert_eq!(
+            cert_fingerprint(b""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
     }
 
     #[test]
