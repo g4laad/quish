@@ -221,7 +221,8 @@ pub async fn serve_channel(client: &MonitorClient, conn_id: u64, stream: FullStr
                 warn!(%conn_id, len = command.len(), "rejecting over-length command");
                 return Ok(());
             }
-            info!(%conn_id, %command, "exec channel");
+            // do not log the command body — it may contain secrets
+            info!(%conn_id, "exec channel");
             let (session_id, io) = client.spawn_exec(conn_id, &command).await?;
             run_exec(client, session_id, io, send, reader).await
         }

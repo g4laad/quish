@@ -39,7 +39,8 @@ pub async fn serve(stream: FullStream) -> Result<()> {
             shell(send, reader, term, cols, rows).await
         }
         ChannelOpen::Exec { command } => {
-            info!(%command, "exec channel");
+            // do not log the command body — it may contain secrets
+            info!("exec channel");
             exec(send, reader, command).await
         }
     }
