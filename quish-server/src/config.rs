@@ -15,6 +15,7 @@ pub struct FileConfig {
     pub privsep_user: Option<String>,
     pub privsep_dir: Option<String>,
     pub host_key: Option<PathBuf>,
+    pub max_auth_fails: Option<u32>,
 }
 
 impl FileConfig {

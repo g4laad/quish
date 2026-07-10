@@ -30,8 +30,9 @@ const FIRST_REQUEST_DEADLINE: Duration = Duration::from_secs(30);
 /// Hard ceiling on how long one auth attempt may take (guards a hung monitor).
 const AUTH_DEADLINE: Duration = Duration::from_secs(30);
 /// Failed auths tolerated on one connection before further attempts are cheap-
-/// rejected (the connection stays up; anti-enumeration is preserved).
-const MAX_AUTH_FAILS_PER_CONN: u32 = 6;
+/// rejected (the connection stays up; anti-enumeration is preserved). Overridable
+/// via config file / `--max-auth-fails`; this is the built-in fallback.
+pub(crate) const DEFAULT_MAX_AUTH_FAILS: u32 = 6;
 
 /// QUIC transport limits shared by dev and privsep endpoints.
 pub fn transport_config() -> Arc<quinn::TransportConfig> {
@@ -118,7 +119,12 @@ pub fn dev_endpoint(listen: SocketAddr) -> Result<quinn::Endpoint> {
 }
 
 /// Serve until the endpoint is closed.
-pub async fn run(endpoint: quinn::Endpoint, path: String, backend: Arc<Backend>) -> Result<()> {
+pub async fn run(
+    endpoint: quinn::Endpoint,
+    path: String,
+    backend: Arc<Backend>,
+    max_auth_fails: u32,
+) -> Result<()> {
     info!(addr = ?endpoint.local_addr().ok(), %path, "quishd listening");
 
     let limiter = Arc::new(RateLimiter::default());
@@ -135,8 +141,15 @@ pub async fn run(endpoint: quinn::Endpoint, path: String, backend: Arc<Backend>)
         let conn_id = NEXT_CONN.fetch_add(1, Ordering::Relaxed);
         tokio::spawn(async move {
             let _guard = guard; // released when the connection ends
-            if let Err(e) =
-                handle_connection(incoming, path, backend.clone(), limiter, conn_id).await
+            if let Err(e) = handle_connection(
+                incoming,
+                path,
+                backend.clone(),
+                limiter,
+                conn_id,
+                max_auth_fails,
+            )
+            .await
             {
                 warn!(error = %e, "connection ended with error");
             }
@@ -152,6 +165,7 @@ async fn handle_connection(
     backend: Arc<Backend>,
     limiter: Arc<RateLimiter>,
     conn_id: u64,
+    max_auth_fails: u32,
 ) -> Result<()> {
     let conn = incoming.await.context("QUIC handshake")?;
     let peer_addr = conn.remote_address();
@@ -198,7 +212,14 @@ async fn handle_connection(
                 let conn_fails = conn_fails.clone();
                 tokio::spawn(async move {
                     if let Err(e) = handle_request(
-                        resolver, path, backend, limiter, conn_info, conn_id, conn_fails,
+                        resolver,
+                        path,
+                        backend,
+                        limiter,
+                        conn_info,
+                        conn_id,
+                        conn_fails,
+                        max_auth_fails,
                     )
                     .await
                     {
@@ -224,6 +245,7 @@ async fn handle_request(
     conn_info: ConnInfo,
     conn_id: u64,
     conn_fails: Arc<AtomicU32>,
+    max_auth_fails: u32,
 ) -> Result<()> {
     let (req, mut stream) = resolver
         .resolve_request()
@@ -255,7 +277,7 @@ async fn handle_request(
 
     // A connection that keeps failing auth gets cheap 401s (no monitor round-trip)
     // once over the cap — bounds spam without dropping the connection.
-    if conn_fails.load(Ordering::Relaxed) >= MAX_AUTH_FAILS_PER_CONN {
+    if conn_fails.load(Ordering::Relaxed) >= max_auth_fails {
         respond(&mut stream, StatusCode::UNAUTHORIZED).await?;
         return stream.finish().await.map_err(Into::into);
     }

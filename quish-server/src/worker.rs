@@ -38,6 +38,9 @@ pub fn run() -> Result<()> {
     let chroot_dir = ipc::env(ipc::ENV_CHROOT)?;
     let worker_user = ipc::env(ipc::ENV_USER)?;
     let scheme = SignatureScheme::from(ipc::env(ipc::ENV_SIGN_SCHEME)?.parse::<u16>()?);
+    let max_auth_fails = ipc::env(ipc::ENV_MAX_AUTH_FAILS)?
+        .parse::<u32>()
+        .context("max_auth_fails")?;
     let cert_der = CertificateDer::from(
         BASE64_STANDARD
             .decode(ipc::env(ipc::ENV_CERT)?)
@@ -84,7 +87,7 @@ pub fn run() -> Result<()> {
 
         let client = Arc::new(MonitorClient::new(ctrl));
         let backend = Arc::new(crate::transport::Backend::Privsep { client });
-        crate::transport::run(endpoint, path, backend).await
+        crate::transport::run(endpoint, path, backend, max_auth_fails).await
     })
 }
 

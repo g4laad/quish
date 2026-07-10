@@ -63,6 +63,11 @@ struct Args {
     #[arg(long, value_name = "PATH")]
     host_key: Option<PathBuf>,
 
+    /// Failed auth attempts tolerated per connection before further attempts get
+    /// cheap 401s (connection stays up). [default: 6]
+    #[arg(long)]
+    max_auth_fails: Option<u32>,
+
     /// Internal: run as the privilege-dropped worker (spawned by the monitor).
     #[arg(long, hide = true)]
     internal_worker: bool,
@@ -111,9 +116,13 @@ fn main() -> anyhow::Result<()> {
         .or(file.path)
         .unwrap_or_else(|| quish_proto::DEFAULT_PATH.to_string());
     let host_key = args.host_key.or(file.host_key);
+    let max_auth_fails = args
+        .max_auth_fails
+        .or(file.max_auth_fails)
+        .unwrap_or(transport::DEFAULT_MAX_AUTH_FAILS);
 
     if let Some(dev_user) = args.dev_insecure_user {
-        return run_dev(listen, path, dev_user);
+        return run_dev(listen, path, dev_user, max_auth_fails);
     }
     monitor::run(monitor::Config {
         listen,
@@ -127,11 +136,17 @@ fn main() -> anyhow::Result<()> {
             .or(file.privsep_user)
             .unwrap_or_else(|| "quish".to_string()),
         host_key,
+        max_auth_fails,
     })
 }
 
 /// Single-process dev server: in-process registry + local session spawning.
-fn run_dev(listen: SocketAddr, path: String, dev_user: String) -> anyhow::Result<()> {
+fn run_dev(
+    listen: SocketAddr,
+    path: String,
+    dev_user: String,
+    max_auth_fails: u32,
+) -> anyhow::Result<()> {
     let backends: Vec<Box<dyn AuthBackend>> = vec![
         Box::new(DevInsecureBackend::new(dev_user)),
         Box::new(PubkeyBackend::new(authorized_keys_path()?)),
@@ -144,7 +159,7 @@ fn run_dev(listen: SocketAddr, path: String, dev_user: String) -> anyhow::Result
         .build()?
         .block_on(async move {
             let endpoint = transport::dev_endpoint(listen)?;
-            transport::run(endpoint, path, backend).await
+            transport::run(endpoint, path, backend, max_auth_fails).await
         })
 }
 

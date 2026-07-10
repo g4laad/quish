@@ -30,6 +30,7 @@ pub const ENV_PATH: &str = "QUISH_PATH";
 pub const ENV_CHROOT: &str = "QUISH_CHROOT";
 pub const ENV_USER: &str = "QUISH_USER";
 pub const ENV_SIGN_SCHEME: &str = "QUISH_SIGN_SCHEME";
+pub const ENV_MAX_AUTH_FAILS: &str = "QUISH_MAX_AUTH_FAILS";
 /// Server cert chain (public), base64 DER, `\n`-separated — passed to the worker.
 pub const ENV_CERT: &str = "QUISH_CERT";
 

@@ -18,3 +18,8 @@ privsep_dir = "/run/quishd"
 # Persist the host key here so the fingerprint is stable across restarts (clients
 # pin it TOFU-style). Generated with 0600 perms on first start.
 host_key = "/var/lib/quishd/host_key.der"
+
+# Failed auth attempts tolerated on a single connection before further attempts
+# get cheap 401s (no monitor round-trip). The connection stays up and the
+# constant-time anti-enumeration floor still applies.
+max_auth_fails = 6

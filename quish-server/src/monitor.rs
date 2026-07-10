@@ -33,6 +33,7 @@ pub struct Config {
     pub chroot_dir: String,
     pub worker_user: String,
     pub host_key: Option<PathBuf>,
+    pub max_auth_fails: u32,
 }
 
 /// Run the monitor: generate the host key, wire up sockets, launch the worker,
@@ -80,6 +81,7 @@ pub fn run(cfg: Config) -> Result<()> {
             .env(ipc::ENV_CHROOT, &cfg.chroot_dir)
             .env(ipc::ENV_USER, &cfg.worker_user)
             .env(ipc::ENV_SIGN_SCHEME, u16::from(scheme).to_string())
+            .env(ipc::ENV_MAX_AUTH_FAILS, cfg.max_auth_fails.to_string())
             .env(ipc::ENV_CERT, BASE64_STANDARD.encode(&cert_der))
             .spawn()
             .context("spawning worker")?;
