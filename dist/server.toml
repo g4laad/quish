@@ -27,10 +27,7 @@ max_auth_fails = 6
 # Enable local (`-L`) TCP port forwarding. Forwarding is OFF by default; when
 # enabled it is loopback-only — the server will only connect to `127.0.0.0/8` /
 # `::1`, so a forward channel cannot pivot to other hosts. Leave unset (or false)
-# to refuse all forward channels.
-#
-# NOTE: in the current slice this key is parsed but not yet threaded to the
-# server frontends; enablement for testing is via the `QUISH_ALLOW_FORWARD=1`
-# environment variable. Wiring this key + a `--allow-forward` CLI flag is a
-# follow-up.
+# to refuse all forward channels. Overridden by the `--allow-forward` CLI flag.
+# Takes effect in both dev and privsep (daemon) modes, but only when this config
+# is actually loaded (`quishd --config /etc/quish/server.toml`).
 # allow_forward = false

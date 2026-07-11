@@ -16,6 +16,13 @@ RuntimeDirectory=quishd
 RuntimeDirectoryMode=0755
 # The control/signing sockets are NOT placed here: the monitor creates them in a
 # root-only sibling dir (/run/quishd.sock.d-<pid>) — do not relocate RuntimeDirectory to a shared path.
+# To enable local (-L) TCP port forwarding (loopback-only) for the daemon,
+# append the flag via a drop-in — `systemctl edit quishd` and add:
+#     [Service]
+#     ExecStart=
+#     ExecStart=/usr/bin/quishd --listen [::]:443 --privsep-user quish --privsep-dir /run/quishd --allow-forward
+# (Or pass --config /etc/quish/server.toml with `allow_forward = true`; note
+# the default ExecStart above does not load a config file.)
 Restart=on-failure
 RestartSec=2
 
