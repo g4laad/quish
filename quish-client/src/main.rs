@@ -9,13 +9,22 @@ mod connect;
 mod terminal;
 
 use std::future;
+use std::net::{IpAddr, Ipv4Addr};
 
 use anyhow::{Context, Result, bail};
-use bytes::Bytes;
+use bytes::{Buf, Bytes};
 use clap::Parser;
 use h3::ext::Protocol;
-use quish_proto::ChannelOpen;
-use tracing::info;
+use quish_proto::{ChannelMessage, ChannelOpen, LEN_PREFIX, parse_len};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
+use tracing::{info, warn};
+
+/// Halves of an open H3 channel stream (client side).
+type SendHalf = h3::client::RequestStream<h3_quinn::SendStream<Bytes>, Bytes>;
+type RecvHalf = h3::client::RequestStream<h3_quinn::RecvStream, Bytes>;
+/// The multiplexing handle used to open new channels on the authed connection.
+type SendRequest = h3::client::SendRequest<h3_quinn::OpenStreams, Bytes>;
 
 /// quish client (HTTP/3 remote shell).
 #[derive(Parser, Debug)]
@@ -29,13 +38,18 @@ struct Args {
     #[arg(short, long)]
     identity: Option<std::path::PathBuf>,
 
+    /// Local forward: `-L [bind:]lport:rhost:rport` (repeatable). `rhost:rport`
+    /// is opened on the server; connections to the local port are tunneled to it.
+    #[arg(short = 'L', long = "local-forward")]
+    local_forward: Vec<String>,
+
     /// Command to run (unused until M4; parsed now for the final CLI shape).
     #[arg(trailing_var_arg = true)]
     command: Vec<String>,
 }
 
 /// Parsed connection target.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct Target {
     user: String,
     host: String,
@@ -83,6 +97,84 @@ fn parse_target(s: &str) -> Result<Target> {
         port,
         path,
     })
+}
+
+/// A parsed `-L` local-forward spec: bind a local `bind:lport` and tunnel every
+/// accepted connection to `rhost:rport` on the server side.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ForwardSpec {
+    bind: IpAddr,
+    lport: u16,
+    rhost: String,
+    rport: u16,
+}
+
+/// Parse `-L [bind:]lport:rhost:rport` (modeled on [`parse_target`]). Bracket
+/// IPv6 literals (`[::1]`) so their colons don't split; a bare `bind` defaults to
+/// `127.0.0.1`. The local bind MUST be loopback (loopback-only PoC policy).
+fn parse_forward(s: &str) -> Result<ForwardSpec> {
+    let tokens = split_forward_tokens(s)?;
+    let (bind_tok, lport_tok, rhost_tok, rport_tok) = match tokens.as_slice() {
+        [l, rh, rp] => (None, l.as_str(), rh.as_str(), rp.as_str()),
+        [b, l, rh, rp] => (Some(b.as_str()), l.as_str(), rh.as_str(), rp.as_str()),
+        _ => bail!("forward spec `{s}` must be [bind:]lport:rhost:rport"),
+    };
+    let lport: u16 = lport_tok
+        .parse()
+        .with_context(|| format!("invalid local port in forward spec `{s}`"))?;
+    let rport: u16 = rport_tok
+        .parse()
+        .with_context(|| format!("invalid remote port in forward spec `{s}`"))?;
+    if rhost_tok.is_empty() {
+        bail!("missing remote host in forward spec `{s}`");
+    }
+    let bind: IpAddr = match bind_tok {
+        Some(b) => b
+            .parse()
+            .with_context(|| format!("invalid bind address in forward spec `{s}`"))?,
+        None => IpAddr::V4(Ipv4Addr::LOCALHOST),
+    };
+    if !bind.is_loopback() {
+        bail!("refusing non-loopback bind address {bind} in forward spec `{s}` (loopback-only)");
+    }
+    Ok(ForwardSpec {
+        bind,
+        lport,
+        rhost: rhost_tok.to_string(),
+        rport,
+    })
+}
+
+/// Split a forward spec on `:`, keeping a bracketed IPv6 literal (`[::1]`) as one
+/// token (brackets stripped). A bare IPv6 literal (unbracketed) yields too many
+/// tokens and is rejected upstream — bracket it.
+fn split_forward_tokens(s: &str) -> Result<Vec<String>> {
+    let mut tokens = Vec::new();
+    let mut rest = s;
+    loop {
+        if let Some(inner) = rest.strip_prefix('[') {
+            let (addr, after) = inner
+                .split_once(']')
+                .context("missing closing ']' in forward spec")?;
+            tokens.push(addr.to_string());
+            match after.strip_prefix(':') {
+                Some(r) => rest = r,
+                None if after.is_empty() => return Ok(tokens),
+                None => bail!("unexpected text after ']' in forward spec `{s}`"),
+            }
+        } else {
+            match rest.split_once(':') {
+                Some((tok, r)) => {
+                    tokens.push(tok.to_string());
+                    rest = r;
+                }
+                None => {
+                    tokens.push(rest.to_string());
+                    return Ok(tokens);
+                }
+            }
+        }
+    }
 }
 
 /// `host:port` for the resolver, the TOFU pin key, and the CONNECT URI
@@ -148,7 +240,7 @@ fn main() -> Result<()> {
     let code = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?
-        .block_on(run(target, args.identity, args.command))?;
+        .block_on(run(target, args.identity, args.command, args.local_forward))?;
     std::process::exit(code);
 }
 
@@ -156,7 +248,14 @@ async fn run(
     target: Target,
     identity: Option<std::path::PathBuf>,
     command: Vec<String>,
+    local_forwards: Vec<String>,
 ) -> Result<i32> {
+    // Parse `-L` specs up front so a malformed spec fails before any network I/O.
+    let forwards = local_forwards
+        .iter()
+        .map(|s| parse_forward(s))
+        .collect::<Result<Vec<_>>>()?;
+
     let host_key = socket_target(&target.host, target.port);
     let addr = tokio::net::lookup_host(&host_key)
         .await
@@ -188,24 +287,18 @@ async fn run(
         let _ = future::poll_fn(|cx| driver.poll_close(cx)).await;
     });
 
+    // Forward mode: bind the local ports and tunnel each accepted connection over
+    // its own Extended CONNECT channel. Runs until the listeners stop (Ctrl-C).
+    if !forwards.is_empty() {
+        run_forwards(send_request, forwards, target, authorization).await?;
+        let _ = drive.await;
+        return Ok(0);
+    }
+
     // Extended CONNECT to the secret path. :protocol must be a value h3 accepts
     // (its Protocol enum is closed), so we use WEB_TRANSPORT and let the secret
     // path + version header mark this as quish.
-    let req = http::Request::builder()
-        .method(http::Method::CONNECT)
-        .uri(format!(
-            "https://{}{}",
-            socket_target(&target.host, target.port),
-            target.path
-        ))
-        .header(
-            quish_proto::HEADER_VERSION,
-            quish_proto::PROTOCOL_VERSION.to_string(),
-        )
-        .header(quish_proto::HEADER_AUTHORIZATION, &authorization)
-        .extension(Protocol::WEB_TRANSPORT)
-        .body(())
-        .expect("valid request");
+    let req = build_connect_request(&target, &authorization);
 
     let mut stream = send_request
         .send_request(req)
@@ -245,6 +338,200 @@ async fn run(
     drop(send_request);
     let _ = drive.await;
     Ok(code)
+}
+
+/// Build the Extended CONNECT request every channel opens with. `:protocol` must
+/// be a value h3 accepts (its `Protocol` enum is closed), so we use WEB_TRANSPORT
+/// and let the secret path + version header mark this as quish. The channel-bound
+/// `authorization` is reused on every channel (it is bound to the connection, not
+/// the stream).
+fn build_connect_request(target: &Target, authorization: &str) -> http::Request<()> {
+    http::Request::builder()
+        .method(http::Method::CONNECT)
+        .uri(format!(
+            "https://{}{}",
+            socket_target(&target.host, target.port),
+            target.path
+        ))
+        .header(
+            quish_proto::HEADER_VERSION,
+            quish_proto::PROTOCOL_VERSION.to_string(),
+        )
+        .header(quish_proto::HEADER_AUTHORIZATION, authorization)
+        .extension(Protocol::WEB_TRANSPORT)
+        .body(())
+        .expect("valid request")
+}
+
+/// Bind every `-L` listener, then serve accepted connections until a listener
+/// errors. Each listener runs on its own task; each accepted connection opens a
+/// fresh forward channel.
+async fn run_forwards(
+    send_request: SendRequest,
+    forwards: Vec<ForwardSpec>,
+    target: Target,
+    authorization: String,
+) -> Result<()> {
+    let mut tasks = Vec::new();
+    for spec in forwards {
+        let listener = TcpListener::bind((spec.bind, spec.lport))
+            .await
+            .with_context(|| format!("binding local forward {}:{}", spec.bind, spec.lport))?;
+        info!(
+            bind = %spec.bind, lport = spec.lport, rhost = %spec.rhost, rport = spec.rport,
+            "local forward listening"
+        );
+        let send_request = send_request.clone();
+        let target = target.clone();
+        let authorization = authorization.clone();
+        tasks.push(tokio::spawn(accept_loop(
+            listener,
+            send_request,
+            spec,
+            target,
+            authorization,
+        )));
+    }
+    // Listeners run until they error; join so a bind/accept failure surfaces.
+    for task in tasks {
+        match task.await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => return Err(e),
+            Err(e) => return Err(anyhow::anyhow!("forward listener task panicked: {e}")),
+        }
+    }
+    Ok(())
+}
+
+/// Accept connections on one local listener; tunnel each over its own channel.
+async fn accept_loop(
+    listener: TcpListener,
+    send_request: SendRequest,
+    spec: ForwardSpec,
+    target: Target,
+    authorization: String,
+) -> Result<()> {
+    loop {
+        let (tcp, peer) = listener.accept().await.context("accepting local forward")?;
+        info!(%peer, rhost = %spec.rhost, rport = spec.rport, "forward connection accepted");
+        let send_request = send_request.clone();
+        let target = target.clone();
+        let authorization = authorization.clone();
+        let rhost = spec.rhost.clone();
+        let rport = spec.rport;
+        tokio::spawn(async move {
+            if let Err(e) =
+                forward_one(send_request, tcp, target, authorization, rhost, rport).await
+            {
+                warn!(error = %e, "forward connection ended");
+            }
+        });
+    }
+}
+
+/// Open one forward channel and bridge it to the accepted local `TcpStream`.
+async fn forward_one(
+    mut send_request: SendRequest,
+    tcp: TcpStream,
+    target: Target,
+    authorization: String,
+    rhost: String,
+    rport: u16,
+) -> Result<()> {
+    let req = build_connect_request(&target, &authorization);
+    let mut stream = send_request
+        .send_request(req)
+        .await
+        .context("opening forward channel")?;
+    let resp = stream
+        .recv_response()
+        .await
+        .context("awaiting forward channel response")?;
+    if resp.status() != http::StatusCode::OK {
+        bail!("server rejected forward channel: HTTP {}", resp.status());
+    }
+    let (mut send, recv) = stream.split();
+    send.send_data(Bytes::from(quish_proto::encode(&ChannelOpen::Forward {
+        host: rhost,
+        port: rport,
+    })?))
+    .await
+    .context("sending Forward open")?;
+    bridge(tcp, send, recv).await
+}
+
+/// Bidirectional byte bridge: local `TcpStream` ⇄ H3 channel, both directions
+/// framed as `ChannelMessage::Data` (per the Decision record). Either EOF closes
+/// the other direction.
+async fn bridge(tcp: TcpStream, mut send: SendHalf, recv: RecvHalf) -> Result<()> {
+    let (mut tcp_read, mut tcp_write) = tcp.into_split();
+
+    // remote → local: decode Data frames off the channel, write to the socket.
+    let down = tokio::spawn(async move {
+        let mut reader = ChannelFrameReader::new(recv);
+        while let Ok(Some(msg)) = reader.next().await {
+            if let ChannelMessage::Data(d) = msg
+                && tcp_write.write_all(&d).await.is_err()
+            {
+                break;
+            }
+        }
+        let _ = tcp_write.shutdown().await;
+    });
+
+    // local → remote: read socket bytes, frame each chunk as Data.
+    let mut buf = vec![0u8; 8192];
+    loop {
+        match tcp_read.read(&mut buf).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                let frame = quish_proto::encode(&ChannelMessage::Data(buf[..n].to_vec()))?;
+                if send.send_data(Bytes::from(frame)).await.is_err() {
+                    break; // channel closed by server (policy refusal / peer EOF)
+                }
+            }
+        }
+    }
+    let _ = send.finish().await;
+    let _ = down.await;
+    Ok(())
+}
+
+/// Reassembles length-prefixed [`ChannelMessage`] frames off an H3 recv half.
+struct ChannelFrameReader {
+    recv: RecvHalf,
+    buf: Vec<u8>,
+}
+
+impl ChannelFrameReader {
+    fn new(recv: RecvHalf) -> Self {
+        Self {
+            recv,
+            buf: Vec::new(),
+        }
+    }
+
+    /// Next decoded message, or `None` at clean end of stream.
+    async fn next(&mut self) -> Result<Option<ChannelMessage>> {
+        loop {
+            if self.buf.len() >= LEN_PREFIX {
+                let len = parse_len(self.buf[..LEN_PREFIX].try_into().unwrap())?;
+                if self.buf.len() >= LEN_PREFIX + len {
+                    let body = self.buf[LEN_PREFIX..LEN_PREFIX + len].to_vec();
+                    self.buf.drain(..LEN_PREFIX + len);
+                    return Ok(Some(quish_proto::decode::<ChannelMessage>(&body)?));
+                }
+            }
+            match self.recv.recv_data().await {
+                Ok(Some(mut chunk)) => self
+                    .buf
+                    .extend_from_slice(chunk.copy_to_bytes(chunk.remaining()).as_ref()),
+                Ok(None) => return Ok(None),
+                Err(e) if e.is_h3_no_error() => return Ok(None),
+                Err(e) => return Err(anyhow::anyhow!("recv forward frame: {e}")),
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -316,5 +603,48 @@ mod tests {
         assert_eq!(uri.host(), Some("[::1]"));
         assert_eq!(uri.port_u16(), Some(4433));
         assert_eq!(uri.path(), "/quish");
+    }
+
+    #[test]
+    fn parse_forward_lport_rhost_rport() {
+        let f = parse_forward("8080:127.0.0.1:5432").unwrap();
+        assert_eq!(
+            f,
+            ForwardSpec {
+                bind: IpAddr::V4(Ipv4Addr::LOCALHOST),
+                lport: 8080,
+                rhost: "127.0.0.1".into(),
+                rport: 5432,
+            }
+        );
+    }
+
+    #[test]
+    fn parse_forward_bind_lport_rhost_rport() {
+        let f = parse_forward("127.0.0.1:8080:127.0.0.1:5432").unwrap();
+        assert_eq!(
+            f,
+            ForwardSpec {
+                bind: IpAddr::V4(Ipv4Addr::LOCALHOST),
+                lport: 8080,
+                rhost: "127.0.0.1".into(),
+                rport: 5432,
+            }
+        );
+    }
+
+    #[test]
+    fn parse_forward_rejects_non_loopback_bind() {
+        assert!(parse_forward("0.0.0.0:8080:127.0.0.1:5432").is_err());
+        assert!(parse_forward("192.168.1.10:8080:127.0.0.1:5432").is_err());
+    }
+
+    #[test]
+    fn parse_forward_rejects_malformed() {
+        assert!(parse_forward("nonsense").is_err()); // too few fields
+        assert!(parse_forward("8080:127.0.0.1").is_err()); // missing rport
+        assert!(parse_forward("notaport:127.0.0.1:5432").is_err()); // bad lport
+        assert!(parse_forward("8080:127.0.0.1:notaport").is_err()); // bad rport
+        assert!(parse_forward("a:8080:127.0.0.1:5432").is_err()); // bad bind
     }
 }

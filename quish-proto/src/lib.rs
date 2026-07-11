@@ -65,6 +65,9 @@ pub enum ChannelOpen {
     Shell { term: String, cols: u16, rows: u16 },
     /// One-shot command, run under the login shell.
     Exec { command: String },
+    /// Open a forwarded TCP connection to `host:port` on the server side.
+    /// The server enforces its egress policy before connecting.
+    Forward { host: String, port: u16 },
 }
 
 /// A forwardable interrupt from the client's terminal (exec channels only).
@@ -164,6 +167,16 @@ mod tests {
             term: "xterm-256color".into(),
             cols: 80,
             rows: 24,
+        };
+        let got: ChannelOpen = decode(&encode(&open).unwrap()[LEN_PREFIX..]).unwrap();
+        assert_eq!(got, open);
+    }
+
+    #[test]
+    fn forward_open_roundtrips() {
+        let open = ChannelOpen::Forward {
+            host: "127.0.0.1".into(),
+            port: 5432,
         };
         let got: ChannelOpen = decode(&encode(&open).unwrap()[LEN_PREFIX..]).unwrap();
         assert_eq!(got, open);

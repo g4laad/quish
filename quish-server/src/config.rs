@@ -16,6 +16,16 @@ pub struct FileConfig {
     pub privsep_dir: Option<String>,
     pub host_key: Option<PathBuf>,
     pub max_auth_fails: Option<u32>,
+    /// Enable local (`-L`) TCP port forwarding. Loopback-only when enabled;
+    /// forwarding is refused unless this is `true`. Default (unset) = disabled.
+    ///
+    /// Parsed here so the knob is documented and stable, but not yet threaded to
+    /// the frontends: this slice enables forwarding via the `QUISH_ALLOW_FORWARD`
+    /// env override (see `session::forwarding_enabled`). Wiring this field to a
+    /// `--allow-forward` CLI flag and the privsep monitor→worker handoff is a
+    /// documented follow-up, hence `allow(dead_code)` for now.
+    #[allow(dead_code)]
+    pub allow_forward: Option<bool>,
 }
 
 impl FileConfig {
