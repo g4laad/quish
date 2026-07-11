@@ -94,10 +94,10 @@ pub enum Response {
     Closed,
 }
 
-/// Signing request: sign `message` under rustls `SignatureScheme` `scheme` (u16).
+/// Signing request: sign `message` with the host key under the scheme the monitor
+/// pinned at startup. The worker does not get to choose the scheme (or send one).
 #[derive(Debug, Serialize, serde::Deserialize)]
 pub struct SignRequest {
-    pub scheme: u16,
     pub message: Vec<u8>,
 }
 

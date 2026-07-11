@@ -15,7 +15,6 @@ use crate::ipc::{self, SignRequest, SignResponse};
 
 /// A signing job handed to the socket thread; the reply comes back via `reply`.
 struct Job {
-    scheme: u16,
     message: Vec<u8>,
     reply: mpsc::Sender<Option<Vec<u8>>>,
 }
@@ -43,7 +42,7 @@ impl ProxySigningKey {
         std::thread::spawn(move || {
             let mut stream = stream;
             while let Ok(job) = rx.recv() {
-                let sig = sign_once(&mut stream, job.scheme, &job.message);
+                let sig = sign_once(&mut stream, &job.message);
                 let _ = job.reply.send(sig);
             }
         });
@@ -55,11 +54,10 @@ impl ProxySigningKey {
     }
 }
 
-fn sign_once(stream: &mut UnixStream, scheme: u16, message: &[u8]) -> Option<Vec<u8>> {
+fn sign_once(stream: &mut UnixStream, message: &[u8]) -> Option<Vec<u8>> {
     ipc::sign_write(
         stream,
         &SignRequest {
-            scheme,
             message: message.to_vec(),
         },
     )
@@ -101,7 +99,6 @@ impl Signer for ProxySigner {
         let (tx, rx) = mpsc::channel();
         self.jobs
             .send(Job {
-                scheme: u16::from(self.scheme),
                 message: message.to_vec(),
                 reply: tx,
             })

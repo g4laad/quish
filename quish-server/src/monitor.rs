@@ -10,6 +10,7 @@ use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use base64::prelude::{BASE64_STANDARD, Engine};
@@ -59,7 +60,7 @@ pub fn run(cfg: Config) -> Result<()> {
 
     // Signing channel: blocking UnixListener; a thread signs with the host key.
     let sign_listener = UnixListener::bind(&sign_path).context("bind sign socket")?;
-    spawn_sign_thread(sign_listener, signing_key);
+    spawn_sign_thread(sign_listener, signing_key, scheme);
 
     // Auth registry (pubkey per-user; PAM when compiled in).
     let registry = build_registry();
@@ -197,10 +198,62 @@ fn per_user_keys(user: &str) -> Option<PathBuf> {
     Some(u.dir.join(".config/quish/authorized_keys"))
 }
 
-/// Blocking signing loop: proxy each worker signature request to the host key.
-fn spawn_sign_thread(listener: UnixListener, key: Arc<dyn SigningKey>) {
+/// Burst capacity of the host-key signing token bucket. One legitimate full TLS
+/// handshake needs exactly one signature, so this is far above any real signing
+/// rate for an interactive-shell server.
+const SIGN_BURST: u32 = 32;
+/// Time to regain one signing token (~2 signatures/sec sustained). A compromised
+/// worker can use the monitor as a signing oracle (inherent to any signing proxy);
+/// this bounds the abuse throughput. Sized well above legitimate handshake rates.
+const SIGN_REFILL: Duration = Duration::from_millis(500);
+/// Emit an audit line every this many signatures served (journal volume signal).
+const SIGN_AUDIT_INTERVAL: u64 = 100;
+
+/// Single-thread token bucket guarding host-key signatures. The signing loop is a
+/// dedicated serial thread, so no locking is needed.
+struct SignThrottle {
+    tokens: u32,
+    last: Instant,
+}
+
+impl SignThrottle {
+    fn new() -> Self {
+        Self {
+            tokens: SIGN_BURST,
+            last: Instant::now(),
+        }
+    }
+
+    /// Refill by whole tokens for the time elapsed since `last`, then try to spend
+    /// one. Returns `true` if a signature is permitted.
+    fn allow(&mut self, now: Instant) -> bool {
+        let refill_ns = SIGN_REFILL.as_nanos();
+        let elapsed_ns = now.saturating_duration_since(self.last).as_nanos();
+        let gained = u32::try_from(elapsed_ns / refill_ns).unwrap_or(u32::MAX);
+        if gained > 0 {
+            self.tokens = self.tokens.saturating_add(gained).min(SIGN_BURST);
+            // Advance `last` by exactly the intervals consumed so fractional
+            // progress isn't discarded.
+            let step = SIGN_REFILL.checked_mul(gained).unwrap_or(SIGN_REFILL);
+            self.last = self.last.checked_add(step).unwrap_or(now);
+        }
+        if self.tokens > 0 {
+            self.tokens -= 1;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+/// Blocking signing loop: proxy each worker signature request to the host key. The
+/// scheme is pinned to `scheme` (the monitor's choice) — the worker cannot select it.
+/// A token bucket bounds oracle-abuse throughput and every refusal is logged.
+fn spawn_sign_thread(listener: UnixListener, key: Arc<dyn SigningKey>, scheme: SignatureScheme) {
     std::thread::spawn(move || {
-        // One worker → one sign connection; loop to tolerate reconnects.
+        let mut throttle = SignThrottle::new();
+        let mut signed: u64 = 0;
+        // One worker -> one sign connection; loop to tolerate reconnects.
         for conn in listener.incoming() {
             let Ok(mut stream) = conn else { continue };
             loop {
@@ -208,9 +261,22 @@ fn spawn_sign_thread(listener: UnixListener, key: Arc<dyn SigningKey>) {
                     Ok(Some(r)) => r,
                     _ => break,
                 };
-                let resp = match sign_with(&key, req.scheme, &req.message) {
-                    Some(sig) => SignResponse::Signature(sig),
-                    None => SignResponse::Failed,
+                let resp = if !throttle.allow(Instant::now()) {
+                    warn!(
+                        "host-key signing rate limit exceeded; refusing (possible worker compromise)"
+                    );
+                    SignResponse::Failed
+                } else {
+                    match sign_with(&key, scheme, &req.message) {
+                        Some(sig) => {
+                            signed += 1;
+                            if signed.is_multiple_of(SIGN_AUDIT_INTERVAL) {
+                                info!(signed, "host-key signatures served (audit)");
+                            }
+                            SignResponse::Signature(sig)
+                        }
+                        None => SignResponse::Failed,
+                    }
                 };
                 if ipc::sign_write(&mut stream, &resp).is_err() {
                     break;
@@ -220,8 +286,11 @@ fn spawn_sign_thread(listener: UnixListener, key: Arc<dyn SigningKey>) {
     });
 }
 
-fn sign_with(key: &Arc<dyn SigningKey>, scheme: u16, message: &[u8]) -> Option<Vec<u8>> {
-    let scheme = SignatureScheme::from(scheme);
+fn sign_with(
+    key: &Arc<dyn SigningKey>,
+    scheme: SignatureScheme,
+    message: &[u8],
+) -> Option<Vec<u8>> {
     let signer = key.choose_scheme(&[scheme])?;
     signer.sign(message).ok()
 }
@@ -523,5 +592,29 @@ mod tests {
         assert!(s.starts_with("/run/quishd.sock.d-"), "got {s}");
         // A sibling, not a child of the chroot dir.
         assert_ne!(d.parent(), Some(Path::new("/run/quishd")));
+    }
+
+    #[test]
+    fn sign_throttle_allows_burst_then_refuses() {
+        let mut t = SignThrottle::new();
+        let now = Instant::now();
+        for i in 0..SIGN_BURST {
+            assert!(t.allow(now), "burst token {i} should be allowed");
+        }
+        assert!(!t.allow(now), "over-burst request must be refused");
+    }
+
+    #[test]
+    fn sign_throttle_refills_after_interval() {
+        let mut t = SignThrottle::new();
+        let now = Instant::now();
+        for _ in 0..SIGN_BURST {
+            assert!(t.allow(now));
+        }
+        assert!(!t.allow(now), "bucket is empty");
+        // Exactly one refill interval later, exactly one token is back.
+        let later = now + SIGN_REFILL;
+        assert!(t.allow(later), "one token should have refilled");
+        assert!(!t.allow(later), "only one token should have refilled");
     }
 }
