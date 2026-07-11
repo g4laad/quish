@@ -49,6 +49,18 @@ jobs:
       - name: Dev-mode e2e
         run: cargo test -p quish-server --test e2e -- --ignored --nocapture
 
+  # Real privilege-separated path (root monitor + chrooted worker + PAM + PTY)
+  # exercised in a rootful podman container. Rootful is the reliable path for
+  # chroot/setuid, so run under sudo.
+  privsep-e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build privsep e2e image
+        run: sudo podman build -t quish-privsep-e2e -f dist/test/Containerfile .
+      - name: Run privsep e2e
+        run: sudo podman run --rm quish-privsep-e2e
+
   build:
     runs-on: ubuntu-latest
     steps:
