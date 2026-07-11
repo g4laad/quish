@@ -31,5 +31,9 @@ ENV QUISH_TEST_PASSWORD=quishtestpw
 # Build once at image-build time so `podman run` is fast and hermetic.
 RUN cargo build --workspace --features quish-server/pam
 
+# --test-threads=1: each scenario spawns a real root monitor with a global
+# /run/quishd.sock.d-<pid> socket dir and drives timing-sensitive session
+# teardown; serialize so socket_dir_is_root_only sees exactly one dir and the
+# reap/disconnect guards aren't perturbed by concurrent daemons.
 CMD ["cargo", "test", "-p", "quish-server", "--features", "pam", \
-     "--test", "privsep_e2e", "--", "--ignored", "--nocapture"]
+     "--test", "privsep_e2e", "--", "--ignored", "--nocapture", "--test-threads=1"]
