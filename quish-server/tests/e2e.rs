@@ -60,12 +60,12 @@ struct DevServer {
 
 impl DevServer {
     fn start(user: &str) -> DevServer {
-        Self::start_with_env(user, &[])
+        Self::start_with_args(user, &[])
     }
 
-    /// Like [`start`], but sets extra env vars on the `quishd` process (e.g.
-    /// `QUISH_ALLOW_FORWARD`, which gates `-L` forwarding in this slice).
-    fn start_with_env(user: &str, extra_env: &[(&str, &str)]) -> DevServer {
+    /// Like [`start`], but appends `extra_args` to the `quishd` argv (e.g.
+    /// `--allow-forward`, which enables `-L` forwarding).
+    fn start_with_args(user: &str, extra_args: &[&str]) -> DevServer {
         let quishd = PathBuf::from(env!("CARGO_BIN_EXE_quishd"));
         let home = fresh_temp_dir("quishd-home");
 
@@ -73,12 +73,10 @@ impl DevServer {
         // sets stderr), so the readiness line arrives on stdout.
         let mut cmd = Command::new(&quishd);
         cmd.args(["--listen", "127.0.0.1:0", "--dev-insecure-user", user])
+            .args(extra_args)
             .env("HOME", &home)
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
-        for (k, v) in extra_env {
-            cmd.env(k, v);
-        }
         let mut child = cmd.spawn().expect("spawn quishd");
 
         let stdout = child.stdout.take().expect("piped stdout");
@@ -345,7 +343,7 @@ fn connect_retry(port: u16, timeout: Duration) -> TcpStream {
 fn local_forward_roundtrips_when_enabled() {
     let echo_port = spawn_echo_server();
     let lport = free_local_port();
-    let server = DevServer::start_with_env("testuser", &[("QUISH_ALLOW_FORWARD", "1")]);
+    let server = DevServer::start_with_args("testuser", &["--allow-forward"]);
     let target = format!("testuser@{}", server.addr);
     let spec = format!("{lport}:127.0.0.1:{echo_port}");
 

@@ -14,7 +14,7 @@
 //! image CMD runs them with `--ignored`.
 
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::SocketAddr;
+use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -76,6 +76,12 @@ struct PrivsepServer {
 
 impl PrivsepServer {
     fn start() -> PrivsepServer {
+        Self::start_with_args(&[])
+    }
+
+    /// Like [`start`], but appends `extra` to the `quishd` argv (e.g.
+    /// `--allow-forward`, which enables `-L` forwarding for the daemon).
+    fn start_with_args(extra: &[&str]) -> PrivsepServer {
         // Guardrail: privsep mode forks/chroots/setuids and requires root. The
         // real gate is `#[ignore]` + the container CMD; this just fails clearly
         // if someone runs the file directly on a non-root host.
@@ -99,6 +105,7 @@ impl PrivsepServer {
                 "--privsep-user",
                 "quish",
             ])
+            .args(extra)
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()
@@ -497,4 +504,142 @@ fn disconnect_kills_the_session_privsep() {
         gone,
         "session process 'sleep 293' survived client disconnect (plan 003 teardown regressed)"
     );
+}
+
+/// A loopback echo server (mirrors `e2e.rs::spawn_echo_server`): echoes back
+/// whatever it reads on each accepted connection. Returns its bound port.
+fn spawn_echo_server() -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind echo server");
+    let port = listener.local_addr().unwrap().port();
+    thread::spawn(move || {
+        for conn in listener.incoming() {
+            let Ok(mut sock) = conn else { break };
+            thread::spawn(move || {
+                let mut buf = [0u8; 8192];
+                loop {
+                    match sock.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            if sock.write_all(&buf[..n]).is_err() {
+                                break;
+                            }
+                        }
+                    }
+                }
+            });
+        }
+    });
+    port
+}
+
+/// Grab a currently-free loopback port by binding ephemeral and releasing it
+/// (mirrors `e2e.rs::free_local_port`; small TOCTOU window, fine for a test).
+fn free_local_port() -> u16 {
+    TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+}
+
+/// Connect to `127.0.0.1:port`, retrying until the client's `-L` listener is up
+/// or the deadline elapses (mirrors `e2e.rs::connect_retry`).
+fn connect_retry(port: u16, timeout: Duration) -> TcpStream {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match TcpStream::connect(("127.0.0.1", port)) {
+            Ok(s) => return s,
+            Err(e) => {
+                if Instant::now() >= deadline {
+                    panic!("no connect to local forward port {port} within {timeout:?}: {e}");
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+        }
+    }
+}
+
+/// Spawn the real `quish` client with a `-L` local forward against `server`,
+/// stdin piped and held open so the client stays in forward mode (mirrors
+/// `spawn_interactive_client`, but for a forwarding session).
+fn spawn_forward_client(server: &PrivsepServer, user: &str, password: &str, spec: &str) -> Child {
+    let quish = quish_client();
+    let home = server.client_home();
+    Command::new(&quish)
+        .args(["-L", spec, &format!("{user}@{}", server.addr)])
+        .env("HOME", &home)
+        .env("QUISH_PASSWORD", password)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn forwarding quish client")
+}
+
+/// With `--allow-forward`, a `-L` local forward must tunnel loopback bytes
+/// through the REAL daemon (root monitor + chrooted worker): local port →
+/// worker → the remote loopback echo service and back. Proves the flag is
+/// usable in privsep mode, not just dev mode.
+#[test]
+#[ignore]
+fn local_forward_roundtrips_privsep() {
+    let user = test_user();
+    let pw = test_password();
+    let echo_port = spawn_echo_server();
+    let lport = free_local_port();
+    let server = PrivsepServer::start_with_args(&["--allow-forward"]);
+    let spec = format!("{lport}:127.0.0.1:{echo_port}");
+
+    let mut client = spawn_forward_client(&server, &user, &pw, &spec);
+    // Keep the client's stdin open so it doesn't half-close and exit forward mode.
+    let _stdin = client.stdin.take();
+
+    let mut conn = connect_retry(lport, Duration::from_secs(10));
+    conn.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let payload = b"quish-privsep-forward-roundtrip";
+    conn.write_all(payload).expect("write to forward");
+    let mut got = vec![0u8; payload.len()];
+    conn.read_exact(&mut got)
+        .expect("read echo back through forward");
+    assert_eq!(&got, payload, "forwarded bytes did not echo back");
+
+    drop(conn);
+    let _ = client.kill();
+    let _ = client.wait();
+}
+
+/// Default (no `--allow-forward`): the real worker must refuse the forward
+/// channel — the local connection opens but is closed without reaching the echo
+/// service, so we read EOF (0 bytes).
+#[test]
+#[ignore]
+fn local_forward_refused_when_disabled_privsep() {
+    let user = test_user();
+    let pw = test_password();
+    let echo_port = spawn_echo_server();
+    let lport = free_local_port();
+    let server = PrivsepServer::start(); // default: forwarding disabled
+    let spec = format!("{lport}:127.0.0.1:{echo_port}");
+
+    let mut client = spawn_forward_client(&server, &user, &pw, &spec);
+    let _stdin = client.stdin.take();
+
+    let mut conn = connect_retry(lport, Duration::from_secs(10));
+    conn.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let payload = b"should-not-echo";
+    let _ = conn.write_all(payload); // may succeed locally; the channel is refused
+    let mut buf = vec![0u8; payload.len()];
+    // Refused: the worker closes the channel without connecting, the client shuts
+    // the local socket, so we read EOF (0 bytes) and never the echoed payload.
+    let n = conn.read(&mut buf).unwrap_or(0);
+    assert_eq!(
+        n,
+        0,
+        "forwarding is disabled but {n} bytes came back: {:?}",
+        &buf[..n]
+    );
+
+    drop(conn);
+    let _ = client.kill();
+    let _ = client.wait();
 }
