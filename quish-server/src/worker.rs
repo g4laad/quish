@@ -53,6 +53,7 @@ pub fn run() -> Result<()> {
     let max_auth_fails = ipc::env(ipc::ENV_MAX_AUTH_FAILS)?
         .parse::<u32>()
         .context("max_auth_fails")?;
+    let allow_forward = ipc::env_bool(ipc::ENV_ALLOW_FORWARD);
     let cert_der = CertificateDer::from(
         BASE64_STANDARD
             .decode(ipc::env(ipc::ENV_CERT)?)
@@ -99,7 +100,7 @@ pub fn run() -> Result<()> {
 
         let client = Arc::new(MonitorClient::new(ctrl));
         let backend = Arc::new(crate::transport::Backend::Privsep { client });
-        crate::transport::run(endpoint, path, backend, max_auth_fails).await
+        crate::transport::run(endpoint, path, backend, max_auth_fails, allow_forward).await
     })
 }
 
@@ -205,7 +206,12 @@ impl MonitorClient {
 }
 
 /// Serve one channel: read `ChannelOpen`, ask the monitor to spawn, pump fds.
-pub async fn serve_channel(client: &MonitorClient, conn_id: u64, stream: FullStream) -> Result<()> {
+pub async fn serve_channel(
+    client: &MonitorClient,
+    conn_id: u64,
+    stream: FullStream,
+    allow_forward: bool,
+) -> Result<()> {
     let (send, recv) = stream.split();
     let mut reader = FrameReader::new(recv);
     let Some(body) = reader.next_frame().await? else {
@@ -239,7 +245,7 @@ pub async fn serve_channel(client: &MonitorClient, conn_id: u64, stream: FullStr
             info!(%conn_id, %port, "forward channel");
             // Loopback-only egress policy + Data pump live in the shared helper;
             // no monitor RPC (the worker opens the socket unprivileged).
-            serve_forward(send, reader, host, port).await
+            serve_forward(send, reader, host, port, allow_forward).await
         }
     }
 }

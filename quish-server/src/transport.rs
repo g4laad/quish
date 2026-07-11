@@ -81,10 +81,17 @@ impl Backend {
         }
     }
 
-    async fn serve(&self, conn_id: u64, stream: crate::session::FullStream) -> Result<()> {
+    async fn serve(
+        &self,
+        conn_id: u64,
+        stream: crate::session::FullStream,
+        allow_forward: bool,
+    ) -> Result<()> {
         match self {
-            Backend::Dev { .. } => crate::session::serve(stream).await,
-            Backend::Privsep { client } => serve_channel(client, conn_id, stream).await,
+            Backend::Dev { .. } => crate::session::serve(stream, allow_forward).await,
+            Backend::Privsep { client } => {
+                serve_channel(client, conn_id, stream, allow_forward).await
+            }
         }
     }
 
@@ -124,6 +131,7 @@ pub async fn run(
     path: String,
     backend: Arc<Backend>,
     max_auth_fails: u32,
+    allow_forward: bool,
 ) -> Result<()> {
     info!(addr = ?endpoint.local_addr().ok(), %path, "quishd listening");
 
@@ -148,6 +156,7 @@ pub async fn run(
                 limiter,
                 conn_id,
                 max_auth_fails,
+                allow_forward,
             )
             .await
             {
@@ -166,6 +175,7 @@ async fn handle_connection(
     limiter: Arc<RateLimiter>,
     conn_id: u64,
     max_auth_fails: u32,
+    allow_forward: bool,
 ) -> Result<()> {
     let conn = incoming.await.context("QUIC handshake")?;
     let peer_addr = conn.remote_address();
@@ -220,6 +230,7 @@ async fn handle_connection(
                         conn_id,
                         conn_fails,
                         max_auth_fails,
+                        allow_forward,
                     )
                     .await
                     {
@@ -246,6 +257,7 @@ async fn handle_request(
     conn_id: u64,
     conn_fails: Arc<AtomicU32>,
     max_auth_fails: u32,
+    allow_forward: bool,
 ) -> Result<()> {
     let (req, mut stream) = resolver
         .resolve_request()
@@ -306,7 +318,7 @@ async fn handle_request(
 
     info!(%conn_id, "quish session authenticated");
     respond(&mut stream, StatusCode::OK).await?;
-    backend.serve(conn_id, stream).await
+    backend.serve(conn_id, stream, allow_forward).await
 }
 
 async fn respond(stream: &mut ReqStream, status: StatusCode) -> Result<()> {

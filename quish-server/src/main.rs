@@ -68,6 +68,11 @@ struct Args {
     #[arg(long)]
     max_auth_fails: Option<u32>,
 
+    /// Enable local (`-L`) TCP port forwarding (loopback-only). OFF by default;
+    /// this flag or `allow_forward = true` in the config file turns it on.
+    #[arg(long)]
+    allow_forward: bool,
+
     /// Internal: run as the privilege-dropped worker (spawned by the monitor).
     #[arg(long, hide = true)]
     internal_worker: bool,
@@ -123,9 +128,10 @@ fn main() -> anyhow::Result<()> {
         .max_auth_fails
         .or(file.max_auth_fails)
         .unwrap_or(transport::DEFAULT_MAX_AUTH_FAILS);
+    let allow_forward = args.allow_forward || file.allow_forward.unwrap_or(false);
 
     if let Some(dev_user) = args.dev_insecure_user {
-        return run_dev(listen, path, dev_user, max_auth_fails);
+        return run_dev(listen, path, dev_user, max_auth_fails, allow_forward);
     }
     monitor::run(monitor::Config {
         listen,
@@ -140,6 +146,7 @@ fn main() -> anyhow::Result<()> {
             .unwrap_or_else(|| "quish".to_string()),
         host_key,
         max_auth_fails,
+        allow_forward,
     })
 }
 
@@ -149,6 +156,7 @@ fn run_dev(
     path: String,
     dev_user: String,
     max_auth_fails: u32,
+    allow_forward: bool,
 ) -> anyhow::Result<()> {
     let backends: Vec<Box<dyn AuthBackend>> = vec![
         Box::new(DevInsecureBackend::new(dev_user)),
@@ -162,7 +170,7 @@ fn run_dev(
         .build()?
         .block_on(async move {
             let endpoint = transport::dev_endpoint(listen)?;
-            transport::run(endpoint, path, backend, max_auth_fails).await
+            transport::run(endpoint, path, backend, max_auth_fails, allow_forward).await
         })
 }
 

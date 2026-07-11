@@ -26,7 +26,7 @@ pub(crate) type RecvHalf = h3::server::RequestStream<h3_quinn::RecvStream, Bytes
 
 /// Read the opening frame and dispatch to the requested channel type (dev mode:
 /// spawns the process locally via portable-pty).
-pub async fn serve(stream: FullStream) -> Result<()> {
+pub async fn serve(stream: FullStream, allow_forward: bool) -> Result<()> {
     let (send, recv) = stream.split();
     let mut reader = FrameReader::new(recv);
 
@@ -46,7 +46,7 @@ pub async fn serve(stream: FullStream) -> Result<()> {
         }
         ChannelOpen::Forward { host, port } => {
             info!(%port, "forward channel");
-            serve_forward(send, reader, host, port).await
+            serve_forward(send, reader, host, port, allow_forward).await
         }
     }
 }
@@ -310,18 +310,6 @@ pub(crate) async fn pump_exec(
     }
 }
 
-/// Whether the operator has enabled `-L` TCP forwarding. Off unless
-/// `QUISH_ALLOW_FORWARD` is `1`/`true`. This env override is the enablement path
-/// wired in this slice (the e2e harness sets it); threading `--allow-forward` /
-/// `FileConfig.allow_forward` through the server frontends is a documented
-/// follow-up. Default (unset) = disabled = forwarding refused.
-pub(crate) fn forwarding_enabled() -> bool {
-    matches!(
-        std::env::var("QUISH_ALLOW_FORWARD").as_deref(),
-        Ok("1") | Ok("true")
-    )
-}
-
 /// Serve a `Forward` channel: enforce the loopback-only egress policy, then
 /// bridge the H3 channel to a server-side TCP connection. The channel is closed
 /// WITHOUT connecting when forwarding is disabled or the destination resolves to
@@ -333,8 +321,9 @@ pub(crate) async fn serve_forward(
     reader: FrameReader,
     host: String,
     port: u16,
+    allow_forward: bool,
 ) -> Result<()> {
-    if !forwarding_enabled() {
+    if !allow_forward {
         warn!(%port, "forward channel refused: forwarding disabled");
         return send.finish().await.map_err(Into::into);
     }

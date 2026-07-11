@@ -34,6 +34,9 @@ pub const ENV_SIGN_SCHEME: &str = "QUISH_SIGN_SCHEME";
 pub const ENV_MAX_AUTH_FAILS: &str = "QUISH_MAX_AUTH_FAILS";
 /// Server cert chain (public), base64 DER, `\n`-separated — passed to the worker.
 pub const ENV_CERT: &str = "QUISH_CERT";
+/// Whether `-L` TCP forwarding is enabled; `"true"`/`"false"`. Set by the monitor
+/// on the worker re-exec, read by `worker::run`.
+pub const ENV_ALLOW_FORWARD: &str = "QUISH_ALLOW_FORWARD";
 
 /// Env vars for the `--internal-run-session` helper.
 pub const ENV_SESS_UID: &str = "QUISH_SESS_UID";
@@ -56,6 +59,12 @@ pub fn env(key: &str) -> Result<String> {
 /// [`env`] parsed as a `u32`.
 pub fn env_u32(key: &str) -> Result<u32> {
     env(key)?.parse().with_context(|| format!("bad {key}"))
+}
+
+/// [`env`] parsed as a bool: `true` only for exactly `"true"`. A missing or
+/// unrecognized value is `false` (fail closed).
+pub fn env_bool(key: &str) -> bool {
+    matches!(std::env::var(key).as_deref(), Ok("true"))
 }
 
 /// Control-channel request (worker → monitor).
