@@ -188,6 +188,76 @@ fn exec_propagates_nonzero_exit_code() {
     assert_eq!(output.status.code(), Some(7), "output: {output:?}");
 }
 
+/// Like [`run_client`] but returns the live [`Child`] so the test can signal it
+/// mid-run. stdin is `/dev/null`, stdout/stderr are captured; the caller waits.
+fn run_client_child(server: &DevServer, args: &[&str], password: Option<&str>) -> Child {
+    let quishd = PathBuf::from(env!("CARGO_BIN_EXE_quishd"));
+    let quish = quishd.with_file_name("quish");
+    if !quish.exists() {
+        panic!(
+            "quish client binary not found at {}; run `cargo build --workspace` first",
+            quish.display()
+        );
+    }
+
+    let home = fresh_temp_dir("quish-client-home");
+    let kh_dir = home.join(".config/quish");
+    std::fs::create_dir_all(&kh_dir).unwrap();
+    std::fs::write(
+        kh_dir.join("known_hosts"),
+        format!("{} {}\n", server.addr, server.fingerprint),
+    )
+    .unwrap();
+    let mut cmd = Command::new(&quish);
+    cmd.args(args)
+        .env("HOME", &home)
+        // Pipe stdin so the caller can hold it open (a real TTY never EOFs); an
+        // EOF would make the client half-close its send stream mid-run.
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    if let Some(p) = password {
+        cmd.env("QUISH_PASSWORD", p);
+    }
+    cmd.spawn().expect("spawn quish client")
+}
+
+/// Ctrl-C on an exec channel must reach the *remote* process, not just kill the
+/// local client. The client traps SIGINT and forwards a `Signal` frame; the
+/// server delivers it to the remote command's process, whose own INT trap runs
+/// and exits 42. The client then reports that remote status — proving the signal
+/// made the full round trip rather than the client dying on the signal.
+#[test]
+#[ignore]
+fn exec_signal_interrupts_remote() {
+    let server = DevServer::start("testuser");
+    let target = format!("testuser@{}", server.addr);
+
+    // Remote command reacts to SIGINT within one 100ms tick (the pending trap
+    // runs once the in-flight `sleep` returns) and exits 42.
+    let mut child = run_client_child(
+        &server,
+        &[&target, "trap 'exit 42' INT; while :; do sleep 0.1; done"],
+        Some("anything"),
+    );
+    // Keep the client's stdin open (as a real TTY is): on stdin EOF the client
+    // half-closes its send stream and could no longer forward the signal frame.
+    let _stdin = child.stdin.take();
+
+    // Let the client connect and open the channel, then simulate Ctrl-C by
+    // sending the client process SIGINT. The client forwards it and does not die.
+    thread::sleep(Duration::from_millis(1500));
+    let pid = nix::unistd::Pid::from_raw(child.id() as i32);
+    nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGINT).expect("send SIGINT to client");
+
+    let status = child.wait().expect("wait for client");
+    assert_eq!(
+        status.code(),
+        Some(42),
+        "remote INT trap did not run; client status: {status:?}"
+    );
+}
+
 #[test]
 #[ignore]
 fn auth_rejects_unknown_user() {
