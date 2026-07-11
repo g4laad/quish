@@ -169,7 +169,23 @@ async fn exec(mut send: SendHalf, reader: FrameReader, command: String) -> Resul
     });
 
     let frames = spawn_frame_reader(reader);
-    let end = pump_exec(&mut send, frames, out_rx, err_rx, in_tx).await?;
+    let (sig_tx, mut sig_rx) = mpsc::channel::<quish_proto::Signal>(8);
+    let child_id = child.id(); // Option<u32>
+    let pump = pump_exec(&mut send, frames, out_rx, err_rx, in_tx, sig_tx);
+    let drain = async {
+        while let Some(s) = sig_rx.recv().await {
+            if let Some(pid) = child_id {
+                let sig = match s {
+                    quish_proto::Signal::Int => nix::sys::signal::Signal::SIGINT,
+                    quish_proto::Signal::Quit => nix::sys::signal::Signal::SIGQUIT,
+                    quish_proto::Signal::Term => nix::sys::signal::Signal::SIGTERM,
+                };
+                let _ = nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), sig);
+            }
+        }
+    };
+    let (end, ()) = tokio::join!(pump, drain);
+    let end = end?;
 
     if let PumpEnd::Drained = end {
         let code = child
@@ -250,6 +266,7 @@ pub(crate) async fn pump_exec(
     mut out_rx: mpsc::Receiver<Vec<u8>>,
     mut err_rx: mpsc::Receiver<Vec<u8>>,
     in_tx: mpsc::Sender<Vec<u8>>,
+    sig_tx: mpsc::Sender<quish_proto::Signal>,
 ) -> Result<PumpEnd> {
     let mut in_tx = Some(in_tx);
     let (mut out_done, mut err_done, mut frames_done) = (false, false, false);
@@ -274,6 +291,9 @@ pub(crate) async fn pump_exec(
             msg = frames.recv(), if !frames_done => match msg {
                 Some(ChannelMessage::Data(d)) => {
                     if let Some(tx) = in_tx.as_ref() { let _ = tx.send(d).await; }
+                }
+                Some(ChannelMessage::Signal(s)) => {
+                    let _ = sig_tx.send(s).await;
                 }
                 Some(_) => {}
                 None => { frames_done = true; in_tx = None; } // EOF child stdin

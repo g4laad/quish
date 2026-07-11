@@ -61,6 +61,13 @@ pub fn run_session_helper() -> Result<()> {
     let term = std::env::var(ipc::ENV_SESS_TERM).unwrap_or_else(|_| "xterm".into());
     let command = std::env::var(ipc::ENV_SESS_COMMAND).ok();
 
+    // Exec channels have no controlling TTY, but still become a session/group
+    // leader so the monitor can signal the whole command group (see plan 009).
+    // Shell channels setsid() inside the tty branch below; don't double-setsid.
+    if command.is_some() && std::env::var(ipc::ENV_SESS_TTY).is_err() {
+        nix::unistd::setsid().context("setsid (exec)")?;
+    }
+
     // Shell channels: become a session leader and acquire the pty as our
     // controlling terminal (job control, Ctrl-C, …). stdin/out/err are already the
     // slave; opening the pts path as a fresh session leader (no O_NOCTTY) makes it

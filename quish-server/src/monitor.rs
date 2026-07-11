@@ -457,6 +457,22 @@ async fn serve_control(mut listener: UnixSeqpacketListener, registry: Arc<Regist
                 }
                 ipc::ctrl_send(&sock, &Response::Closed, &[]).await?;
             }
+
+            Request::Signal { session_id, signal } => {
+                if let Some(child) = st.sessions.get(&session_id) {
+                    let pid = child.id() as i32;
+                    let sig = match signal {
+                        quish_proto::Signal::Int => nix::sys::signal::Signal::SIGINT,
+                        quish_proto::Signal::Quit => nix::sys::signal::Signal::SIGQUIT,
+                        quish_proto::Signal::Term => nix::sys::signal::Signal::SIGTERM,
+                    };
+                    // Signal the whole session process group (negative pid). The
+                    // exec session helper setsid()s (Step 3) so pgid == pid and
+                    // the target command dies even if the login shell wrapped it.
+                    let _ = nix::sys::signal::killpg(nix::unistd::Pid::from_raw(pid), sig);
+                }
+                ipc::ctrl_send(&sock, &Response::Closed, &[]).await?;
+            }
         }
     }
 

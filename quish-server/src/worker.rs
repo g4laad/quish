@@ -195,6 +195,10 @@ impl MonitorClient {
         }
     }
 
+    async fn signal(&self, session_id: u64, signal: quish_proto::Signal) {
+        let _ = self.call(&Request::Signal { session_id, signal }).await;
+    }
+
     pub async fn close(&self, conn_id: u64) {
         let _ = self.call(&Request::Close { conn_id }).await;
     }
@@ -289,7 +293,15 @@ async fn run_exec(
     std::thread::spawn(move || write_loop(File::from(stdin), in_rx));
 
     let frames = spawn_frame_reader(reader);
-    let end = pump_exec(&mut send, frames, out_rx, err_rx, in_tx).await?;
+    let (sig_tx, mut sig_rx) = mpsc::channel::<quish_proto::Signal>(8);
+    let pump = pump_exec(&mut send, frames, out_rx, err_rx, in_tx, sig_tx);
+    let drain = async {
+        while let Some(s) = sig_rx.recv().await {
+            client.signal(session_id, s).await;
+        }
+    };
+    let (end, ()) = tokio::join!(pump, drain);
+    let end = end?;
 
     let code = client.reap(session_id).await; // ALWAYS reap — no session leak
     if let PumpEnd::Drained = end {

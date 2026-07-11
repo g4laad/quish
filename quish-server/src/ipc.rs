@@ -77,6 +77,11 @@ pub enum Request {
     Reap { session_id: u64 },
     /// Connection gone: drop its identity + bookkeeping.
     Close { conn_id: u64 },
+    /// Deliver a signal to a spawned session's process group.
+    Signal {
+        session_id: u64,
+        signal: quish_proto::Signal,
+    },
 }
 
 /// Control-channel response (monitor → worker).
