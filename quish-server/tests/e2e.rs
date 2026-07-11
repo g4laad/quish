@@ -6,14 +6,14 @@
 //! `cargo test -p quish-server` does not build. Run
 //! `cargo build --workspace && cargo test -p quish-server --test e2e -- --ignored`.
 
-use std::io::{BufRead, BufReader};
-use std::net::SocketAddr;
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Unique-per-call temp dir, matching the style in `quish-auth/src/pubkey.rs`.
 fn fresh_temp_dir(prefix: &str) -> PathBuf {
@@ -60,18 +60,26 @@ struct DevServer {
 
 impl DevServer {
     fn start(user: &str) -> DevServer {
+        Self::start_with_env(user, &[])
+    }
+
+    /// Like [`start`], but sets extra env vars on the `quishd` process (e.g.
+    /// `QUISH_ALLOW_FORWARD`, which gates `-L` forwarding in this slice).
+    fn start_with_env(user: &str, extra_env: &[(&str, &str)]) -> DevServer {
         let quishd = PathBuf::from(env!("CARGO_BIN_EXE_quishd"));
         let home = fresh_temp_dir("quishd-home");
 
         // quishd's tracing writer defaults to stdout (unlike the client, which
         // sets stderr), so the readiness line arrives on stdout.
-        let mut child = Command::new(&quishd)
-            .args(["--listen", "127.0.0.1:0", "--dev-insecure-user", user])
+        let mut cmd = Command::new(&quishd);
+        cmd.args(["--listen", "127.0.0.1:0", "--dev-insecure-user", user])
             .env("HOME", &home)
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn quishd");
+            .stderr(Stdio::null());
+        for (k, v) in extra_env {
+            cmd.env(k, v);
+        }
+        let mut child = cmd.spawn().expect("spawn quishd");
 
         let stdout = child.stdout.take().expect("piped stdout");
         let (tx, rx) = mpsc::channel();
@@ -274,4 +282,122 @@ fn auth_rejects_unknown_user() {
         !String::from_utf8_lossy(&output.stdout).contains("nope"),
         "command output leaked despite rejected auth: {output:?}"
     );
+}
+
+/// A throwaway loopback TCP echo server: echoes every byte back until the peer
+/// closes. Returns its bound port; the accept loop runs on a detached thread
+/// (leaked for the test's lifetime, matching the stdout-drainer style above).
+fn spawn_echo_server() -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind echo server");
+    let port = listener.local_addr().unwrap().port();
+    thread::spawn(move || {
+        for conn in listener.incoming() {
+            let Ok(mut sock) = conn else { break };
+            thread::spawn(move || {
+                let mut buf = [0u8; 8192];
+                loop {
+                    match sock.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            if sock.write_all(&buf[..n]).is_err() {
+                                break;
+                            }
+                        }
+                    }
+                }
+            });
+        }
+    });
+    port
+}
+
+/// Grab a currently-free loopback port by binding ephemeral and releasing it.
+/// (Small TOCTOU window, acceptable for a test.)
+fn free_local_port() -> u16 {
+    TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+}
+
+/// Connect to `127.0.0.1:port`, retrying until the client's `-L` listener is up
+/// or the deadline elapses.
+fn connect_retry(port: u16, timeout: Duration) -> TcpStream {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match TcpStream::connect(("127.0.0.1", port)) {
+            Ok(s) => return s,
+            Err(e) => {
+                if Instant::now() >= deadline {
+                    panic!("no connect to local forward port {port} within {timeout:?}: {e}");
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+        }
+    }
+}
+
+/// With forwarding enabled, a `-L` local forward must tunnel loopback bytes:
+/// local port → server → the remote loopback echo service and back.
+#[test]
+#[ignore]
+fn local_forward_roundtrips_when_enabled() {
+    let echo_port = spawn_echo_server();
+    let lport = free_local_port();
+    let server = DevServer::start_with_env("testuser", &[("QUISH_ALLOW_FORWARD", "1")]);
+    let target = format!("testuser@{}", server.addr);
+    let spec = format!("{lport}:127.0.0.1:{echo_port}");
+
+    let mut client = run_client_child(&server, &["-L", &spec, &target], Some("anything"));
+    // Keep the client's stdin open so it doesn't half-close and exit forward mode.
+    let _stdin = client.stdin.take();
+
+    let mut conn = connect_retry(lport, Duration::from_secs(10));
+    conn.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let payload = b"quish-forward-roundtrip";
+    conn.write_all(payload).expect("write to forward");
+    let mut got = vec![0u8; payload.len()];
+    conn.read_exact(&mut got)
+        .expect("read echo back through forward");
+    assert_eq!(&got, payload, "forwarded bytes did not echo back");
+
+    drop(conn);
+    let _ = client.kill();
+    let _ = client.wait();
+}
+
+/// With forwarding disabled (the default — no `QUISH_ALLOW_FORWARD`), the server
+/// must refuse the forward channel: the local connection opens but is closed
+/// without ever reaching the echo service, so no bytes come back.
+#[test]
+#[ignore]
+fn local_forward_refused_when_disabled() {
+    let echo_port = spawn_echo_server();
+    let lport = free_local_port();
+    let server = DevServer::start("testuser"); // default: forwarding disabled
+    let target = format!("testuser@{}", server.addr);
+    let spec = format!("{lport}:127.0.0.1:{echo_port}");
+
+    let mut client = run_client_child(&server, &["-L", &spec, &target], Some("anything"));
+    let _stdin = client.stdin.take();
+
+    let mut conn = connect_retry(lport, Duration::from_secs(10));
+    conn.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let payload = b"should-not-echo";
+    let _ = conn.write_all(payload); // may succeed locally; the channel is refused
+    let mut buf = vec![0u8; payload.len()];
+    // Refused: the server closes the channel without connecting, the client shuts
+    // the local socket, so we read EOF (0 bytes) and never the echoed payload.
+    let n = conn.read(&mut buf).unwrap_or(0);
+    assert_eq!(
+        n,
+        0,
+        "forwarding is disabled but {n} bytes came back: {:?}",
+        &buf[..n]
+    );
+
+    drop(conn);
+    let _ = client.kill();
+    let _ = client.wait();
 }

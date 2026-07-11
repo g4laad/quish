@@ -23,3 +23,14 @@ host_key = "/var/lib/quishd/host_key.der"
 # get cheap 401s (no monitor round-trip). The connection stays up and the
 # constant-time anti-enumeration floor still applies.
 max_auth_fails = 6
+
+# Enable local (`-L`) TCP port forwarding. Forwarding is OFF by default; when
+# enabled it is loopback-only — the server will only connect to `127.0.0.0/8` /
+# `::1`, so a forward channel cannot pivot to other hosts. Leave unset (or false)
+# to refuse all forward channels.
+#
+# NOTE: in the current slice this key is parsed but not yet threaded to the
+# server frontends; enablement for testing is via the `QUISH_ALLOW_FORWARD=1`
+# environment variable. Wiring this key + a `--allow-forward` CLI flag is a
+# follow-up.
+# allow_forward = false

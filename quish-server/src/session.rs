@@ -16,6 +16,7 @@ use bytes::{Buf, Bytes};
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use quish_proto::{ChannelMessage, ChannelOpen, LEN_PREFIX, parse_len};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
@@ -42,6 +43,10 @@ pub async fn serve(stream: FullStream) -> Result<()> {
             // do not log the command body — it may contain secrets
             info!("exec channel");
             exec(send, reader, command).await
+        }
+        ChannelOpen::Forward { host, port } => {
+            info!(%port, "forward channel");
+            serve_forward(send, reader, host, port).await
         }
     }
 }
@@ -303,6 +308,118 @@ pub(crate) async fn pump_exec(
             return Ok(PumpEnd::Drained);
         }
     }
+}
+
+/// Whether the operator has enabled `-L` TCP forwarding. Off unless
+/// `QUISH_ALLOW_FORWARD` is `1`/`true`. This env override is the enablement path
+/// wired in this slice (the e2e harness sets it); threading `--allow-forward` /
+/// `FileConfig.allow_forward` through the server frontends is a documented
+/// follow-up. Default (unset) = disabled = forwarding refused.
+pub(crate) fn forwarding_enabled() -> bool {
+    matches!(
+        std::env::var("QUISH_ALLOW_FORWARD").as_deref(),
+        Ok("1") | Ok("true")
+    )
+}
+
+/// Serve a `Forward` channel: enforce the loopback-only egress policy, then
+/// bridge the H3 channel to a server-side TCP connection. The channel is closed
+/// WITHOUT connecting when forwarding is disabled or the destination resolves to
+/// any non-loopback address — the security check runs strictly before
+/// `TcpStream::connect`, and we connect only to an address already verified
+/// loopback (so a DNS rebind cannot slip a non-loopback address through).
+pub(crate) async fn serve_forward(
+    mut send: SendHalf,
+    reader: FrameReader,
+    host: String,
+    port: u16,
+) -> Result<()> {
+    if !forwarding_enabled() {
+        warn!(%port, "forward channel refused: forwarding disabled");
+        return send.finish().await.map_err(Into::into);
+    }
+    // Resolve, then require EVERY returned address to be loopback.
+    let addrs: Vec<std::net::SocketAddr> =
+        match tokio::net::lookup_host((host.as_str(), port)).await {
+            Ok(it) => it.collect(),
+            Err(e) => {
+                warn!(%host, %port, error = %e, "forward channel refused: resolve failed");
+                return send.finish().await.map_err(Into::into);
+            }
+        };
+    if addrs.is_empty() || !addrs.iter().all(|a| a.ip().is_loopback()) {
+        warn!(%host, %port, "forward channel refused: destination not loopback-only");
+        return send.finish().await.map_err(Into::into);
+    }
+    // Connect only to an address we have already checked is loopback.
+    let target = addrs[0];
+    let tcp = match TcpStream::connect(target).await {
+        Ok(s) => s,
+        Err(e) => {
+            warn!(%target, error = %e, "forward channel: connect failed");
+            return send.finish().await.map_err(Into::into);
+        }
+    };
+    info!(%target, "forward channel connected");
+    pump_forward(&mut send, reader, tcp).await
+}
+
+/// Symmetric byte pump for a forward channel: client channel frames ⇄ the
+/// server-side TCP stream, both directions carried as `ChannelMessage::Data`
+/// (per the Decision record — no stderr/resize/exit). Ends when either side EOFs.
+async fn pump_forward(send: &mut SendHalf, reader: FrameReader, tcp: TcpStream) -> Result<()> {
+    let (mut tcp_read, mut tcp_write) = tcp.into_split();
+    let mut frames = spawn_frame_reader(reader);
+
+    // Service output → mpsc (dedicated reader task, matching the pump shape used
+    // by the shell/exec channels).
+    let (out_tx, mut out_rx) = mpsc::channel::<Vec<u8>>(64);
+    let up = tokio::spawn(async move {
+        let mut buf = vec![0u8; 8192];
+        loop {
+            match tcp_read.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if out_tx.send(buf[..n].to_vec()).await.is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+
+    let (mut frames_done, mut out_done) = (false, false);
+    loop {
+        tokio::select! {
+            msg = frames.recv(), if !frames_done => match msg {
+                // client → server bytes: write to the forwarded service.
+                Some(ChannelMessage::Data(d)) => {
+                    if tcp_write.write_all(&d).await.is_err() {
+                        frames_done = true;
+                    }
+                }
+                Some(_) => {} // forward channels carry only Data
+                None => {
+                    frames_done = true;
+                    let _ = tcp_write.shutdown().await; // EOF the service's input
+                }
+            },
+            out = out_rx.recv(), if !out_done => match out {
+                // service → client bytes: frame as Data.
+                Some(bytes) => {
+                    if !send_msg(send, &ChannelMessage::Data(bytes)).await? {
+                        break; // client hung up
+                    }
+                }
+                None => out_done = true, // service closed its output
+            },
+        }
+        if frames_done && out_done {
+            break;
+        }
+    }
+    up.abort();
+    send.finish().await.map_err(Into::into)
 }
 
 /// Owns the recv half, spooling H3 DATA into complete frame bodies.

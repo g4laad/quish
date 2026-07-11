@@ -25,7 +25,7 @@ use tracing::{info, warn};
 use crate::ipc::{self, Request, Response};
 use crate::session::{
     FrameReader, FullStream, PumpEnd, SendHalf, pump_exec, pump_shell, read_loop, send_msg,
-    spawn_frame_reader, write_loop,
+    serve_forward, spawn_frame_reader, write_loop,
 };
 use crate::signproxy::ProxySigningKey;
 
@@ -230,6 +230,16 @@ pub async fn serve_channel(client: &MonitorClient, conn_id: u64, stream: FullStr
             info!(%conn_id, "exec channel");
             let (session_id, io) = client.spawn_exec(conn_id, &command).await?;
             run_exec(client, session_id, io, send, reader).await
+        }
+        ChannelOpen::Forward { host, port } => {
+            if !spawn_arg_ok(host.len()) {
+                warn!(%conn_id, len = host.len(), "rejecting over-length forward host");
+                return Ok(());
+            }
+            info!(%conn_id, %port, "forward channel");
+            // Loopback-only egress policy + Data pump live in the shared helper;
+            // no monitor RPC (the worker opens the socket unprivileged).
+            serve_forward(send, reader, host, port).await
         }
     }
 }
