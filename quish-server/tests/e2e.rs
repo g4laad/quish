@@ -365,7 +365,7 @@ fn local_forward_roundtrips_when_enabled() {
     let _ = client.wait();
 }
 
-/// With forwarding disabled (the default — no `QUISH_ALLOW_FORWARD`), the server
+/// With forwarding disabled (the default — no `--allow-forward`), the server
 /// must refuse the forward channel: the local connection opens but is closed
 /// without ever reaching the echo service, so no bytes come back.
 #[test]
