@@ -78,6 +78,12 @@ pub async fn run_channel(
     } else {
         None
     };
+    let mut sigint = (!interactive)
+        .then(|| signal(SignalKind::interrupt()).context("SIGINT handler"))
+        .transpose()?;
+    let mut sigquit = (!interactive)
+        .then(|| signal(SignalKind::quit()).context("SIGQUIT handler"))
+        .transpose()?;
     let mut out = stdout();
     let mut err = stderr();
     let mut stdin_done = false;
@@ -91,6 +97,7 @@ pub async fn run_channel(
                 Some(ChannelMessage::DataErr(d)) => { err.write_all(&d).await?; err.flush().await?; }
                 Some(ChannelMessage::ExitStatus(code)) => { exit = code; break; }
                 Some(ChannelMessage::Resize { .. }) => {} // server never sends these
+                Some(ChannelMessage::Signal(_)) => {} // client never receives signals
                 None => { exit = -1; break; } // stream closed without an exit status
             },
             // local stdin → remote
@@ -110,6 +117,13 @@ pub async fn run_channel(
                 let (cols, rows) = winsize();
                 send_frame(&mut send, &ChannelMessage::Resize { cols, rows }).await?;
             },
+            // forward interrupts on exec (non-interactive) channels
+            _ = recv_sig(&mut sigint) => {
+                send_frame(&mut send, &ChannelMessage::Signal(quish_proto::Signal::Int)).await?;
+            }
+            _ = recv_sig(&mut sigquit) => {
+                send_frame(&mut send, &ChannelMessage::Signal(quish_proto::Signal::Quit)).await?;
+            }
         }
     }
 
@@ -123,6 +137,15 @@ async fn recv_winch(winch: &mut Option<tokio::signal::unix::Signal>) {
     match winch {
         Some(sig) => {
             sig.recv().await;
+        }
+        None => std::future::pending::<()>().await,
+    }
+}
+
+async fn recv_sig(sig: &mut Option<tokio::signal::unix::Signal>) {
+    match sig {
+        Some(s) => {
+            s.recv().await;
         }
         None => std::future::pending::<()>().await,
     }
