@@ -8,7 +8,7 @@
 use serde::{Serialize, de::DeserializeOwned};
 
 /// Bumped on any incompatible wire change. Sent in the `quish-version` header.
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// ALPN for the QUIC/TLS handshake. quish speaks HTTP/3, so this is `h3`.
 pub const ALPN: &[u8] = b"h3";
@@ -67,6 +67,19 @@ pub enum ChannelOpen {
     Exec { command: String },
 }
 
+/// A forwardable interrupt from the client's terminal (exec channels only).
+/// A fixed allowlist — the server maps each to a real signal; the client can
+/// never request an arbitrary signum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]
+pub enum Signal {
+    /// Ctrl-C → SIGINT.
+    Int,
+    /// Ctrl-\ → SIGQUIT.
+    Quit,
+    /// SIGTERM (graceful terminate).
+    Term,
+}
+
 /// Frames exchanged over an open channel, both directions.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
 pub enum ChannelMessage {
@@ -78,6 +91,8 @@ pub enum ChannelMessage {
     Resize { cols: u16, rows: u16 },
     /// Process exit code; last frame server→client, closes the channel.
     ExitStatus(i32),
+    /// Deliver a signal to the remote process (client→server, exec only).
+    Signal(Signal),
 }
 
 /// Codec errors. Framing (length prefix, cap) is the caller's job; these cover
@@ -155,6 +170,13 @@ mod tests {
     }
 
     #[test]
+    fn signal_frame_roundtrips() {
+        let msg = ChannelMessage::Signal(Signal::Int);
+        let got: ChannelMessage = decode(&encode(&msg).unwrap()[LEN_PREFIX..]).unwrap();
+        assert_eq!(got, msg);
+    }
+
+    #[test]
     fn oversized_body_rejected() {
         let big = ChannelMessage::Data(vec![0u8; MAX_FRAME_LEN + 1]);
         assert!(matches!(encode(&big), Err(CodecError::TooLarge { .. })));
@@ -178,10 +200,11 @@ mod tests {
     #[test]
     fn version_supported_accepts_current_rejects_others() {
         assert!(version_supported(Some(&PROTOCOL_VERSION.to_string())));
-        // Literal "1" tracks PROTOCOL_VERSION == 1; update if the version is bumped.
-        assert!(version_supported(Some("1")));
+        // Literal "2" tracks PROTOCOL_VERSION == 2; update if the version is bumped.
+        assert!(version_supported(Some("2")));
         assert!(!version_supported(None));
-        assert!(!version_supported(Some("2")));
+        assert!(!version_supported(Some("1")));
+        assert!(!version_supported(Some("3")));
         assert!(!version_supported(Some("abc")));
         assert!(!version_supported(Some("")));
     }
