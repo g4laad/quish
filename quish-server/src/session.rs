@@ -70,7 +70,7 @@ async fn shell(
 
     // PTY output → mpsc (blocking read thread; portable-pty is std::io).
     let pty_out = pair.master.try_clone_reader().context("pty reader")?;
-    let (out_tx, mut out_rx) = mpsc::channel::<Vec<u8>>(64);
+    let (out_tx, out_rx) = mpsc::channel::<Vec<u8>>(64);
     std::thread::spawn(move || read_loop(pty_out, out_tx));
 
     // stdin mpsc → PTY writer (blocking write thread). Dropping in_tx closes the
@@ -86,46 +86,26 @@ async fn shell(
         let _ = exit_tx.send(code);
     });
 
-    let master = pair.master; // kept alive for resize
-    let mut frames = spawn_frame_reader(reader);
-    let mut in_tx = Some(in_tx);
-    let mut frames_done = false;
+    let master = pair.master; // kept alive; borrowed by the resize closure below
+    let frames = spawn_frame_reader(reader);
 
-    loop {
-        tokio::select! {
-            // client → shell stdin / resize
-            msg = frames.recv(), if !frames_done => match msg {
-                Some(ChannelMessage::Data(d)) => {
-                    if let Some(tx) = in_tx.as_ref() {
-                        let _ = tx.send(d).await;
-                    }
-                }
-                Some(ChannelMessage::Resize { cols, rows }) => {
-                    let _ = master.resize(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 });
-                }
-                Some(_) => {} // DataErr/ExitStatus from client: ignore
-                None => {
-                    frames_done = true;
-                    in_tx = None; // EOF the shell's stdin
-                }
-            },
-            // shell output → client. None = PTY fully drained (child gone): finish.
-            out = out_rx.recv() => match out {
-                Some(bytes) => {
-                    if !send_msg(&mut send, &ChannelMessage::Data(bytes)).await? {
-                        return send.finish().await.map_err(Into::into);
-                    }
-                }
-                None => break,
-            },
-        }
+    let end = pump_shell(&mut send, frames, out_rx, in_tx, move |cols, rows| {
+        let _ = master.resize(PtySize {
+            rows,
+            cols,
+            pixel_width: 0,
+            pixel_height: 0,
+        });
+    })
+    .await?;
+
+    if let PumpEnd::Drained = end {
+        let code = match exit_rx.try_recv() {
+            Ok(c) => c,
+            Err(_) => (&mut exit_rx).await.unwrap_or(-1),
+        };
+        send_msg(&mut send, &ChannelMessage::ExitStatus(code)).await?;
     }
-
-    let code = match exit_rx.try_recv() {
-        Ok(c) => c,
-        Err(_) => (&mut exit_rx).await.unwrap_or(-1),
-    };
-    send_msg(&mut send, &ChannelMessage::ExitStatus(code)).await?;
     send.finish().await.map_err(Into::into)
 }
 
@@ -144,56 +124,61 @@ async fn exec(mut send: SendHalf, reader: FrameReader, command: String) -> Resul
 
     let mut stdout = child.stdout.take().expect("piped stdout");
     let mut stderr = child.stderr.take().expect("piped stderr");
-    let mut stdin = Some(child.stdin.take().expect("piped stdin"));
-    let mut frames = spawn_frame_reader(reader);
+    let mut stdin = child.stdin.take().expect("piped stdin");
 
-    let mut out_buf = [0u8; 8192];
-    let mut err_buf = [0u8; 8192];
-    let (mut out_done, mut err_done, mut frames_done) = (false, false, false);
-    let mut exit_code: Option<i32> = None;
-
-    loop {
-        tokio::select! {
-            r = stdout.read(&mut out_buf), if !out_done => {
-                match r.context("reading stdout")? {
-                    0 => out_done = true,
-                    n => if !send_msg(&mut send, &ChannelMessage::Data(out_buf[..n].to_vec())).await? {
-                        return send.finish().await.map_err(Into::into);
-                    },
-                }
-            },
-            r = stderr.read(&mut err_buf), if !err_done => {
-                match r.context("reading stderr")? {
-                    0 => err_done = true,
-                    n => if !send_msg(&mut send, &ChannelMessage::DataErr(err_buf[..n].to_vec())).await? {
-                        return send.finish().await.map_err(Into::into);
-                    },
-                }
-            },
-            msg = frames.recv(), if !frames_done => match msg {
-                Some(ChannelMessage::Data(d)) => {
-                    if let Some(si) = stdin.as_mut() {
-                        let _ = si.write_all(&d).await;
-                        let _ = si.flush().await;
+    // stdout/stderr → mpsc (async read tasks); mpsc → stdin (async write task).
+    // Mirrors the blocking read_loop/write_loop the privsep worker uses over fds,
+    // but with tokio's async child pipes.
+    let (out_tx, out_rx) = mpsc::channel::<Vec<u8>>(64);
+    tokio::spawn(async move {
+        let mut buf = [0u8; 8192];
+        loop {
+            match stdout.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if out_tx.send(buf[..n].to_vec()).await.is_err() {
+                        break;
                     }
                 }
-                Some(_) => {}
-                None => { frames_done = true; stdin = None; } // EOF child stdin
-            },
-            status = child.wait(), if exit_code.is_none() => {
-                exit_code = Some(status.context("waiting on child")?.code().unwrap_or(-1));
-            },
+            }
         }
-        if out_done && err_done && exit_code.is_some() {
-            break;
+    });
+    let (err_tx, err_rx) = mpsc::channel::<Vec<u8>>(64);
+    tokio::spawn(async move {
+        let mut buf = [0u8; 8192];
+        loop {
+            match stderr.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if err_tx.send(buf[..n].to_vec()).await.is_err() {
+                        break;
+                    }
+                }
+            }
         }
-    }
+    });
+    let (in_tx, mut in_rx) = mpsc::channel::<Vec<u8>>(64);
+    tokio::spawn(async move {
+        while let Some(bytes) = in_rx.recv().await {
+            if stdin.write_all(&bytes).await.is_err() || stdin.flush().await.is_err() {
+                break;
+            }
+        }
+        // dropping `stdin` here closes the child's stdin (EOF) when the pump
+        // drops `in_tx` on client frame-EOF or when the loop ends.
+    });
 
-    send_msg(
-        &mut send,
-        &ChannelMessage::ExitStatus(exit_code.unwrap_or(-1)),
-    )
-    .await?;
+    let frames = spawn_frame_reader(reader);
+    let end = pump_exec(&mut send, frames, out_rx, err_rx, in_tx).await?;
+
+    if let PumpEnd::Drained = end {
+        let code = child
+            .wait()
+            .await
+            .map(|s| s.code().unwrap_or(-1))
+            .unwrap_or(-1);
+        send_msg(&mut send, &ChannelMessage::ExitStatus(code)).await?;
+    }
     send.finish().await.map_err(Into::into)
 }
 
@@ -204,6 +189,99 @@ pub(crate) async fn send_msg(send: &mut SendHalf, msg: &ChannelMessage) -> Resul
         Ok(()) => Ok(true),
         Err(e) if e.is_h3_no_error() => Ok(false),
         Err(e) => Err(anyhow::anyhow!("sending frame: {e}")),
+    }
+}
+
+/// Why a channel pump loop ended.
+pub(crate) enum PumpEnd {
+    /// Local process output fully drained (child exited). The caller should
+    /// obtain the exit code and send a final `ExitStatus` frame.
+    Drained,
+    /// The client hung up mid-send (H3_NO_ERROR). The send half is done; the
+    /// caller should NOT send `ExitStatus`, only `finish()`.
+    ClientGone,
+}
+
+/// Shared PTY-shell pump. Selects client frames against merged PTY output until
+/// the PTY drains (child exited) or the client hangs up. On client frame-EOF it
+/// EOFs the shell's stdin (drops `in_tx`) and keeps draining output — a client
+/// that stops sending input can still read the rest of the shell's output. The
+/// caller supplies the resize action (portable-pty vs. rustix on an fd differ)
+/// and, after this returns `Drained`, the exit code.
+pub(crate) async fn pump_shell(
+    send: &mut SendHalf,
+    mut frames: mpsc::Receiver<ChannelMessage>,
+    mut out_rx: mpsc::Receiver<Vec<u8>>,
+    in_tx: mpsc::Sender<Vec<u8>>,
+    mut resize: impl FnMut(u16, u16),
+) -> Result<PumpEnd> {
+    let mut in_tx = Some(in_tx);
+    let mut frames_done = false;
+    loop {
+        tokio::select! {
+            msg = frames.recv(), if !frames_done => match msg {
+                Some(ChannelMessage::Data(d)) => {
+                    if let Some(tx) = in_tx.as_ref() { let _ = tx.send(d).await; }
+                }
+                Some(ChannelMessage::Resize { cols, rows }) => resize(cols, rows),
+                Some(_) => {} // DataErr/ExitStatus from client: ignore
+                None => { frames_done = true; in_tx = None; } // EOF the shell's stdin
+            },
+            out = out_rx.recv() => match out {
+                Some(bytes) => {
+                    if !send_msg(send, &ChannelMessage::Data(bytes)).await? {
+                        return Ok(PumpEnd::ClientGone);
+                    }
+                }
+                None => return Ok(PumpEnd::Drained), // PTY drained: shell exited
+            },
+        }
+    }
+}
+
+/// Shared one-shot-exec pump. Selects stdout / stderr / client frames until both
+/// output streams drain, or the client hangs up. Client frame-EOF EOFs the
+/// child's stdin (drops `in_tx`) and keeps draining. After this returns
+/// `Drained`, the caller obtains the exit code (`child.wait()` in dev, a monitor
+/// reap RPC in privsep).
+pub(crate) async fn pump_exec(
+    send: &mut SendHalf,
+    mut frames: mpsc::Receiver<ChannelMessage>,
+    mut out_rx: mpsc::Receiver<Vec<u8>>,
+    mut err_rx: mpsc::Receiver<Vec<u8>>,
+    in_tx: mpsc::Sender<Vec<u8>>,
+) -> Result<PumpEnd> {
+    let mut in_tx = Some(in_tx);
+    let (mut out_done, mut err_done, mut frames_done) = (false, false, false);
+    loop {
+        tokio::select! {
+            out = out_rx.recv(), if !out_done => match out {
+                Some(bytes) => {
+                    if !send_msg(send, &ChannelMessage::Data(bytes)).await? {
+                        return Ok(PumpEnd::ClientGone);
+                    }
+                }
+                None => out_done = true,
+            },
+            err = err_rx.recv(), if !err_done => match err {
+                Some(bytes) => {
+                    if !send_msg(send, &ChannelMessage::DataErr(bytes)).await? {
+                        return Ok(PumpEnd::ClientGone);
+                    }
+                }
+                None => err_done = true,
+            },
+            msg = frames.recv(), if !frames_done => match msg {
+                Some(ChannelMessage::Data(d)) => {
+                    if let Some(tx) = in_tx.as_ref() { let _ = tx.send(d).await; }
+                }
+                Some(_) => {}
+                None => { frames_done = true; in_tx = None; } // EOF child stdin
+            },
+        }
+        if out_done && err_done {
+            return Ok(PumpEnd::Drained);
+        }
     }
 }
 

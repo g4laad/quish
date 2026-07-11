@@ -24,7 +24,8 @@ use tracing::{info, warn};
 
 use crate::ipc::{self, Request, Response};
 use crate::session::{
-    FrameReader, FullStream, SendHalf, read_loop, send_msg, spawn_frame_reader, write_loop,
+    FrameReader, FullStream, PumpEnd, SendHalf, pump_exec, pump_shell, read_loop, send_msg,
+    spawn_frame_reader, write_loop,
 };
 use crate::signproxy::ProxySigningKey;
 
@@ -251,7 +252,7 @@ async fn run_shell(
     let master = File::from(master);
     set_winsize(&master, cols, rows);
 
-    let (out_tx, mut out_rx) = mpsc::channel::<Vec<u8>>(64);
+    let (out_tx, out_rx) = mpsc::channel::<Vec<u8>>(64);
     let out_file = master.try_clone()?;
     std::thread::spawn(move || read_loop(out_file, out_tx));
 
@@ -259,33 +260,17 @@ async fn run_shell(
     let in_file = master.try_clone()?;
     std::thread::spawn(move || write_loop(in_file, in_rx));
 
-    let mut frames = spawn_frame_reader(reader);
+    let frames = spawn_frame_reader(reader);
+    let end = pump_shell(&mut send, frames, out_rx, in_tx, |cols, rows| {
+        set_winsize(&master, cols, rows)
+    })
+    .await?;
 
-    loop {
-        tokio::select! {
-            msg = frames.recv() => match msg {
-                Some(ChannelMessage::Data(d)) => {
-                    let _ = in_tx.send(d).await;
-                }
-                Some(ChannelMessage::Resize { cols, rows }) => set_winsize(&master, cols, rows),
-                Some(_) => {}
-                None => break, // client hung up: stop the session
-            },
-            out = out_rx.recv() => match out {
-                Some(bytes) => {
-                    if !send_msg(&mut send, &ChannelMessage::Data(bytes)).await? {
-                        break;
-                    }
-                }
-                None => break, // PTY drained: shell exited
-            },
-        }
+    drop(master); // release the winsize handle; reap kills/collects the child
+    let code = client.reap(session_id).await; // ALWAYS reap — no session leak
+    if let PumpEnd::Drained = end {
+        send_msg(&mut send, &ChannelMessage::ExitStatus(code)).await?;
     }
-
-    drop(in_tx); // EOF the shell's stdin so the write thread exits
-    drop(master); // release the winsize handle; reap will kill the child
-    let code = client.reap(session_id).await;
-    send_msg(&mut send, &ChannelMessage::ExitStatus(code)).await?;
     send.finish().await.map_err(Into::into)
 }
 
@@ -296,42 +281,20 @@ async fn run_exec(
     mut send: SendHalf,
     reader: FrameReader,
 ) -> Result<()> {
-    let (out_tx, mut out_rx) = mpsc::channel::<Vec<u8>>(64);
+    let (out_tx, out_rx) = mpsc::channel::<Vec<u8>>(64);
     std::thread::spawn(move || read_loop(File::from(stdout), out_tx));
-    let (err_tx, mut err_rx) = mpsc::channel::<Vec<u8>>(64);
+    let (err_tx, err_rx) = mpsc::channel::<Vec<u8>>(64);
     std::thread::spawn(move || read_loop(File::from(stderr), err_tx));
     let (in_tx, in_rx) = mpsc::channel::<Vec<u8>>(64);
     std::thread::spawn(move || write_loop(File::from(stdin), in_rx));
 
-    let mut frames = spawn_frame_reader(reader);
-    let mut in_tx = Some(in_tx);
-    let (mut out_done, mut err_done, mut frames_done) = (false, false, false);
+    let frames = spawn_frame_reader(reader);
+    let end = pump_exec(&mut send, frames, out_rx, err_rx, in_tx).await?;
 
-    loop {
-        tokio::select! {
-            out = out_rx.recv(), if !out_done => match out {
-                Some(bytes) => { if !send_msg(&mut send, &ChannelMessage::Data(bytes)).await? { break; } }
-                None => out_done = true,
-            },
-            err = err_rx.recv(), if !err_done => match err {
-                Some(bytes) => { if !send_msg(&mut send, &ChannelMessage::DataErr(bytes)).await? { break; } }
-                None => err_done = true,
-            },
-            msg = frames.recv(), if !frames_done => match msg {
-                Some(ChannelMessage::Data(d)) => {
-                    if let Some(tx) = in_tx.as_ref() { let _ = tx.send(d).await; }
-                }
-                Some(_) => {}
-                None => { frames_done = true; in_tx = None; } // EOF child stdin
-            },
-        }
-        if out_done && err_done {
-            break;
-        }
+    let code = client.reap(session_id).await; // ALWAYS reap — no session leak
+    if let PumpEnd::Drained = end {
+        send_msg(&mut send, &ChannelMessage::ExitStatus(code)).await?;
     }
-
-    let code = client.reap(session_id).await;
-    send_msg(&mut send, &ChannelMessage::ExitStatus(code)).await?;
     send.finish().await.map_err(Into::into)
 }
 
