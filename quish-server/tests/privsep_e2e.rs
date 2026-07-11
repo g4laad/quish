@@ -418,8 +418,7 @@ fn reap_does_not_wedge_the_monitor_privsep() {
         let elapsed = start.elapsed();
 
         assert!(
-            out2.status.success()
-                && String::from_utf8_lossy(&out2.stdout).contains("second-login"),
+            out2.status.success() && String::from_utf8_lossy(&out2.stdout).contains("second-login"),
             "second exec failed (monitor may be wedged): {out2:?}"
         );
         assert!(
