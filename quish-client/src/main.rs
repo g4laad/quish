@@ -43,6 +43,12 @@ struct Args {
     #[arg(short = 'L', long = "local-forward")]
     local_forward: Vec<String>,
 
+    /// Download a remote regular file to stdout, then exit. The file is opened
+    /// AS the authenticated user by the server's setuid'd session helper (never
+    /// as root or the worker). Mutually exclusive with a command / `-L`.
+    #[arg(long, value_name = "REMOTE-PATH")]
+    download: Option<String>,
+
     /// Command to run (unused until M4; parsed now for the final CLI shape).
     #[arg(trailing_var_arg = true)]
     command: Vec<String>,
@@ -240,7 +246,13 @@ fn main() -> Result<()> {
     let code = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?
-        .block_on(run(target, args.identity, args.command, args.local_forward))?;
+        .block_on(run(
+            target,
+            args.identity,
+            args.command,
+            args.local_forward,
+            args.download,
+        ))?;
     std::process::exit(code);
 }
 
@@ -249,6 +261,7 @@ async fn run(
     identity: Option<std::path::PathBuf>,
     command: Vec<String>,
     local_forwards: Vec<String>,
+    download: Option<String>,
 ) -> Result<i32> {
     // Parse `-L` specs up front so a malformed spec fails before any network I/O.
     let forwards = local_forwards
@@ -318,8 +331,15 @@ async fn run(
     }
     info!(user = %target.user, "session authenticated");
 
-    // Open a channel on the authed stream: shell if no command, else exec.
+    // Open a channel on the authed stream: download if `--download`, else shell
+    // (no command) or exec.
     let (send, recv) = stream.split();
+    if let Some(path) = download {
+        let code = download_file(send, recv, path).await?;
+        drop(send_request);
+        let _ = drive.await;
+        return Ok(code);
+    }
     let interactive = command.is_empty();
     let (cols, rows) = terminal::winsize();
     let open = if interactive {
@@ -337,6 +357,38 @@ async fn run(
 
     drop(send_request);
     let _ = drive.await;
+    Ok(code)
+}
+
+/// Download PoC: send a `ReadFile` open, then pump received `Data` frames to
+/// stdout until the terminal `ExitStatus`, returning that code. The server reads
+/// the file AS the authenticated user (setuid'd helper), so a file the user
+/// can't read yields a nonzero status with no content.
+async fn download_file(mut send: SendHalf, recv: RecvHalf, path: String) -> Result<i32> {
+    send.send_data(Bytes::from(quish_proto::encode(&ChannelOpen::ReadFile {
+        path,
+    })?))
+    .await
+    .context("sending ReadFile open")?;
+
+    let mut stdout = tokio::io::stdout();
+    let mut reader = ChannelFrameReader::new(recv);
+    let mut code = 0;
+    while let Some(msg) = reader.next().await? {
+        match msg {
+            ChannelMessage::Data(d) => stdout
+                .write_all(&d)
+                .await
+                .context("writing download to stdout")?,
+            ChannelMessage::ExitStatus(c) => {
+                code = c;
+                break;
+            }
+            _ => {}
+        }
+    }
+    stdout.flush().await.context("flushing stdout")?;
+    let _ = send.finish().await;
     Ok(code)
 }
 

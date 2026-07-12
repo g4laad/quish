@@ -643,3 +643,71 @@ fn local_forward_refused_when_disabled_privsep() {
     let _ = client.kill();
     let _ = client.wait();
 }
+
+#[test]
+#[ignore]
+fn download_streams_user_readable_file_privsep() {
+    // Plan 011 happy path: a file the login user can read downloads correctly.
+    use std::os::unix::fs::PermissionsExt;
+    let user = test_user();
+    let pw = test_password();
+    let server = PrivsepServer::start();
+    let target = format!("{user}@{}", server.addr);
+
+    let contents = "quish-download-ok-marker\n";
+    let path = std::env::temp_dir().join(format!("quish-dl-user-{}.txt", std::process::id()));
+    std::fs::write(&path, contents).expect("write download file");
+    // World-readable so the target user can open it (parent /tmp is 1777).
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+        .expect("chmod download file");
+
+    let out = run_client(
+        &server,
+        &[&target, "--download", path.to_str().unwrap()],
+        Some(&pw),
+    );
+    let _ = std::fs::remove_file(&path);
+
+    assert!(out.status.success(), "download failed: {out:?}");
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains(contents.trim()),
+        "download did not stream file contents: {out:?}"
+    );
+}
+
+#[test]
+#[ignore]
+fn download_refuses_root_only_file_privsep() {
+    // Plan 011 identity-boundary proof: a root-owned, mode-000 file. Root CAN
+    // read it; the login user CANNOT. If the download succeeds or leaks content,
+    // open() ran as root (or the worker), not the authed user — the exact bug
+    // this plan exists to prevent.
+    use std::os::unix::fs::PermissionsExt;
+    let user = test_user();
+    let pw = test_password();
+    let server = PrivsepServer::start();
+    let target = format!("{user}@{}", server.addr);
+
+    let secret = "root-only-secret-should-not-leak\n";
+    let path = std::env::temp_dir().join(format!("quish-dl-root-{}.txt", std::process::id()));
+    std::fs::write(&path, secret).expect("write root-only file"); // created as root
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).expect("chmod 000");
+
+    let out = run_client(
+        &server,
+        &[&target, "--download", path.to_str().unwrap()],
+        Some(&pw),
+    );
+    // Restore perms so cleanup can remove the file.
+    let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    let _ = std::fs::remove_file(&path);
+
+    assert!(
+        !out.status.success(),
+        "download of a root-only file succeeded — open() ran as root, not the user: {out:?}"
+    );
+    assert!(
+        !String::from_utf8_lossy(&out.stdout).contains(secret.trim()),
+        "root-only file contents leaked despite refusal: {out:?}"
+    );
+}
