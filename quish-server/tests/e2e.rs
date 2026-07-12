@@ -161,6 +161,70 @@ fn run_client(server: &DevServer, args: &[&str], password: Option<&str>) -> Outp
     cmd.output().expect("spawn quish client")
 }
 
+/// Like `run_client` but pipes `stdin` into the client (for --upload).
+fn run_client_stdin(
+    server: &DevServer,
+    args: &[&str],
+    password: Option<&str>,
+    stdin: &[u8],
+) -> Output {
+    let quishd = PathBuf::from(env!("CARGO_BIN_EXE_quishd"));
+    let quish = quishd.with_file_name("quish");
+    if !quish.exists() {
+        panic!(
+            "quish client binary not found at {}; run `cargo build --workspace` first",
+            quish.display()
+        );
+    }
+
+    let home = fresh_temp_dir("quish-client-home");
+    let kh_dir = home.join(".config/quish");
+    std::fs::create_dir_all(&kh_dir).unwrap();
+    std::fs::write(
+        kh_dir.join("known_hosts"),
+        format!("{} {}\n", server.addr, server.fingerprint),
+    )
+    .unwrap();
+    let mut cmd = Command::new(&quish);
+    cmd.args(args).env("HOME", &home);
+    if let Some(p) = password {
+        cmd.env("QUISH_PASSWORD", p);
+    }
+    let mut child = cmd
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn quish client");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(stdin)
+        .expect("write client stdin");
+    child.wait_with_output().expect("wait client")
+}
+
+#[test]
+#[ignore]
+fn upload_writes_file() {
+    let server = DevServer::start("testuser");
+    let target = format!("testuser@{}", server.addr);
+    let dir = fresh_temp_dir("quish-upload");
+    let dest = dir.join("uploaded.txt");
+    let body = b"quish-upload-smoke-marker\n";
+    let out = run_client_stdin(
+        &server,
+        &[&target, "--upload", dest.to_str().unwrap()],
+        Some("anything"),
+        body,
+    );
+    assert!(out.status.success(), "upload failed: {out:?}");
+    assert_eq!(std::fs::read(&dest).unwrap(), body);
+    let _ = std::fs::remove_file(&dest);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 #[ignore]
 fn exec_runs_command_and_returns_output() {

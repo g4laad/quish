@@ -711,3 +711,107 @@ fn download_refuses_root_only_file_privsep() {
         "root-only file contents leaked despite refusal: {out:?}"
     );
 }
+
+/// Run the real client with piped stdin (for --upload), write `stdin`, and
+/// collect output. `run_client`'s `.output()` closes stdin immediately.
+fn run_client_stdin(server: &PrivsepServer, args: &[&str], password: &str, stdin: &[u8]) -> Output {
+    let quish = quish_client();
+    let home = server.client_home();
+    let mut child = Command::new(&quish)
+        .args(args)
+        .env("HOME", &home)
+        .env("QUISH_PASSWORD", password)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn quish client");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(stdin)
+        .expect("write client stdin");
+    child.wait_with_output().expect("wait client")
+}
+
+#[test]
+#[ignore]
+fn upload_writes_user_writable_file_privsep() {
+    // Plan 018 happy path: uploading into a world-writable dir succeeds and the
+    // created file is owned by the login user (the create/write ran AS the user,
+    // not as root/worker).
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let user = test_user();
+    let pw = test_password();
+    let server = PrivsepServer::start();
+    let target = format!("{user}@{}", server.addr);
+
+    let dir = std::env::temp_dir().join(format!("quish-ul-user-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("create upload dir");
+    // World-writable so the target user can create a file inside it.
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).expect("chmod dir 777");
+    let dest = dir.join("uploaded.txt");
+
+    let body = b"quish-upload-privsep-marker\n";
+    let out = run_client_stdin(
+        &server,
+        &[&target, "--upload", dest.to_str().unwrap()],
+        &pw,
+        body,
+    );
+
+    let contents = std::fs::read(&dest).ok();
+    let uid = std::fs::metadata(&dest).ok().map(|m| m.uid());
+    let _ = std::fs::remove_file(&dest);
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(out.status.success(), "upload failed: {out:?}");
+    assert_eq!(
+        contents.as_deref(),
+        Some(&body[..]),
+        "uploaded contents differ: {out:?}"
+    );
+    assert_ne!(uid, Some(0), "file created as root, not the user: {out:?}");
+}
+
+#[test]
+#[ignore]
+fn upload_refuses_root_only_dir_privsep() {
+    // Plan 018 identity-boundary proof: a root-owned, mode-0700 dir. Root CAN
+    // create files in it; the login user CANNOT. If the upload succeeds or the
+    // target file gets created, open(O_CREAT) ran as root (or the worker), not
+    // the authed user — the exact bug this plan exists to prevent.
+    use std::os::unix::fs::PermissionsExt;
+    let user = test_user();
+    let pw = test_password();
+    let server = PrivsepServer::start();
+    let target = format!("{user}@{}", server.addr);
+
+    let dir = std::env::temp_dir().join(format!("quish-ul-root-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("create root-only dir"); // created as root
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).expect("chmod dir 700");
+    let dest = dir.join("should-not-be-created.txt");
+
+    let out = run_client_stdin(
+        &server,
+        &[&target, "--upload", dest.to_str().unwrap()],
+        &pw,
+        b"must-not-land\n",
+    );
+
+    let created = dest.exists();
+    // Restore/loosen perms so cleanup can remove the tree.
+    let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755));
+    let _ = std::fs::remove_file(&dest);
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(
+        !out.status.success(),
+        "upload into a root-only dir succeeded — open() ran as root, not the user: {out:?}"
+    );
+    assert!(
+        !created,
+        "target file was created despite the user lacking write on the dir: {out:?}"
+    );
+}
