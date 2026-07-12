@@ -12,10 +12,10 @@ use std::future;
 use std::net::{IpAddr, Ipv4Addr};
 
 use anyhow::{Context, Result, bail};
-use bytes::{Buf, Bytes};
+use bytes::{BufMut, Bytes, BytesMut};
 use clap::Parser;
 use h3::ext::Protocol;
-use quish_proto::{ChannelMessage, ChannelOpen, LEN_PREFIX, parse_len};
+use quish_proto::{ChannelMessage, ChannelOpen};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tracing::{info, warn};
@@ -589,32 +589,25 @@ async fn bridge(tcp: TcpStream, mut send: SendHalf, recv: RecvHalf) -> Result<()
 /// Reassembles length-prefixed [`ChannelMessage`] frames off an H3 recv half.
 struct ChannelFrameReader {
     recv: RecvHalf,
-    buf: Vec<u8>,
+    buf: BytesMut,
 }
 
 impl ChannelFrameReader {
     fn new(recv: RecvHalf) -> Self {
         Self {
             recv,
-            buf: Vec::new(),
+            buf: BytesMut::new(),
         }
     }
 
     /// Next decoded message, or `None` at clean end of stream.
     async fn next(&mut self) -> Result<Option<ChannelMessage>> {
         loop {
-            if self.buf.len() >= LEN_PREFIX {
-                let len = parse_len(self.buf[..LEN_PREFIX].try_into().unwrap())?;
-                if self.buf.len() >= LEN_PREFIX + len {
-                    let body = self.buf[LEN_PREFIX..LEN_PREFIX + len].to_vec();
-                    self.buf.drain(..LEN_PREFIX + len);
-                    return Ok(Some(quish_proto::decode::<ChannelMessage>(&body)?));
-                }
+            if let Some(body) = quish_proto::take_frame(&mut self.buf)? {
+                return Ok(Some(quish_proto::decode::<ChannelMessage>(&body)?));
             }
             match self.recv.recv_data().await {
-                Ok(Some(mut chunk)) => self
-                    .buf
-                    .extend_from_slice(chunk.copy_to_bytes(chunk.remaining()).as_ref()),
+                Ok(Some(chunk)) => self.buf.put(chunk),
                 Ok(None) => return Ok(None),
                 Err(e) if e.is_h3_no_error() => return Ok(None),
                 Err(e) => return Err(anyhow::anyhow!("recv forward frame: {e}")),

@@ -12,9 +12,9 @@
 use std::process::Stdio;
 
 use anyhow::{Context, Result};
-use bytes::{Buf, Bytes};
+use bytes::{BufMut, Bytes, BytesMut};
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
-use quish_proto::{ChannelMessage, ChannelOpen, LEN_PREFIX, parse_len};
+use quish_proto::{ChannelMessage, ChannelOpen};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
@@ -452,34 +452,25 @@ async fn pump_forward(send: &mut SendHalf, reader: FrameReader, tcp: TcpStream) 
 /// Owns the recv half, spooling H3 DATA into complete frame bodies.
 pub(crate) struct FrameReader {
     recv: RecvHalf,
-    buf: Vec<u8>,
+    buf: BytesMut,
 }
 
 impl FrameReader {
     pub(crate) fn new(recv: RecvHalf) -> Self {
         Self {
             recv,
-            buf: Vec::new(),
+            buf: BytesMut::new(),
         }
     }
 
     /// Next complete frame body, or `None` at clean end of stream.
-    pub(crate) async fn next_frame(&mut self) -> Result<Option<Vec<u8>>> {
+    pub(crate) async fn next_frame(&mut self) -> Result<Option<Bytes>> {
         loop {
-            if self.buf.len() >= LEN_PREFIX {
-                let len = parse_len(self.buf[..LEN_PREFIX].try_into().unwrap())?;
-                if self.buf.len() >= LEN_PREFIX + len {
-                    let body = self.buf[LEN_PREFIX..LEN_PREFIX + len].to_vec();
-                    self.buf.drain(..LEN_PREFIX + len);
-                    return Ok(Some(body));
-                }
+            if let Some(body) = quish_proto::take_frame(&mut self.buf)? {
+                return Ok(Some(body));
             }
             match self.recv.recv_data().await {
-                Ok(Some(mut chunk)) => {
-                    self.buf
-                        .extend_from_slice(chunk.copy_to_bytes(chunk.remaining()).as_ref());
-                }
-                // Clean EOF (possibly with a trailing partial frame we ignore).
+                Ok(Some(chunk)) => self.buf.put(chunk),
                 Ok(None) => return Ok(None),
                 Err(e) if e.is_h3_no_error() => return Ok(None),
                 Err(e) => return Err(anyhow::anyhow!("recv frame: {e}")),

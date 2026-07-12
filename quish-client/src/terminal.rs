@@ -8,8 +8,8 @@
 use std::io::Read;
 
 use anyhow::{Context, Result};
-use bytes::{Buf, Bytes};
-use quish_proto::{ChannelMessage, ChannelOpen, LEN_PREFIX, parse_len};
+use bytes::{BufMut, Bytes, BytesMut};
+use quish_proto::{ChannelMessage, ChannelOpen};
 use rustix::termios::{OptionalActions, Termios, tcgetattr, tcgetwinsize, tcsetattr};
 use tokio::io::{AsyncWriteExt, stderr, stdout};
 use tokio::signal::unix::{SignalKind, signal};
@@ -194,32 +194,22 @@ fn spawn_stdin() -> mpsc::Receiver<Vec<u8>> {
 fn spawn_frame_reader(mut recv: RecvHalf) -> mpsc::Receiver<ChannelMessage> {
     let (tx, rx) = mpsc::channel(64);
     tokio::spawn(async move {
-        let mut buf: Vec<u8> = Vec::new();
+        let mut buf = BytesMut::new();
         loop {
-            // Emit any complete frames already buffered.
-            while buf.len() >= LEN_PREFIX {
-                let Ok(len) = parse_len(buf[..LEN_PREFIX].try_into().unwrap()) else {
-                    return;
-                };
-                if buf.len() < LEN_PREFIX + len {
-                    break;
-                }
-                let body = buf[LEN_PREFIX..LEN_PREFIX + len].to_vec();
-                buf.drain(..LEN_PREFIX + len);
-                match quish_proto::decode::<ChannelMessage>(&body) {
+            match quish_proto::take_frame(&mut buf) {
+                Ok(Some(body)) => match quish_proto::decode::<ChannelMessage>(&body) {
                     Ok(msg) => {
                         if tx.send(msg).await.is_err() {
                             return;
                         }
                     }
                     Err(_) => return,
-                }
-            }
-            match recv.recv_data().await {
-                Ok(Some(mut chunk)) => {
-                    buf.extend_from_slice(chunk.copy_to_bytes(chunk.remaining()).as_ref())
-                }
-                _ => return, // EOF or error: end of channel
+                },
+                Ok(None) => match recv.recv_data().await {
+                    Ok(Some(chunk)) => buf.put(chunk),
+                    _ => return,
+                },
+                Err(_) => return,
             }
         }
     });
