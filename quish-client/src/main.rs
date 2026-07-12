@@ -57,6 +57,17 @@ struct ConnectArgs {
     #[arg(long, value_name = "REMOTE-PATH")]
     download: Option<String>,
 
+    /// Upload a local file to REMOTE-PATH on the server, streaming this process's
+    /// STDIN. The file is created/written AS the authenticated user by the
+    /// server's setuid'd session helper (never as root or the worker). Mutually
+    /// exclusive with a command / `-L` / `--download`.
+    #[arg(long, value_name = "REMOTE-PATH", conflicts_with_all = ["download", "local_forward"])]
+    upload: Option<String>,
+
+    /// Creation mode (octal) for an --upload, e.g. 755. Default 644.
+    #[arg(long, value_name = "OCTAL", default_value = "644")]
+    mode: String,
+
     /// Command to run (empty = interactive shell).
     #[arg(trailing_var_arg = true)]
     command: Vec<String>,
@@ -280,6 +291,9 @@ fn main() -> Result<()> {
         .context("a target ([user@]host[:port]) is required")?;
     let target = parse_target(&target_str)?;
 
+    let mode =
+        u32::from_str_radix(&args.connect.mode, 8).context("invalid --mode (expected octal)")?;
+
     let code = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?
@@ -289,6 +303,8 @@ fn main() -> Result<()> {
             args.connect.command,
             args.connect.local_forward,
             args.connect.download,
+            args.connect.upload,
+            mode,
         ))?;
     std::process::exit(code);
 }
@@ -299,6 +315,8 @@ async fn run(
     command: Vec<String>,
     local_forwards: Vec<String>,
     download: Option<String>,
+    upload: Option<String>,
+    mode: u32,
 ) -> Result<i32> {
     // Parse `-L` specs up front so a malformed spec fails before any network I/O.
     let forwards = local_forwards
@@ -371,6 +389,12 @@ async fn run(
     // Open a channel on the authed stream: download if `--download`, else shell
     // (no command) or exec.
     let (send, recv) = stream.split();
+    if let Some(path) = upload {
+        let code = upload_file(send, recv, path, mode).await?;
+        drop(send_request);
+        let _ = drive.await;
+        return Ok(code);
+    }
     if let Some(path) = download {
         let code = download_file(send, recv, path).await?;
         drop(send_request);
@@ -426,6 +450,46 @@ async fn download_file(mut send: SendHalf, recv: RecvHalf, path: String) -> Resu
     }
     stdout.flush().await.context("flushing stdout")?;
     let _ = send.finish().await;
+    Ok(code)
+}
+
+/// Upload PoC: send a `WriteFile` open, stream this process's stdin as `Data`
+/// frames, finish the send half, then read the terminal `ExitStatus`. The server
+/// creates/writes the file AS the authenticated user (setuid'd helper), so a
+/// path the user can't write yields a nonzero status.
+async fn upload_file(mut send: SendHalf, recv: RecvHalf, path: String, mode: u32) -> Result<i32> {
+    send.send_data(Bytes::from(quish_proto::encode(&ChannelOpen::WriteFile {
+        path,
+        mode,
+    })?))
+    .await
+    .context("sending WriteFile open")?;
+
+    // stdin → Data frames
+    let mut stdin = tokio::io::stdin();
+    let mut buf = vec![0u8; 32 * 1024];
+    loop {
+        let n = stdin.read(&mut buf).await.context("reading stdin")?;
+        if n == 0 {
+            break;
+        }
+        send.send_data(Bytes::from(quish_proto::encode(&ChannelMessage::Data(
+            buf[..n].to_vec(),
+        ))?))
+        .await
+        .context("sending upload data")?;
+    }
+    send.finish().await.context("finishing upload send")?;
+
+    // read the terminal ExitStatus
+    let mut reader = ChannelFrameReader::new(recv);
+    let mut code = 0;
+    while let Some(msg) = reader.next().await? {
+        if let ChannelMessage::ExitStatus(c) = msg {
+            code = c;
+            break;
+        }
+    }
     Ok(code)
 }
 
