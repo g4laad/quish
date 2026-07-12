@@ -68,6 +68,10 @@ pub enum ChannelOpen {
     /// Open a forwarded TCP connection to `host:port` on the server side.
     /// The server enforces its egress policy before connecting.
     Forward { host: String, port: u16 },
+    /// Download a regular file from the server, read AS the authenticated user
+    /// (open() happens in the setuid'd session helper, never as root/worker).
+    /// The server streams the file as `Data` frames + a terminal `ExitStatus`.
+    ReadFile { path: String },
 }
 
 /// A forwardable interrupt from the client's terminal (exec channels only).
@@ -177,6 +181,15 @@ mod tests {
         let open = ChannelOpen::Forward {
             host: "127.0.0.1".into(),
             port: 5432,
+        };
+        let got: ChannelOpen = decode(&encode(&open).unwrap()[LEN_PREFIX..]).unwrap();
+        assert_eq!(got, open);
+    }
+
+    #[test]
+    fn readfile_open_roundtrips() {
+        let open = ChannelOpen::ReadFile {
+            path: "/etc/hostname".into(),
         };
         let got: ChannelOpen = decode(&encode(&open).unwrap()[LEN_PREFIX..]).unwrap();
         assert_eq!(got, open);
