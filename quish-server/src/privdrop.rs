@@ -5,6 +5,8 @@
 //! *authenticated* user and execs their shell.
 
 use std::ffi::CString;
+use std::io::Write;
+use std::os::unix::fs::OpenOptionsExt;
 
 use anyhow::{Context, Result, bail};
 use nix::unistd::{Gid, Uid, User, chdir, chroot, execve, initgroups, setgid, setgroups, setuid};
@@ -53,6 +55,11 @@ pub fn drop_to_worker(chroot_dir: &str, username: &str) -> Result<()> {
 /// (login shell, or `shell -c <command>` for exec channels). Never returns on
 /// success (the process image is replaced).
 pub fn run_session_helper() -> Result<()> {
+    // Transfer channels branch off before any tty/exec setup: the helper opens
+    // the requested file AS the user and streams it, never execing a shell.
+    if let Ok(path) = std::env::var(ipc::ENV_SESS_TRANSFER_PATH) {
+        return run_transfer_helper(path);
+    }
     let uid = Uid::from_raw(ipc::env_u32(ipc::ENV_SESS_UID)?);
     let gid = Gid::from_raw(ipc::env_u32(ipc::ENV_SESS_GID)?);
     let user = ipc::env(ipc::ENV_SESS_USER)?;
@@ -121,4 +128,40 @@ pub fn run_session_helper() -> Result<()> {
 
     execve(&shell_c, &argv, &envp).context("exec shell")?;
     unreachable!("execve returned without error")
+}
+
+/// Transfer-channel entry: drop to the target user, then open `path` and copy it
+/// to stdout (the pipe the monitor handed the worker). The credential drop
+/// happens BEFORE open() — identical ordering to the shell/exec path — so the
+/// kernel enforces the *user's* permissions on the open, never root's or the
+/// worker's. Only regular files are served (fstat refuses devices/FIFOs/etc.).
+fn run_transfer_helper(path: String) -> Result<()> {
+    let uid = Uid::from_raw(ipc::env_u32(ipc::ENV_SESS_UID)?);
+    let gid = Gid::from_raw(ipc::env_u32(ipc::ENV_SESS_GID)?);
+    let user = ipc::env(ipc::ENV_SESS_USER)?;
+
+    // Identity boundary (reuse the shell/exec ordering verbatim): supplementary
+    // groups, then gid, then uid last while still privileged.
+    let cuser = CString::new(user).context("user cstring")?;
+    initgroups(&cuser, gid).context("initgroups")?;
+    setgid(gid).context("setgid")?;
+    setuid(uid).context("setuid")?;
+
+    // O_NONBLOCK so opening a FIFO/device/socket can't hang the helper; it is a
+    // no-op on regular files. We fstat the opened fd and serve ONLY regular
+    // files — everything else exits nonzero (→ terminal ExitStatus).
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::fcntl::OFlag::O_NONBLOCK.bits())
+        .open(&path)
+        .with_context(|| format!("open {path}"))?;
+    let meta = file.metadata().context("fstat")?;
+    if !meta.file_type().is_file() {
+        bail!("refusing non-regular file: {path}");
+    }
+
+    let mut stdout = std::io::stdout().lock();
+    std::io::copy(&mut file, &mut stdout).context("copy file to stdout")?;
+    stdout.flush().context("flush stdout")?;
+    Ok(())
 }

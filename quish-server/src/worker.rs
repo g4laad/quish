@@ -189,6 +189,19 @@ impl MonitorClient {
         }
     }
 
+    async fn spawn_transfer(&self, conn_id: u64, path: &str) -> Result<(u64, OwnedFd)> {
+        let (resp, mut fds) = self
+            .call(&Request::SpawnTransfer {
+                conn_id,
+                path: path.to_string(),
+            })
+            .await?;
+        match resp {
+            Response::Spawned { session_id } if fds.len() == 1 => Ok((session_id, fds.remove(0))),
+            _ => bail!("monitor refused transfer"),
+        }
+    }
+
     async fn reap(&self, session_id: u64) -> i32 {
         match self.call(&Request::Reap { session_id }).await {
             Ok((Response::Exited(code), _)) => code,
@@ -246,6 +259,19 @@ pub async fn serve_channel(
             // Loopback-only egress policy + Data pump live in the shared helper;
             // no monitor RPC (the worker opens the socket unprivileged).
             serve_forward(send, reader, host, port, allow_forward).await
+        }
+        ChannelOpen::ReadFile { path } => {
+            if !spawn_arg_ok(path.len()) {
+                warn!(%conn_id, len = path.len(), "rejecting over-length path");
+                return Ok(());
+            }
+            // do not log the path body — it may reveal the user's file layout.
+            // The worker never resolves or opens the path: it forwards it to the
+            // monitor, which hands it to the setuid'd helper that opens it as the
+            // user. Only the length is bounded here (as term/command are).
+            info!(%conn_id, "readfile channel");
+            let (session_id, out) = client.spawn_transfer(conn_id, &path).await?;
+            run_transfer(client, session_id, out, send).await
         }
     }
 }
@@ -321,6 +347,34 @@ async fn run_exec(
 
     let code = client.reap(session_id).await; // ALWAYS reap — no session leak
     if let PumpEnd::Drained = end {
+        send_msg(&mut send, &ChannelMessage::ExitStatus(code)).await?;
+    }
+    send.finish().await.map_err(Into::into)
+}
+
+/// Pump a transfer helper's stdout (the file bytes, read AS the user) to the
+/// client as `Data` frames, then reap the helper and send its exit code as the
+/// terminal `ExitStatus` (nonzero if open/fstat/copy failed). The client sends
+/// nothing after `ReadFile`, so there is no input pump.
+async fn run_transfer(
+    client: &MonitorClient,
+    session_id: u64,
+    stdout: OwnedFd,
+    mut send: SendHalf,
+) -> Result<()> {
+    let (out_tx, mut out_rx) = mpsc::channel::<Vec<u8>>(64);
+    std::thread::spawn(move || read_loop(File::from(stdout), out_tx));
+
+    let mut client_gone = false;
+    while let Some(chunk) = out_rx.recv().await {
+        if !send_msg(&mut send, &ChannelMessage::Data(chunk)).await? {
+            client_gone = true; // client hung up (H3_NO_ERROR); stop, don't error
+            break;
+        }
+    }
+
+    let code = client.reap(session_id).await; // ALWAYS reap — no session leak
+    if !client_gone {
         send_msg(&mut send, &ChannelMessage::ExitStatus(code)).await?;
     }
     send.finish().await.map_err(Into::into)

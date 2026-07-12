@@ -48,7 +48,45 @@ pub async fn serve(stream: FullStream, allow_forward: bool) -> Result<()> {
             info!(%port, "forward channel");
             serve_forward(send, reader, host, port, allow_forward).await
         }
+        ChannelOpen::ReadFile { path } => {
+            info!("readfile channel");
+            transfer(send, path).await
+        }
     }
+}
+
+/// Dev-mode download: open `path`, refuse non-regular files, and stream the
+/// bytes as `Data` frames + a terminal `ExitStatus` (nonzero on failure). Dev
+/// mode is a single process with no privilege drop, so the file is read as
+/// whoever runs `quishd` — the privsep worker (worker.rs) is the path that
+/// enforces the real per-user identity boundary.
+async fn transfer(mut send: SendHalf, path: String) -> Result<()> {
+    let (tx, mut rx) = mpsc::channel::<Vec<u8>>(64);
+    let reader = std::thread::spawn(move || -> std::io::Result<()> {
+        let file = std::fs::File::open(&path)?;
+        if !file.metadata()?.file_type().is_file() {
+            return Err(std::io::Error::other("not a regular file"));
+        }
+        read_loop(file, tx);
+        Ok(())
+    });
+
+    let mut client_gone = false;
+    while let Some(chunk) = rx.recv().await {
+        if !send_msg(&mut send, &ChannelMessage::Data(chunk)).await? {
+            client_gone = true;
+            break;
+        }
+    }
+
+    let code = match reader.join() {
+        Ok(Ok(())) => 0,
+        _ => 1,
+    };
+    if !client_gone {
+        send_msg(&mut send, &ChannelMessage::ExitStatus(code)).await?;
+    }
+    send.finish().await.map_err(Into::into)
 }
 
 /// Interactive shell on a PTY. stdout+stderr merge on the tty (correct terminal

@@ -49,6 +49,10 @@ pub const ENV_SESS_COMMAND: &str = "QUISH_SESS_COMMAND";
 /// Present (= slave pts path) only for shell channels: the helper reopens it
 /// after `setsid` to acquire the controlling terminal.
 pub const ENV_SESS_TTY: &str = "QUISH_SESS_TTY";
+/// Present (= file path) only for transfer channels: the helper open()s this
+/// path AFTER dropping to the target user, refuses non-regular files, then
+/// copies it to stdout. Never set for shell/exec.
+pub const ENV_SESS_TRANSFER_PATH: &str = "QUISH_SESS_TRANSFER_PATH";
 
 /// Read a required handoff env var (set by the monitor on the worker/session
 /// re-exec), or an error naming it.
@@ -91,6 +95,10 @@ pub enum Request {
         session_id: u64,
         signal: quish_proto::Signal,
     },
+    /// Open `path` for `conn_id`'s authed user and stream it back: the session
+    /// helper drops to the user, then open()s the file (response passes the
+    /// helper's stdout read fd). The worker never resolves or opens the path.
+    SpawnTransfer { conn_id: u64, path: String },
 }
 
 /// Control-channel response (monitor → worker).
