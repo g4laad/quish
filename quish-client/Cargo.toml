@@ -34,7 +34,7 @@ rpassword = "7.5.4"
 rustix = { version = "1.1.4", features = ["termios", "stdio"] }
 rustls = { version = "0.23.41", default-features = false, features = ["ring", "std"] }
 rustls-pki-types = "1.15.0"
-tokio = { version = "1.52.3", features = ["full"] }
+tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "sync", "time", "net", "io-util", "io-std", "signal"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 webpki-roots = "1.0.8"
