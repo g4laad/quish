@@ -28,10 +28,18 @@ type SendRequest = h3::client::SendRequest<h3_quinn::OpenStreams, Bytes>;
 
 /// quish client (HTTP/3 remote shell).
 #[derive(Parser, Debug)]
-#[command(name = "quish", version)]
+#[command(name = "quish", version, args_conflicts_with_subcommands = true)]
 struct Args {
+    #[command(subcommand)]
+    action: Option<Command>,
+    #[command(flatten)]
+    connect: ConnectArgs,
+}
+
+#[derive(clap::Args, Debug)]
+struct ConnectArgs {
     /// Target as `[user@]host[:port][/path]`.
-    target: String,
+    target: Option<String>,
 
     /// OpenSSH ed25519 private key for pubkey auth. Without it, password auth is
     /// used (prompted, or read from `QUISH_PASSWORD`).
@@ -49,9 +57,26 @@ struct Args {
     #[arg(long, value_name = "REMOTE-PATH")]
     download: Option<String>,
 
-    /// Command to run (unused until M4; parsed now for the final CLI shape).
+    /// Command to run (empty = interactive shell).
     #[arg(trailing_var_arg = true)]
     command: Vec<String>,
+}
+
+#[derive(clap::Subcommand, Debug)]
+enum Command {
+    /// Manage pinned server host keys (TOFU known_hosts).
+    KnownHosts {
+        #[command(subcommand)]
+        action: KnownHostsAction,
+    },
+}
+
+#[derive(clap::Subcommand, Debug)]
+enum KnownHostsAction {
+    /// List pinned hosts and their fingerprints.
+    List,
+    /// Remove a pinned host (like `ssh-keygen -R`). HOST is the `host:port` shown by `list`.
+    Remove { host: String },
 }
 
 /// Parsed connection target.
@@ -241,17 +266,29 @@ fn main() -> Result<()> {
         .map_err(|_| anyhow::anyhow!("failed to install rustls crypto provider"))?;
 
     let args = Args::parse();
-    let target = parse_target(&args.target)?;
+
+    if let Some(Command::KnownHosts { action }) = args.action {
+        return match action {
+            KnownHostsAction::List => connect::list_known_hosts(),
+            KnownHostsAction::Remove { host } => connect::remove_known_host(&host),
+        };
+    }
+
+    let target_str = args
+        .connect
+        .target
+        .context("a target ([user@]host[:port]) is required")?;
+    let target = parse_target(&target_str)?;
 
     let code = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?
         .block_on(run(
             target,
-            args.identity,
-            args.command,
-            args.local_forward,
-            args.download,
+            args.connect.identity,
+            args.connect.command,
+            args.connect.local_forward,
+            args.connect.download,
         ))?;
     std::process::exit(code);
 }

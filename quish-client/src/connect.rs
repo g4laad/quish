@@ -102,8 +102,9 @@ impl ServerCertVerifier for TofuVerifier {
         match lookup(&self.known_hosts, &self.host_key) {
             Some(pinned) if pinned == fp => Ok(ServerCertVerified::assertion()),
             Some(_) => Err(rustls::Error::General(format!(
-                "host key mismatch for {} — possible MITM; refusing to connect",
-                self.host_key
+                "host key mismatch for {h} — possible MITM; refusing to connect. \
+                 If you know the server key changed, run: quish known-hosts remove {h}",
+                h = self.host_key
             ))),
             None => {
                 if !prompt_accept(&self.host_key, &fp) {
@@ -234,6 +235,73 @@ fn pin(path: &PathBuf, host: &str, fp: &str) -> Result<()> {
     Ok(())
 }
 
+/// Print every pinned `host fingerprint` line to stdout. Missing file = empty.
+pub fn list_known_hosts() -> anyhow::Result<()> {
+    let path = known_hosts_path()?;
+    match std::fs::read_to_string(&path) {
+        Ok(contents) => {
+            for line in contents.lines().filter(|l| !l.trim().is_empty()) {
+                println!("{line}");
+            }
+            Ok(())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            eprintln!("quish: no known_hosts file at {}", path.display());
+            Ok(())
+        }
+        Err(e) => Err(e).context("reading known_hosts"),
+    }
+}
+
+/// Remove all pins for `host` (exact `host:port` match). Rewrites the file
+/// atomically-ish (write a temp, rename). Reports how many were removed.
+pub fn remove_known_host(host: &str) -> anyhow::Result<()> {
+    let path = known_hosts_path()?;
+    let contents = match std::fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            eprintln!("quish: no known_hosts file at {}", path.display());
+            return Ok(());
+        }
+        Err(e) => return Err(e).context("reading known_hosts"),
+    };
+    let (body, removed) = remove_host_lines(&contents, host);
+    if removed == 0 {
+        eprintln!("quish: no pinned key for {host}");
+        return Ok(());
+    }
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, &body).context("writing known_hosts")?;
+    std::fs::rename(&tmp, &path).context("replacing known_hosts")?;
+    eprintln!("quish: removed {removed} pin(s) for {host}");
+    Ok(())
+}
+
+/// Pure core of `remove_known_host`: drop every line whose first space-delimited
+/// token equals `host`, preserving all others. Returns the new file body (with a
+/// trailing newline iff non-empty) and the count removed. Unit-tested directly.
+fn remove_host_lines(contents: &str, host: &str) -> (String, usize) {
+    let mut removed = 0usize;
+    let kept: Vec<&str> = contents
+        .lines()
+        .filter(|line| {
+            let is_match = line
+                .split_once(' ')
+                .map(|(h, _)| h == host)
+                .unwrap_or(false);
+            if is_match {
+                removed += 1;
+            }
+            !is_match
+        })
+        .collect();
+    let mut body = kept.join("\n");
+    if !body.is_empty() {
+        body.push('\n');
+    }
+    (body, removed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -248,6 +316,46 @@ mod tests {
         assert_eq!(lookup(&path, "h:1"), Some("deadbeef".into()));
         assert_eq!(lookup(&path, "other:1"), None);
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn remove_existing_host_drops_it() {
+        let contents = "a:1 aa\nb:2 bb\nc:3 cc\n";
+        let (body, removed) = remove_host_lines(contents, "b:2");
+        assert_eq!(removed, 1);
+        assert_eq!(body, "a:1 aa\nc:3 cc\n");
+    }
+
+    #[test]
+    fn remove_host_with_two_pins_removes_both() {
+        let contents = "a:1 aa\nb:2 bb\na:1 dd\n";
+        let (body, removed) = remove_host_lines(contents, "a:1");
+        assert_eq!(removed, 2);
+        assert_eq!(body, "b:2 bb\n");
+    }
+
+    #[test]
+    fn remove_absent_host_is_noop() {
+        let contents = "a:1 aa\nb:2 bb\n";
+        let (body, removed) = remove_host_lines(contents, "z:9");
+        assert_eq!(removed, 0);
+        assert_eq!(body, "a:1 aa\nb:2 bb\n");
+    }
+
+    #[test]
+    fn remove_preserves_blank_and_garbage_lines() {
+        let contents = "a:1 aa\n\ngarbage-no-space\nb:2 bb\n";
+        let (body, removed) = remove_host_lines(contents, "b:2");
+        assert_eq!(removed, 1);
+        assert_eq!(body, "a:1 aa\n\ngarbage-no-space\n");
+    }
+
+    #[test]
+    fn remove_matches_exact_host_only() {
+        let contents = "1.2.3.4:443 aa\n1.2.3.4:4433 bb\n";
+        let (body, removed) = remove_host_lines(contents, "1.2.3.4:443");
+        assert_eq!(removed, 1);
+        assert_eq!(body, "1.2.3.4:4433 bb\n");
     }
 
     // Drive `decide` with an in-memory reader/writer, returning its verdict and
