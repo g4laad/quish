@@ -73,6 +73,12 @@ pub enum ChannelOpen {
     /// (open() happens in the setuid'd session helper, never as root/worker).
     /// The server streams the file as `Data` frames + a terminal `ExitStatus`.
     ReadFile { path: String },
+    /// Upload a regular file to the server, created/written AS the authenticated
+    /// user (open() happens in the setuid'd session helper, never as root/worker).
+    /// The client streams the bytes as `Data` frames; the server replies with a
+    /// terminal `ExitStatus` (nonzero on open/fstat/write failure). `mode` is the
+    /// creation mode, applied subject to the user's umask.
+    WriteFile { path: String, mode: u32 },
 }
 
 /// A forwardable interrupt from the client's terminal (exec channels only).
@@ -213,6 +219,16 @@ mod tests {
     fn readfile_open_roundtrips() {
         let open = ChannelOpen::ReadFile {
             path: "/etc/hostname".into(),
+        };
+        let got: ChannelOpen = decode(&encode(&open).unwrap()[LEN_PREFIX..]).unwrap();
+        assert_eq!(got, open);
+    }
+
+    #[test]
+    fn writefile_open_roundtrips() {
+        let open = ChannelOpen::WriteFile {
+            path: "/tmp/x".into(),
+            mode: 0o644,
         };
         let got: ChannelOpen = decode(&encode(&open).unwrap()[LEN_PREFIX..]).unwrap();
         assert_eq!(got, open);
