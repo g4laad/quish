@@ -52,6 +52,10 @@ pub async fn serve(stream: FullStream, allow_forward: bool) -> Result<()> {
             info!("readfile channel");
             transfer(send, path).await
         }
+        ChannelOpen::WriteFile { path, mode } => {
+            info!("writefile channel");
+            transfer_write(send, reader, path, mode).await
+        }
     }
 }
 
@@ -86,6 +90,51 @@ async fn transfer(mut send: SendHalf, path: String) -> Result<()> {
     if !client_gone {
         send_msg(&mut send, &ChannelMessage::ExitStatus(code)).await?;
     }
+    send.finish().await.map_err(Into::into)
+}
+
+/// Dev-mode upload: create/open `path` (mode applied), refuse non-regular
+/// files, write received `Data` frames into it, then send a terminal
+/// `ExitStatus` (nonzero on failure). Dev mode is a single process with no
+/// privilege drop — the privsep worker (worker.rs) enforces the real per-user
+/// identity boundary.
+async fn transfer_write(
+    mut send: SendHalf,
+    reader: FrameReader,
+    path: String,
+    mode: u32,
+) -> Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let (in_tx, in_rx) = mpsc::channel::<Vec<u8>>(64);
+    let writer = std::thread::spawn(move || -> std::io::Result<()> {
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(mode)
+            .open(&path)?;
+        if !file.metadata()?.file_type().is_file() {
+            return Err(std::io::Error::other("not a regular file"));
+        }
+        write_loop(file, in_rx);
+        Ok(())
+    });
+
+    let mut frames = spawn_frame_reader(reader);
+    while let Some(msg) = frames.recv().await {
+        if let ChannelMessage::Data(d) = msg
+            && in_tx.send(d).await.is_err()
+        {
+            break;
+        }
+    }
+    drop(in_tx);
+
+    let code = match writer.join() {
+        Ok(Ok(())) => 0,
+        _ => 1,
+    };
+    send_msg(&mut send, &ChannelMessage::ExitStatus(code)).await?;
     send.finish().await.map_err(Into::into)
 }
 

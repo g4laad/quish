@@ -461,6 +461,34 @@ async fn serve_control(mut listener: UnixSeqpacketListener, registry: Arc<Regist
                 ipc::ctrl_send(&sock, &reply, &[]).await?;
             }
 
+            Request::SpawnTransferWrite {
+                conn_id,
+                path,
+                mode,
+            } => {
+                let reply = match st.users.get(&conn_id).cloned() {
+                    Some(user) => match spawn_transfer_write(&user, &path, mode) {
+                        Ok((child, wr)) => {
+                            let id = st.alloc(conn_id, child);
+                            ipc::ctrl_send(
+                                &sock,
+                                &Response::Spawned { session_id: id },
+                                &[wr.as_fd()],
+                            )
+                            .await?;
+                            drop(wr);
+                            continue;
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "spawn upload transfer failed");
+                            Response::Failed
+                        }
+                    },
+                    None => Response::Failed,
+                };
+                ipc::ctrl_send(&sock, &reply, &[]).await?;
+            }
+
             Request::Reap { session_id } => {
                 let reply = match st.sessions.remove(&session_id) {
                     Some(child) => {
@@ -580,6 +608,26 @@ fn spawn_transfer(user: &str, path: &str) -> Result<(Child, std::os::fd::OwnedFd
         .context("spawn transfer session")?;
     let o = child.stdout.take().context("no stdout")?;
     Ok((child, o.into()))
+}
+
+/// Spawn an upload helper for `user` that creates/writes `path` (as the user)
+/// with `mode`, copying its stdin into the file. Only stdin is piped. Returns
+/// the child (for reaping) and the stdin write fd passed to the worker.
+fn spawn_transfer_write(
+    user: &str,
+    path: &str,
+    mode: u32,
+) -> Result<(Child, std::os::fd::OwnedFd)> {
+    let u = crate::privdrop::lookup_user(user)?;
+    let mut child = session_command(&u)
+        .env(ipc::ENV_SESS_TRANSFER_WRITE_PATH, path)
+        .env(ipc::ENV_SESS_TRANSFER_MODE, mode.to_string())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .spawn()
+        .context("spawn upload transfer session")?;
+    let i = child.stdin.take().context("no stdin")?;
+    Ok((child, i.into()))
 }
 
 /// Base `--internal-run-session` command for `user` (identity envs common to

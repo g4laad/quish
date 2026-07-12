@@ -53,6 +53,14 @@ pub const ENV_SESS_TTY: &str = "QUISH_SESS_TTY";
 /// path AFTER dropping to the target user, refuses non-regular files, then
 /// copies it to stdout. Never set for shell/exec.
 pub const ENV_SESS_TRANSFER_PATH: &str = "QUISH_SESS_TRANSFER_PATH";
+/// Present (= file path) only for UPLOAD transfer channels: the helper
+/// open(O_WRONLY|O_CREAT|O_TRUNC)s this path AFTER dropping to the target user,
+/// refuses non-regular files, then copies stdin into it. Never set together
+/// with `ENV_SESS_TRANSFER_PATH`.
+pub const ENV_SESS_TRANSFER_WRITE_PATH: &str = "QUISH_SESS_TRANSFER_WRITE_PATH";
+/// The creation mode (decimal string of a u32) for an upload. Read only when
+/// `ENV_SESS_TRANSFER_WRITE_PATH` is set.
+pub const ENV_SESS_TRANSFER_MODE: &str = "QUISH_SESS_TRANSFER_MODE";
 
 /// Read a required handoff env var (set by the monitor on the worker/session
 /// re-exec), or an error naming it.
@@ -99,6 +107,14 @@ pub enum Request {
     /// helper drops to the user, then open()s the file (response passes the
     /// helper's stdout read fd). The worker never resolves or opens the path.
     SpawnTransfer { conn_id: u64, path: String },
+    /// Spawn an UPLOAD transfer helper for the authed user of `conn_id`. The
+    /// response passes the helper's stdin WRITE fd (SCM_RIGHTS); the worker pumps
+    /// client bytes into it. The worker never resolves or opens the path.
+    SpawnTransferWrite {
+        conn_id: u64,
+        path: String,
+        mode: u32,
+    },
 }
 
 /// Control-channel response (monitor → worker).

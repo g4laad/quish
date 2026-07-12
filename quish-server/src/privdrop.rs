@@ -60,6 +60,9 @@ pub fn run_session_helper() -> Result<()> {
     if let Ok(path) = std::env::var(ipc::ENV_SESS_TRANSFER_PATH) {
         return run_transfer_helper(path);
     }
+    if let Ok(path) = std::env::var(ipc::ENV_SESS_TRANSFER_WRITE_PATH) {
+        return run_transfer_write_helper(path);
+    }
     let uid = Uid::from_raw(ipc::env_u32(ipc::ENV_SESS_UID)?);
     let gid = Gid::from_raw(ipc::env_u32(ipc::ENV_SESS_GID)?);
     let user = ipc::env(ipc::ENV_SESS_USER)?;
@@ -163,5 +166,45 @@ fn run_transfer_helper(path: String) -> Result<()> {
     let mut stdout = std::io::stdout().lock();
     std::io::copy(&mut file, &mut stdout).context("copy file to stdout")?;
     stdout.flush().context("flush stdout")?;
+    Ok(())
+}
+
+/// Upload-channel entry: drop to the target user, then create/open `path` for
+/// writing and copy stdin (the pipe the monitor handed the worker) into it. The
+/// credential drop happens BEFORE open() — identical ordering to download — so
+/// the kernel enforces the *user's* permissions on the create/write, never
+/// root's or the worker's. Only regular files are written (fstat refuses
+/// devices/FIFOs/etc.). O_TRUNC means a partial write on error leaves a
+/// truncated file — acceptable, matches `cat > file`.
+fn run_transfer_write_helper(path: String) -> Result<()> {
+    let uid = Uid::from_raw(ipc::env_u32(ipc::ENV_SESS_UID)?);
+    let gid = Gid::from_raw(ipc::env_u32(ipc::ENV_SESS_GID)?);
+    let user = ipc::env(ipc::ENV_SESS_USER)?;
+    let mode = ipc::env_u32(ipc::ENV_SESS_TRANSFER_MODE)?;
+
+    // Identity boundary (reuse the shell/exec/download ordering verbatim).
+    let cuser = CString::new(user).context("user cstring")?;
+    initgroups(&cuser, gid).context("initgroups")?;
+    setgid(gid).context("setgid")?;
+    setuid(uid).context("setuid")?;
+
+    // O_NONBLOCK so opening an existing FIFO/device can't hang; no-op on a
+    // regular file. fstat and refuse anything but a regular file.
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(mode)
+        .custom_flags(nix::fcntl::OFlag::O_NONBLOCK.bits())
+        .open(&path)
+        .with_context(|| format!("open {path}"))?;
+    let meta = file.metadata().context("fstat")?;
+    if !meta.file_type().is_file() {
+        bail!("refusing non-regular file: {path}");
+    }
+
+    let mut stdin = std::io::stdin().lock();
+    std::io::copy(&mut stdin, &mut file).context("copy stdin to file")?;
+    file.flush().context("flush file")?;
     Ok(())
 }

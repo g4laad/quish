@@ -202,6 +202,25 @@ impl MonitorClient {
         }
     }
 
+    async fn spawn_transfer_write(
+        &self,
+        conn_id: u64,
+        path: &str,
+        mode: u32,
+    ) -> Result<(u64, OwnedFd)> {
+        let (resp, mut fds) = self
+            .call(&Request::SpawnTransferWrite {
+                conn_id,
+                path: path.to_string(),
+                mode,
+            })
+            .await?;
+        match resp {
+            Response::Spawned { session_id } if fds.len() == 1 => Ok((session_id, fds.remove(0))),
+            _ => bail!("monitor refused upload transfer"),
+        }
+    }
+
     async fn reap(&self, session_id: u64) -> i32 {
         match self.call(&Request::Reap { session_id }).await {
             Ok((Response::Exited(code), _)) => code,
@@ -272,6 +291,15 @@ pub async fn serve_channel(
             info!(%conn_id, "readfile channel");
             let (session_id, out) = client.spawn_transfer(conn_id, &path).await?;
             run_transfer(client, session_id, out, send).await
+        }
+        ChannelOpen::WriteFile { path, mode } => {
+            if !spawn_arg_ok(path.len()) {
+                warn!(%conn_id, len = path.len(), "rejecting over-length upload path");
+                return Ok(());
+            }
+            info!(%conn_id, "writefile channel");
+            let (session_id, wr) = client.spawn_transfer_write(conn_id, &path, mode).await?;
+            run_transfer_write(client, session_id, wr, send, reader).await
         }
     }
 }
@@ -377,6 +405,37 @@ async fn run_transfer(
     if !client_gone {
         send_msg(&mut send, &ChannelMessage::ExitStatus(code)).await?;
     }
+    send.finish().await.map_err(Into::into)
+}
+
+/// Pump client `Data` frames into an upload helper's stdin (the file bytes,
+/// written AS the user). On client EOF, drop the write end so the helper sees
+/// EOF, finishes its copy, and exits; then reap and send its exit code as the
+/// terminal `ExitStatus` (nonzero if open/fstat/write failed). The server sends
+/// no `Data` on this channel — only the terminal status.
+async fn run_transfer_write(
+    client: &MonitorClient,
+    session_id: u64,
+    stdin: OwnedFd,
+    mut send: SendHalf,
+    reader: FrameReader,
+) -> Result<()> {
+    let (in_tx, in_rx) = mpsc::channel::<Vec<u8>>(64);
+    std::thread::spawn(move || write_loop(File::from(stdin), in_rx));
+
+    let mut frames = spawn_frame_reader(reader);
+    while let Some(msg) = frames.recv().await {
+        // ignore any other frame kinds; the client sends only Data + finish
+        if let ChannelMessage::Data(d) = msg
+            && in_tx.send(d).await.is_err()
+        {
+            break; // helper stdin closed early (write failed) — stop pumping
+        }
+    }
+    drop(in_tx); // close helper stdin → EOF → io::copy finishes, helper exits
+
+    let code = client.reap(session_id).await; // ALWAYS reap — no session leak
+    send_msg(&mut send, &ChannelMessage::ExitStatus(code)).await?;
     send.finish().await.map_err(Into::into)
 }
 
