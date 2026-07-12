@@ -10,17 +10,19 @@ Wants=network-online.target
 # worker, which chroots to RuntimeDirectory, setuids to `quish`, and sets
 # no_new_privs on itself — so the network-facing process is unprivileged.
 Type=simple
-ExecStart=/usr/bin/quishd --listen [::]:443 --privsep-user quish --privsep-dir /run/quishd
+ExecStart=/usr/bin/quishd --listen [::]:443 --privsep-user quish --privsep-dir /run/quishd --host-key /var/lib/quishd/host_key.der
 User=root
 RuntimeDirectory=quishd
 RuntimeDirectoryMode=0755
+StateDirectory=quishd
+StateDirectoryMode=0700
 # The control/signing sockets are NOT placed here: the monitor creates them in a
 # root-only sibling dir (/run/quishd.sock.d-<pid>) — do not relocate RuntimeDirectory to a shared path.
 # To enable local (-L) TCP port forwarding (loopback-only) for the daemon,
 # append the flag via a drop-in — `systemctl edit quishd` and add:
 #     [Service]
 #     ExecStart=
-#     ExecStart=/usr/bin/quishd --listen [::]:443 --privsep-user quish --privsep-dir /run/quishd --allow-forward
+#     ExecStart=/usr/bin/quishd --listen [::]:443 --privsep-user quish --privsep-dir /run/quishd --host-key /var/lib/quishd/host_key.der --allow-forward
 # (Or pass --config /etc/quish/server.toml with `allow_forward = true`; note
 # the default ExecStart above does not load a config file.)
 Restart=on-failure
