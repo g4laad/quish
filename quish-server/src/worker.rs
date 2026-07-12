@@ -207,7 +207,7 @@ impl MonitorClient {
         conn_id: u64,
         path: &str,
         mode: u32,
-    ) -> Result<(u64, OwnedFd)> {
+    ) -> Result<(u64, OwnedFd, OwnedFd)> {
         let (resp, mut fds) = self
             .call(&Request::SpawnTransferWrite {
                 conn_id,
@@ -216,7 +216,11 @@ impl MonitorClient {
             })
             .await?;
         match resp {
-            Response::Spawned { session_id } if fds.len() == 1 => Ok((session_id, fds.remove(0))),
+            Response::Spawned { session_id } if fds.len() == 2 => {
+                let wr = fds.remove(0);
+                let rd = fds.remove(0);
+                Ok((session_id, wr, rd))
+            }
             _ => bail!("monitor refused upload transfer"),
         }
     }
@@ -298,8 +302,8 @@ pub async fn serve_channel(
                 return Ok(());
             }
             info!(%conn_id, "writefile channel");
-            let (session_id, wr) = client.spawn_transfer_write(conn_id, &path, mode).await?;
-            run_transfer_write(client, session_id, wr, send, reader).await
+            let (session_id, wr, rd) = client.spawn_transfer_write(conn_id, &path, mode).await?;
+            run_transfer_write(client, session_id, wr, rd, send, reader).await
         }
     }
 }
@@ -417,11 +421,19 @@ async fn run_transfer_write(
     client: &MonitorClient,
     session_id: u64,
     stdin: OwnedFd,
+    stdout: OwnedFd,
     mut send: SendHalf,
     reader: FrameReader,
 ) -> Result<()> {
     let (in_tx, in_rx) = mpsc::channel::<Vec<u8>>(64);
     std::thread::spawn(move || write_loop(File::from(stdin), in_rx));
+    // The helper writes nothing to stdout; we drain it only to observe the
+    // helper's exit (EOF on stdout ⇔ it closed the fd ⇔ it exited), exactly as
+    // the download pump waits on stdout EOF. Reaping only after this keeps the
+    // shared try_wait+kill reaper (plan 003) from SIGKILLing a still-finishing
+    // helper and truncating the file.
+    let (out_tx, mut out_rx) = mpsc::channel::<Vec<u8>>(64);
+    std::thread::spawn(move || read_loop(File::from(stdout), out_tx));
 
     let mut frames = spawn_frame_reader(reader);
     while let Some(msg) = frames.recv().await {
@@ -433,6 +445,10 @@ async fn run_transfer_write(
         }
     }
     drop(in_tx); // close helper stdin → EOF → io::copy finishes, helper exits
+
+    // Wait for the helper to actually exit (stdout EOF) before reaping, so the
+    // reaper sees an exited child instead of SIGKILLing a live one.
+    while out_rx.recv().await.is_some() {}
 
     let code = client.reap(session_id).await; // ALWAYS reap — no session leak
     send_msg(&mut send, &ChannelMessage::ExitStatus(code)).await?;

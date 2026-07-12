@@ -468,15 +468,16 @@ async fn serve_control(mut listener: UnixSeqpacketListener, registry: Arc<Regist
             } => {
                 let reply = match st.users.get(&conn_id).cloned() {
                     Some(user) => match spawn_transfer_write(&user, &path, mode) {
-                        Ok((child, wr)) => {
+                        Ok((child, wr, rd)) => {
                             let id = st.alloc(conn_id, child);
                             ipc::ctrl_send(
                                 &sock,
                                 &Response::Spawned { session_id: id },
-                                &[wr.as_fd()],
+                                &[wr.as_fd(), rd.as_fd()],
                             )
                             .await?;
                             drop(wr);
+                            drop(rd);
                             continue;
                         }
                         Err(e) => {
@@ -611,23 +612,28 @@ fn spawn_transfer(user: &str, path: &str) -> Result<(Child, std::os::fd::OwnedFd
 }
 
 /// Spawn an upload helper for `user` that creates/writes `path` (as the user)
-/// with `mode`, copying its stdin into the file. Only stdin is piped. Returns
-/// the child (for reaping) and the stdin write fd passed to the worker.
+/// with `mode`, copying its stdin into the file. Returns the child (for reaping),
+/// the stdin WRITE fd (the worker pumps client bytes into it), and the stdout
+/// READ fd. The helper writes nothing to stdout; that pipe exists solely so the
+/// worker can observe the helper's exit (EOF on stdout) before reaping, exactly
+/// as the download pump waits on stdout — the shared try_wait+kill reaper (plan
+/// 003) would otherwise SIGKILL a still-finishing helper and truncate the file.
 fn spawn_transfer_write(
     user: &str,
     path: &str,
     mode: u32,
-) -> Result<(Child, std::os::fd::OwnedFd)> {
+) -> Result<(Child, std::os::fd::OwnedFd, std::os::fd::OwnedFd)> {
     let u = crate::privdrop::lookup_user(user)?;
     let mut child = session_command(&u)
         .env(ipc::ENV_SESS_TRANSFER_WRITE_PATH, path)
         .env(ipc::ENV_SESS_TRANSFER_MODE, mode.to_string())
         .stdin(Stdio::piped())
-        .stdout(Stdio::null())
+        .stdout(Stdio::piped())
         .spawn()
         .context("spawn upload transfer session")?;
     let i = child.stdin.take().context("no stdin")?;
-    Ok((child, i.into()))
+    let o = child.stdout.take().context("no stdout")?;
+    Ok((child, i.into(), o.into()))
 }
 
 /// Base `--internal-run-session` command for `user` (identity envs common to
