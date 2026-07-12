@@ -5,6 +5,7 @@
 //! directions exchange length-prefixed postcard frames: a leading [`ChannelOpen`]
 //! from the client, then [`ChannelMessage`]s each way.
 
+use bytes::{Buf, Bytes, BytesMut};
 use serde::{Serialize, de::DeserializeOwned};
 
 /// Bumped on any incompatible wire change. Sent in the `quish-version` header.
@@ -141,9 +142,31 @@ pub fn parse_len(prefix: [u8; LEN_PREFIX]) -> Result<usize, CodecError> {
     Ok(len)
 }
 
+/// Split one complete length-prefixed frame body off the front of `buf`.
+///
+/// Returns `Ok(Some(body))` when a full `[len][body]` frame is buffered (the
+/// frame is removed from `buf`), `Ok(None)` when more bytes are needed, and
+/// `Err` if the length prefix exceeds [`MAX_FRAME_LEN`]. The split is O(1) and
+/// does not shift the remaining bytes; the returned `Bytes` shares the buffer's
+/// allocation (no copy). Callers accumulate incoming chunks into `buf` (e.g. via
+/// `bytes::BufMut::put`) and call this in a loop.
+pub fn take_frame(buf: &mut BytesMut) -> Result<Option<Bytes>, CodecError> {
+    if buf.len() < LEN_PREFIX {
+        return Ok(None);
+    }
+    let len = parse_len(buf[..LEN_PREFIX].try_into().unwrap())?;
+    if buf.len() < LEN_PREFIX + len {
+        return Ok(None);
+    }
+    let mut frame = buf.split_to(LEN_PREFIX + len); // O(1); `buf` keeps the tail
+    frame.advance(LEN_PREFIX); // drop the length prefix, O(1)
+    Ok(Some(frame.freeze())) // -> Bytes, no copy
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::{BufMut, BytesMut};
 
     #[test]
     fn frame_roundtrips() {
@@ -233,5 +256,59 @@ mod tests {
         assert!(!version_supported(Some("3")));
         assert!(!version_supported(Some("abc")));
         assert!(!version_supported(Some("")));
+    }
+
+    #[test]
+    fn take_frame_returns_one_full_frame() {
+        let framed = encode(&ChannelMessage::Data(vec![9, 8, 7])).unwrap();
+        let mut buf = BytesMut::from(&framed[..]);
+        let body = take_frame(&mut buf).unwrap().expect("one full frame");
+        assert!(buf.is_empty(), "frame fully consumed, no leftover");
+        assert_eq!(
+            decode::<ChannelMessage>(&body).unwrap(),
+            ChannelMessage::Data(vec![9, 8, 7])
+        );
+    }
+
+    #[test]
+    fn take_frame_needs_more_when_partial() {
+        let framed = encode(&ChannelMessage::Data(vec![1, 2, 3, 4])).unwrap();
+        let mut buf = BytesMut::new();
+        buf.put_slice(&framed[..2]);
+        assert!(take_frame(&mut buf).unwrap().is_none());
+        buf.put_slice(&framed[2..framed.len() - 1]);
+        assert!(take_frame(&mut buf).unwrap().is_none());
+        buf.put_slice(&framed[framed.len() - 1..]);
+        let body = take_frame(&mut buf).unwrap().expect("now complete");
+        assert_eq!(
+            decode::<ChannelMessage>(&body).unwrap(),
+            ChannelMessage::Data(vec![1, 2, 3, 4])
+        );
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn take_frame_splits_two_frames_in_one_buffer() {
+        let mut framed = encode(&ChannelMessage::Data(vec![1])).unwrap();
+        framed.extend_from_slice(&encode(&ChannelMessage::Data(vec![2, 2])).unwrap());
+        let mut buf = BytesMut::from(&framed[..]);
+        let a = take_frame(&mut buf).unwrap().unwrap();
+        let b = take_frame(&mut buf).unwrap().unwrap();
+        assert_eq!(
+            decode::<ChannelMessage>(&a).unwrap(),
+            ChannelMessage::Data(vec![1])
+        );
+        assert_eq!(
+            decode::<ChannelMessage>(&b).unwrap(),
+            ChannelMessage::Data(vec![2, 2])
+        );
+        assert!(take_frame(&mut buf).unwrap().is_none());
+    }
+
+    #[test]
+    fn take_frame_rejects_oversized_length() {
+        let mut buf = BytesMut::new();
+        buf.put_u32((MAX_FRAME_LEN + 1) as u32);
+        assert!(take_frame(&mut buf).is_err());
     }
 }

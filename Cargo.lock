@@ -1495,6 +1495,7 @@ dependencies = [
 name = "quish-proto"
 version = "0.2.0"
 dependencies = [
+ "bytes",
  "postcard",
  "serde",
  "sha2 0.11.0",
