@@ -6,6 +6,7 @@
 //! exec channel and pump it to completion, exiting with the remote status.
 
 mod connect;
+mod cp;
 mod terminal;
 
 use std::future;
