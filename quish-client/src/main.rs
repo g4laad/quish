@@ -52,23 +52,6 @@ struct ConnectArgs {
     #[arg(short = 'L', long = "local-forward")]
     local_forward: Vec<String>,
 
-    /// Download a remote regular file to stdout, then exit. The file is opened
-    /// AS the authenticated user by the server's setuid'd session helper (never
-    /// as root or the worker). Mutually exclusive with a command / `-L`.
-    #[arg(long, value_name = "REMOTE-PATH")]
-    download: Option<String>,
-
-    /// Upload a local file to REMOTE-PATH on the server, streaming this process's
-    /// STDIN. The file is created/written AS the authenticated user by the
-    /// server's setuid'd session helper (never as root or the worker). Mutually
-    /// exclusive with a command / `-L` / `--download`.
-    #[arg(long, value_name = "REMOTE-PATH", conflicts_with_all = ["download", "local_forward"])]
-    upload: Option<String>,
-
-    /// Creation mode (octal) for an --upload, e.g. 755. Default 644.
-    #[arg(long, value_name = "OCTAL", default_value = "644")]
-    mode: String,
-
     /// Command to run (empty = interactive shell).
     #[arg(trailing_var_arg = true)]
     command: Vec<String>,
@@ -81,6 +64,10 @@ enum Command {
         #[command(subcommand)]
         action: KnownHostsAction,
     },
+    /// Copy a file or folder to/from a server (scp-like). Exactly one of
+    /// SRC/DST is remote (`[user@]host:path`); a local folder SRC uploads
+    /// recursively (symlinks are skipped, never followed).
+    Cp(cp::CpArgs),
 }
 
 #[derive(clap::Subcommand, Debug)]
@@ -279,11 +266,21 @@ fn main() -> Result<()> {
 
     let args = Args::parse();
 
-    if let Some(Command::KnownHosts { action }) = args.action {
-        return match action {
-            KnownHostsAction::List => connect::list_known_hosts(),
-            KnownHostsAction::Remove { host } => connect::remove_known_host(&host),
-        };
+    match args.action {
+        Some(Command::KnownHosts { action }) => {
+            return match action {
+                KnownHostsAction::List => connect::list_known_hosts(),
+                KnownHostsAction::Remove { host } => connect::remove_known_host(&host),
+            };
+        }
+        Some(Command::Cp(a)) => {
+            let code = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()?
+                .block_on(cp::run_cp(a))?;
+            std::process::exit(code);
+        }
+        None => {}
     }
 
     let target_str = args
@@ -291,9 +288,6 @@ fn main() -> Result<()> {
         .target
         .context("a target ([user@]host[:port]) is required")?;
     let target = parse_target(&target_str)?;
-
-    let mode =
-        u32::from_str_radix(&args.connect.mode, 8).context("invalid --mode (expected octal)")?;
 
     let code = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -303,9 +297,6 @@ fn main() -> Result<()> {
             args.connect.identity,
             args.connect.command,
             args.connect.local_forward,
-            args.connect.download,
-            args.connect.upload,
-            mode,
         ))?;
     std::process::exit(code);
 }
@@ -315,9 +306,6 @@ async fn run(
     identity: Option<std::path::PathBuf>,
     command: Vec<String>,
     local_forwards: Vec<String>,
-    download: Option<String>,
-    upload: Option<String>,
-    mode: u32,
 ) -> Result<i32> {
     // Parse `-L` specs up front so a malformed spec fails before any network I/O.
     let forwards = local_forwards
@@ -335,21 +323,8 @@ async fn run(
         return Ok(0);
     }
 
-    // Open a channel on the authed connection: download if `--download`, upload if
-    // `--upload`, else shell (no command) or exec.
+    // Open the shell/exec channel on the authed connection.
     let (send, recv) = open_channel(&mut send_request, &target, &authorization).await?;
-    if let Some(path) = upload {
-        let code = upload_file(send, recv, path, mode).await?;
-        drop(send_request);
-        let _ = drive.await;
-        return Ok(code);
-    }
-    if let Some(path) = download {
-        let code = download_file(send, recv, path).await?;
-        drop(send_request);
-        let _ = drive.await;
-        return Ok(code);
-    }
     let interactive = command.is_empty();
     let (cols, rows) = terminal::winsize();
     let open = if interactive {
@@ -439,78 +414,6 @@ pub(crate) async fn open_channel(
     }
     info!(user = %target.user, "session authenticated");
     Ok(stream.split())
-}
-
-/// Download PoC: send a `ReadFile` open, then pump received `Data` frames to
-/// stdout until the terminal `ExitStatus`, returning that code. The server reads
-/// the file AS the authenticated user (setuid'd helper), so a file the user
-/// can't read yields a nonzero status with no content.
-async fn download_file(mut send: SendHalf, recv: RecvHalf, path: String) -> Result<i32> {
-    send.send_data(Bytes::from(quish_proto::encode(&ChannelOpen::ReadFile {
-        path,
-    })?))
-    .await
-    .context("sending ReadFile open")?;
-
-    let mut stdout = tokio::io::stdout();
-    let mut reader = ChannelFrameReader::new(recv);
-    let mut code = 0;
-    while let Some(msg) = reader.next().await? {
-        match msg {
-            ChannelMessage::Data(d) => stdout
-                .write_all(&d)
-                .await
-                .context("writing download to stdout")?,
-            ChannelMessage::ExitStatus(c) => {
-                code = c;
-                break;
-            }
-            _ => {}
-        }
-    }
-    stdout.flush().await.context("flushing stdout")?;
-    let _ = send.finish().await;
-    Ok(code)
-}
-
-/// Upload PoC: send a `WriteFile` open, stream this process's stdin as `Data`
-/// frames, finish the send half, then read the terminal `ExitStatus`. The server
-/// creates/writes the file AS the authenticated user (setuid'd helper), so a
-/// path the user can't write yields a nonzero status.
-async fn upload_file(mut send: SendHalf, recv: RecvHalf, path: String, mode: u32) -> Result<i32> {
-    send.send_data(Bytes::from(quish_proto::encode(&ChannelOpen::WriteFile {
-        path,
-        mode,
-    })?))
-    .await
-    .context("sending WriteFile open")?;
-
-    // stdin → Data frames
-    let mut stdin = tokio::io::stdin();
-    let mut buf = vec![0u8; 32 * 1024];
-    loop {
-        let n = stdin.read(&mut buf).await.context("reading stdin")?;
-        if n == 0 {
-            break;
-        }
-        send.send_data(Bytes::from(quish_proto::encode(&ChannelMessage::Data(
-            buf[..n].to_vec(),
-        ))?))
-        .await
-        .context("sending upload data")?;
-    }
-    send.finish().await.context("finishing upload send")?;
-
-    // read the terminal ExitStatus
-    let mut reader = ChannelFrameReader::new(recv);
-    let mut code = 0;
-    while let Some(msg) = reader.next().await? {
-        if let ChannelMessage::ExitStatus(c) = msg {
-            code = c;
-            break;
-        }
-    }
-    Ok(code)
 }
 
 /// Build the Extended CONNECT request every channel opens with. `:protocol` must
