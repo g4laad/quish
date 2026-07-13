@@ -652,7 +652,8 @@ fn download_streams_user_readable_file_privsep() {
     let user = test_user();
     let pw = test_password();
     let server = PrivsepServer::start();
-    let target = format!("{user}@{}", server.addr);
+    let ip = server.addr.ip();
+    let port = server.addr.port().to_string();
 
     let contents = "quish-download-ok-marker\n";
     let path = std::env::temp_dir().join(format!("quish-dl-user-{}.txt", std::process::id()));
@@ -661,17 +662,28 @@ fn download_streams_user_readable_file_privsep() {
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
         .expect("chmod download file");
 
+    let dst_dir = fresh_temp_dir("quish-dl-dst");
     let out = run_client(
         &server,
-        &[&target, "--download", path.to_str().unwrap()],
+        &[
+            "cp",
+            "-P",
+            &port,
+            &format!("{user}@{ip}:{}", path.to_str().unwrap()),
+            &format!("{}/", dst_dir.to_str().unwrap()),
+        ],
         Some(&pw),
     );
+    let landed = dst_dir.join(path.file_name().unwrap());
+    let got = std::fs::read_to_string(&landed).ok();
     let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_dir_all(&dst_dir);
 
     assert!(out.status.success(), "download failed: {out:?}");
-    assert!(
-        String::from_utf8_lossy(&out.stdout).contains(contents.trim()),
-        "download did not stream file contents: {out:?}"
+    assert_eq!(
+        got.as_deref(),
+        Some(contents),
+        "download did not write file contents: {out:?}"
     );
 }
 
@@ -686,53 +698,59 @@ fn download_refuses_root_only_file_privsep() {
     let user = test_user();
     let pw = test_password();
     let server = PrivsepServer::start();
-    let target = format!("{user}@{}", server.addr);
+    let ip = server.addr.ip();
+    let port = server.addr.port().to_string();
 
     let secret = "root-only-secret-should-not-leak\n";
     let path = std::env::temp_dir().join(format!("quish-dl-root-{}.txt", std::process::id()));
     std::fs::write(&path, secret).expect("write root-only file"); // created as root
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).expect("chmod 000");
 
+    let dst_dir = fresh_temp_dir("quish-dl-root-dst");
     let out = run_client(
         &server,
-        &[&target, "--download", path.to_str().unwrap()],
+        &[
+            "cp",
+            "-P",
+            &port,
+            &format!("{user}@{ip}:{}", path.to_str().unwrap()),
+            &format!("{}/", dst_dir.to_str().unwrap()),
+        ],
         Some(&pw),
     );
     // Restore perms so cleanup can remove the file.
     let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
     let _ = std::fs::remove_file(&path);
 
+    // The secret must appear in no downloaded file, and no temp part may linger.
+    let mut leaked = false;
+    let mut part_leftover = false;
+    for entry in std::fs::read_dir(&dst_dir).unwrap() {
+        let entry = entry.unwrap();
+        if entry
+            .file_name()
+            .to_string_lossy()
+            .contains("quish-part")
+        {
+            part_leftover = true;
+        }
+        if let Ok(body) = std::fs::read_to_string(entry.path())
+            && body.contains(secret.trim())
+        {
+            leaked = true;
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dst_dir);
+
     assert!(
         !out.status.success(),
         "download of a root-only file succeeded — open() ran as root, not the user: {out:?}"
     );
     assert!(
-        !String::from_utf8_lossy(&out.stdout).contains(secret.trim()),
-        "root-only file contents leaked despite refusal: {out:?}"
+        !leaked,
+        "root-only file contents leaked into the destination: {out:?}"
     );
-}
-
-/// Run the real client with piped stdin (for --upload), write `stdin`, and
-/// collect output. `run_client`'s `.output()` closes stdin immediately.
-fn run_client_stdin(server: &PrivsepServer, args: &[&str], password: &str, stdin: &[u8]) -> Output {
-    let quish = quish_client();
-    let home = server.client_home();
-    let mut child = Command::new(&quish)
-        .args(args)
-        .env("HOME", &home)
-        .env("QUISH_PASSWORD", password)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn quish client");
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(stdin)
-        .expect("write client stdin");
-    child.wait_with_output().expect("wait client")
+    assert!(!part_leftover, ".quish-part temp left behind: {out:?}");
 }
 
 #[test]
@@ -745,7 +763,8 @@ fn upload_writes_user_writable_file_privsep() {
     let user = test_user();
     let pw = test_password();
     let server = PrivsepServer::start();
-    let target = format!("{user}@{}", server.addr);
+    let ip = server.addr.ip();
+    let port = server.addr.port().to_string();
 
     let dir = std::env::temp_dir().join(format!("quish-ul-user-{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("create upload dir");
@@ -753,12 +772,20 @@ fn upload_writes_user_writable_file_privsep() {
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).expect("chmod dir 777");
     let dest = dir.join("uploaded.txt");
 
+    let src = fresh_temp_dir("quish-ul-src").join("source.txt");
     let body = b"quish-upload-privsep-marker\n";
-    let out = run_client_stdin(
+    std::fs::write(&src, body).expect("write source");
+
+    let out = run_client(
         &server,
-        &[&target, "--upload", dest.to_str().unwrap()],
-        &pw,
-        body,
+        &[
+            "cp",
+            "-P",
+            &port,
+            src.to_str().unwrap(),
+            &format!("{user}@{ip}:{}", dest.to_str().unwrap()),
+        ],
+        Some(&pw),
     );
 
     let contents = std::fs::read(&dest).ok();
@@ -786,18 +813,27 @@ fn upload_refuses_root_only_dir_privsep() {
     let user = test_user();
     let pw = test_password();
     let server = PrivsepServer::start();
-    let target = format!("{user}@{}", server.addr);
+    let ip = server.addr.ip();
+    let port = server.addr.port().to_string();
 
     let dir = std::env::temp_dir().join(format!("quish-ul-root-{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("create root-only dir"); // created as root
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).expect("chmod dir 700");
     let dest = dir.join("should-not-be-created.txt");
 
-    let out = run_client_stdin(
+    let src = fresh_temp_dir("quish-ul-root-src").join("source.txt");
+    std::fs::write(&src, b"must-not-land\n").expect("write source");
+
+    let out = run_client(
         &server,
-        &[&target, "--upload", dest.to_str().unwrap()],
-        &pw,
-        b"must-not-land\n",
+        &[
+            "cp",
+            "-P",
+            &port,
+            src.to_str().unwrap(),
+            &format!("{user}@{ip}:{}", dest.to_str().unwrap()),
+        ],
+        Some(&pw),
     );
 
     let created = dest.exists();
@@ -813,5 +849,155 @@ fn upload_refuses_root_only_dir_privsep() {
     assert!(
         !created,
         "target file was created despite the user lacking write on the dir: {out:?}"
+    );
+}
+
+#[test]
+#[ignore]
+fn cp_uploads_directory_recursively_privsep() {
+    // Identity-boundary proof for MkDir: a recursive folder upload into a
+    // world-writable dir must create every remote directory AND file as the
+    // login user (mkdir/open ran AS the user, not root/worker).
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let user = test_user();
+    let pw = test_password();
+    let server = PrivsepServer::start();
+    let ip = server.addr.ip();
+    let port = server.addr.port().to_string();
+
+    let dst = std::env::temp_dir().join(format!("quish-tree-dst-{}", std::process::id()));
+    std::fs::create_dir_all(&dst).expect("create dst dir");
+    std::fs::set_permissions(&dst, std::fs::Permissions::from_mode(0o777)).expect("chmod 777");
+
+    let base = fresh_temp_dir("quish-tree-src");
+    let src = base.join("src");
+    std::fs::create_dir_all(src.join("sub")).unwrap();
+    std::fs::write(src.join("a.txt"), b"alpha").unwrap();
+    std::fs::write(src.join("sub/b.txt"), b"bravo").unwrap();
+
+    let out = run_client(
+        &server,
+        &[
+            "cp",
+            "-P",
+            &port,
+            src.to_str().unwrap(),
+            &format!("{user}@{ip}:{}/", dst.to_str().unwrap()),
+        ],
+        Some(&pw),
+    );
+
+    let root = dst.join("src");
+    let a = std::fs::read(root.join("a.txt")).ok();
+    let b = std::fs::read(root.join("sub/b.txt")).ok();
+    let dir_uid = std::fs::metadata(&root).ok().map(|m| m.uid());
+    let sub_uid = std::fs::metadata(root.join("sub")).ok().map(|m| m.uid());
+    let file_uid = std::fs::metadata(root.join("a.txt")).ok().map(|m| m.uid());
+    let _ = std::fs::remove_dir_all(&dst);
+    let _ = std::fs::remove_dir_all(&base);
+
+    assert!(out.status.success(), "tree upload failed: {out:?}");
+    assert_eq!(a.as_deref(), Some(&b"alpha"[..]), "a.txt contents differ: {out:?}");
+    assert_eq!(b.as_deref(), Some(&b"bravo"[..]), "b.txt contents differ: {out:?}");
+    assert_ne!(dir_uid, Some(0), "remote root dir created as root: {out:?}");
+    assert_ne!(sub_uid, Some(0), "remote sub dir created as root: {out:?}");
+    assert_ne!(file_uid, Some(0), "uploaded file created as root: {out:?}");
+}
+
+#[test]
+#[ignore]
+fn cp_mkdir_refused_in_root_only_dir_privsep() {
+    // Identity-boundary proof for MkDir: a root-owned, mode-0700 dir. Root COULD
+    // mkdir inside it; the login user CANNOT. If the folder upload succeeds or
+    // the remote dir gets created, mkdir() ran as root (or the worker), not the
+    // authed user — the exact regression this helper mode must never have.
+    use std::os::unix::fs::PermissionsExt;
+    let user = test_user();
+    let pw = test_password();
+    let server = PrivsepServer::start();
+    let ip = server.addr.ip();
+    let port = server.addr.port().to_string();
+
+    let dir = std::env::temp_dir().join(format!("quish-mkdir-root-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("create root-only dir"); // created as root
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).expect("chmod dir 700");
+
+    let base = fresh_temp_dir("quish-mkdir-src");
+    let src = base.join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("a.txt"), b"nope").unwrap();
+
+    let out = run_client(
+        &server,
+        &[
+            "cp",
+            "-P",
+            &port,
+            src.to_str().unwrap(),
+            &format!("{user}@{ip}:{}/", dir.to_str().unwrap()),
+        ],
+        Some(&pw),
+    );
+
+    let created = dir.join("src").exists();
+    // Restore/loosen perms so cleanup can remove the tree.
+    let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755));
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&base);
+
+    assert!(
+        !out.status.success(),
+        "folder upload into a root-only dir succeeded — mkdir ran as root, not the user: {out:?}"
+    );
+    assert!(
+        !created,
+        "remote dir was created despite the user lacking write on the parent: {out:?}"
+    );
+}
+
+#[test]
+#[ignore]
+fn cp_download_relative_path_resolves_to_home_privsep() {
+    // Proves the chdir-to-home fix: a RELATIVE remote path resolves against the
+    // login user's home dir (like scp/sftp), not the daemon's cwd.
+    use std::os::unix::fs::{PermissionsExt, chown};
+    let user = test_user();
+    let pw = test_password();
+    let server = PrivsepServer::start();
+    let ip = server.addr.ip();
+    let port = server.addr.port().to_string();
+
+    let u = nix::unistd::User::from_name(&user)
+        .expect("getpwnam")
+        .expect("login user exists");
+    let marker = "quish-relative-home-marker\n";
+    let rel_name = "quish-rel-test.txt";
+    let path = u.dir.join(rel_name);
+    std::fs::write(&path, marker).expect("write home file");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+    chown(&path, Some(u.uid.as_raw()), Some(u.gid.as_raw())).expect("chown to login user");
+
+    let dst_dir = fresh_temp_dir("quish-rel-dst");
+    let out = run_client(
+        &server,
+        &[
+            "cp",
+            "-P",
+            &port,
+            &format!("{user}@{ip}:{rel_name}"),
+            &format!("{}/", dst_dir.to_str().unwrap()),
+        ],
+        Some(&pw),
+    );
+    let landed = dst_dir.join(rel_name);
+    let got = std::fs::read_to_string(&landed).ok();
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_dir_all(&dst_dir);
+
+    assert!(out.status.success(), "relative-path download failed: {out:?}");
+    assert_eq!(
+        got.as_deref(),
+        Some(marker),
+        "relative remote path did not resolve to the user's home: {out:?}"
     );
 }
