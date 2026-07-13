@@ -63,6 +63,9 @@ pub fn run_session_helper() -> Result<()> {
     if let Ok(path) = std::env::var(ipc::ENV_SESS_TRANSFER_WRITE_PATH) {
         return run_transfer_write_helper(path);
     }
+    if let Ok(path) = std::env::var(ipc::ENV_SESS_MKDIR_PATH) {
+        return run_mkdir_helper(path);
+    }
     let uid = Uid::from_raw(ipc::env_u32(ipc::ENV_SESS_UID)?);
     let gid = Gid::from_raw(ipc::env_u32(ipc::ENV_SESS_GID)?);
     let user = ipc::env(ipc::ENV_SESS_USER)?;
@@ -149,6 +152,9 @@ fn run_transfer_helper(path: String) -> Result<()> {
     initgroups(&cuser, gid).context("initgroups")?;
     setgid(gid).context("setgid")?;
     setuid(uid).context("setuid")?;
+    if let Ok(home) = ipc::env(ipc::ENV_SESS_HOME) {
+        let _ = chdir(home.as_str());
+    }
 
     // O_NONBLOCK so opening a FIFO/device/socket can't hang the helper; it is a
     // no-op on regular files. We fstat the opened fd and serve ONLY regular
@@ -187,6 +193,9 @@ fn run_transfer_write_helper(path: String) -> Result<()> {
     initgroups(&cuser, gid).context("initgroups")?;
     setgid(gid).context("setgid")?;
     setuid(uid).context("setuid")?;
+    if let Ok(home) = ipc::env(ipc::ENV_SESS_HOME) {
+        let _ = chdir(home.as_str());
+    }
 
     // O_NONBLOCK so opening an existing FIFO/device can't hang; no-op on a
     // regular file. fstat and refuse anything but a regular file.
@@ -207,4 +216,37 @@ fn run_transfer_write_helper(path: String) -> Result<()> {
     std::io::copy(&mut stdin, &mut file).context("copy stdin to file")?;
     file.flush().context("flush file")?;
     Ok(())
+}
+
+/// Mkdir-channel entry: drop to the target user, then create `path` (one
+/// level; the client creates parents first). The credential drop happens
+/// BEFORE mkdir() — identical ordering to the other helper modes — so the
+/// kernel enforces the *user's* permissions. An existing directory at `path`
+/// is success (idempotent re-upload); anything else is a nonzero exit.
+fn run_mkdir_helper(path: String) -> Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    let uid = Uid::from_raw(ipc::env_u32(ipc::ENV_SESS_UID)?);
+    let gid = Gid::from_raw(ipc::env_u32(ipc::ENV_SESS_GID)?);
+    let user = ipc::env(ipc::ENV_SESS_USER)?;
+    let mode = ipc::env_u32(ipc::ENV_SESS_TRANSFER_MODE)?;
+
+    // Identity boundary (reuse the shell/exec/transfer ordering verbatim).
+    let cuser = CString::new(user).context("user cstring")?;
+    initgroups(&cuser, gid).context("initgroups")?;
+    setgid(gid).context("setgid")?;
+    setuid(uid).context("setuid")?;
+    if let Ok(home) = ipc::env(ipc::ENV_SESS_HOME) {
+        let _ = chdir(home.as_str());
+    }
+
+    match std::fs::DirBuilder::new().mode(mode).create(&path) {
+        Ok(()) => Ok(()),
+        Err(e)
+            if e.kind() == std::io::ErrorKind::AlreadyExists
+                && std::fs::metadata(&path).map(|m| m.is_dir()).unwrap_or(false) =>
+        {
+            Ok(())
+        }
+        Err(e) => Err(e).with_context(|| format!("mkdir {path}")),
+    }
 }
