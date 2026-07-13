@@ -81,6 +81,13 @@ pub fn run() -> Result<()> {
         crate::privdrop::drop_to_worker(&chroot_dir, &worker_user)?;
         info!(user = %worker_user, "worker privilege-dropped");
 
+        // Cap the worker's blast radius: an exploit in the untrusted QUIC/TLS/H3
+        // parsing can now only call the syscalls the worker legitimately makes.
+        // Audit mode for now (logs, blocks nothing) — enforcement is wired in a
+        // later step once the allowlist is proven complete.
+        crate::privdrop::install_seccomp(false)?;
+        info!("seccomp filter installed (audit mode)");
+
         // TLS with the signing proxy (host key stays in the monitor).
         let proxy = ProxySigningKey::new(sign_stream, scheme);
         let certified = Arc::new(CertifiedKey::new(vec![cert_der], Arc::new(proxy)));

@@ -10,6 +10,7 @@ use std::os::unix::fs::OpenOptionsExt;
 
 use anyhow::{Context, Result, bail};
 use nix::unistd::{Gid, Uid, User, chdir, chroot, execve, initgroups, setgid, setgroups, setuid};
+use seccompiler::{BpfProgram, SeccompAction, SeccompFilter, SeccompRule};
 
 use crate::ipc;
 
@@ -48,6 +49,133 @@ pub fn drop_to_worker(chroot_dir: &str, username: &str) -> Result<()> {
     if setuid(Uid::from_raw(0)).is_ok() {
         bail!("worker could still regain root — aborting");
     }
+    Ok(())
+}
+
+/// Syscall allowlist for the seccomp-bpf filter installed on the worker right
+/// after [`drop_to_worker`]. Derived by running the worker under `strace -ff`
+/// across every channel type (shell, exec, `-L` forward, `quish cp`
+/// upload/download, mkdir) and both auth methods (PAM password + signed-token
+/// pubkey), taking the union over the worker process and all its
+/// `spawn_blocking` threads, counting only syscalls made AFTER the filter
+/// installs (so privileged setup like `chroot`/`setuid`/`prctl` is excluded).
+/// See `plans/021-worker-seccomp-sandbox.md` "Decision record" for the exact
+/// observed set. x86-64 only — the aarch64 numbers are untested.
+///
+/// Entries are the observed syscalls plus a small margin of same-family
+/// siblings (batched/vectored I/O, `clone`/`exit_group`, `rt_sigreturn`,
+/// vDSO-fallback time calls) that glibc/tokio/quinn use interchangeably across
+/// kernel/libc versions and load — the failure mode (SIGKILL in the field) is
+/// catastrophic while the security delta versus the observed call is nil. The
+/// list still EXCLUDES the dangerous majority (`openat`, `execve`, `ptrace`,
+/// `io_uring_*`, `bpf`, `keyctl`, mount/kexec, `process_vm_*`, …): a
+/// memory-corruption exploit in the worker is capped to what the worker
+/// already does.
+///
+/// The TCP syscalls (`socket`/`connect`/`getsock*`/`setsock*`/`getpeername`)
+/// are included unconditionally rather than gated behind `allow_forward`, to
+/// avoid a second fragile allowlist matrix; at syscall-number granularity a
+/// `socket()` here can do nothing a forward channel couldn't already, and
+/// quinn's GSO/GRO probing in `Endpoint::new` needs `socket`/`bind` regardless.
+const WORKER_SYSCALLS: &[libc::c_long] = &[
+    // Datagram/stream socket I/O: QUIC UDP, the control/signing seqpackets
+    // (SCM_RIGHTS rides recvmsg/sendmsg), and TCP-forward payload.
+    libc::SYS_recvmsg,
+    libc::SYS_sendmsg,
+    libc::SYS_recvmmsg,
+    libc::SYS_sendmmsg,
+    libc::SYS_recvfrom,
+    libc::SYS_sendto,
+    libc::SYS_read,
+    libc::SYS_write,
+    libc::SYS_readv,
+    libc::SYS_writev,
+    libc::SYS_close,
+    // Socket management: QUIC socket + quinn GSO/GRO probes, TCP forward.
+    libc::SYS_socket,
+    libc::SYS_bind,
+    libc::SYS_connect,
+    libc::SYS_getsockname,
+    libc::SYS_getpeername,
+    libc::SYS_getsockopt,
+    libc::SYS_setsockopt,
+    // PTY window-size (TIOCSWINSZ) + terminal probes (TCGETS).
+    libc::SYS_ioctl,
+    // tokio reactor: epoll + eventfd wakeups + futex.
+    libc::SYS_epoll_create1,
+    libc::SYS_epoll_ctl,
+    libc::SYS_epoll_wait,
+    libc::SYS_epoll_pwait,
+    libc::SYS_eventfd2,
+    libc::SYS_futex,
+    // Time + sleeps (mostly vDSO; listed for the rare real-syscall fallback).
+    libc::SYS_clock_gettime,
+    libc::SYS_gettimeofday,
+    libc::SYS_clock_nanosleep,
+    libc::SYS_nanosleep,
+    // Randomness (rustls / getrandom).
+    libc::SYS_getrandom,
+    // Memory management (allocator, thread stacks, mmap'd regions).
+    libc::SYS_mmap,
+    libc::SYS_munmap,
+    libc::SYS_mremap,
+    libc::SYS_mprotect,
+    libc::SYS_madvise,
+    libc::SYS_brk,
+    // Signals (delivery + return; tokio installs a SIGRT handler).
+    libc::SYS_rt_sigaction,
+    libc::SYS_rt_sigprocmask,
+    libc::SYS_rt_sigreturn,
+    libc::SYS_sigaltstack,
+    // Scheduling + identity.
+    libc::SYS_sched_yield,
+    libc::SYS_sched_getaffinity,
+    libc::SYS_getpid,
+    libc::SYS_gettid,
+    libc::SYS_uname,
+    // Thread lifecycle for `spawn_blocking` fd pumps + glibc thread setup.
+    libc::SYS_clone,
+    libc::SYS_clone3,
+    libc::SYS_set_robust_list,
+    libc::SYS_set_tid_address,
+    libc::SYS_rseq,
+    // fd flags/options.
+    libc::SYS_fcntl,
+    // Exit.
+    libc::SYS_exit,
+    libc::SYS_exit_group,
+];
+
+/// Install the worker's seccomp-bpf syscall allowlist ([`WORKER_SYSCALLS`]).
+///
+/// When `enforce` is true, a syscall outside the allowlist kills the whole
+/// process (`SECCOMP_RET_KILL_PROCESS`) — the loudest, safest response to an
+/// exploit in the worker's untrusted parsing. When false (audit mode), the
+/// syscall is allowed but logged (`SECCOMP_RET_LOG`) so the allowlist can be
+/// derived/checked against observed behavior without breaking the worker.
+///
+/// Applied with `SECCOMP_FILTER_FLAG_TSYNC` so every existing thread is covered
+/// atomically; threads spawned afterward inherit the filter via `clone`. Must be
+/// called only in the worker, only after [`drop_to_worker`] (privilege is
+/// already dropped and `no_new_privs` is set, which is what lets an
+/// unprivileged process install a filter). No `unsafe` in our code — the raw
+/// `seccomp(2)` call lives inside the `seccompiler` crate.
+pub fn install_seccomp(enforce: bool) -> Result<()> {
+    let default_action = if enforce {
+        SeccompAction::KillProcess
+    } else {
+        SeccompAction::Log
+    };
+    // Empty rule chain per syscall = allow it unconditionally (match_action).
+    let rules: std::collections::BTreeMap<i64, Vec<SeccompRule>> =
+        WORKER_SYSCALLS.iter().map(|&nr| (nr, Vec::new())).collect();
+    let arch = std::env::consts::ARCH
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("no seccomp arch mapping for {}", std::env::consts::ARCH))?;
+    let filter = SeccompFilter::new(rules, default_action, SeccompAction::Allow, arch)
+        .context("building seccomp filter")?;
+    let program: BpfProgram = filter.try_into().context("compiling seccomp filter")?;
+    seccompiler::apply_filter_all_threads(&program).context("installing seccomp filter")?;
     Ok(())
 }
 
