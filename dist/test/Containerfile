@@ -4,7 +4,7 @@ FROM docker.io/library/rust:1-bookworm
 
 # PAM: build deps (bindgen needs libclang + libpam headers) and the runtime lib.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        clang libclang-dev libpam0g-dev libpam0g procps && \
+        clang libclang-dev libpam0g-dev libpam0g procps openssh-client && \
     rm -rf /var/lib/apt/lists/*
 
 # The unprivileged worker account (mirrors dist/sysusers.d/quishd.conf) …
@@ -13,6 +13,9 @@ RUN useradd --system --home-dir /nonexistent --shell /usr/sbin/nologin quish && 
     # credential for this throwaway container only — never a real secret.
     useradd --create-home --shell /bin/bash quishtest && \
     echo 'quishtest:quishtestpw' | chpasswd && \
+    # Root login credential for the root-usability scenarios (plan 020). TEST
+    # credential for this throwaway container only — never a real secret.
+    echo 'root:quishroottestpw' | chpasswd && \
     # Chroot root for the worker (root-owned, empty).
     mkdir -p /run/quishd && chown root:root /run/quishd
 
@@ -25,6 +28,7 @@ COPY . .
 # Login user + password the Rust harness authenticates as (read from env there).
 ENV QUISH_TEST_USER=quishtest
 ENV QUISH_TEST_PASSWORD=quishtestpw
+ENV QUISH_TEST_ROOT_PASSWORD=quishroottestpw
 # PAM bindgen hints (see AGENTS.md) are NOT needed here: apt installed real
 # clang + libclang-dev + libpam headers, so bindgen finds everything.
 
