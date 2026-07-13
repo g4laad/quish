@@ -225,6 +225,20 @@ impl MonitorClient {
         }
     }
 
+    async fn spawn_mkdir(&self, conn_id: u64, path: &str, mode: u32) -> Result<(u64, OwnedFd)> {
+        let (resp, mut fds) = self
+            .call(&Request::SpawnMkdir {
+                conn_id,
+                path: path.to_string(),
+                mode,
+            })
+            .await?;
+        match resp {
+            Response::Spawned { session_id } if fds.len() == 1 => Ok((session_id, fds.remove(0))),
+            _ => bail!("monitor refused mkdir"),
+        }
+    }
+
     async fn reap(&self, session_id: u64) -> i32 {
         match self.call(&Request::Reap { session_id }).await {
             Ok((Response::Exited(code), _)) => code,
@@ -304,6 +318,16 @@ pub async fn serve_channel(
             info!(%conn_id, "writefile channel");
             let (session_id, wr, rd) = client.spawn_transfer_write(conn_id, &path, mode).await?;
             run_transfer_write(client, session_id, wr, rd, send, reader).await
+        }
+        ChannelOpen::MkDir { path, mode } => {
+            if !spawn_arg_ok(path.len()) {
+                warn!(%conn_id, len = path.len(), "rejecting over-length mkdir path");
+                return Ok(());
+            }
+            // As with Read/WriteFile: never log or resolve the path here.
+            info!(%conn_id, "mkdir channel");
+            let (session_id, out) = client.spawn_mkdir(conn_id, &path, mode).await?;
+            run_transfer(client, session_id, out, send).await
         }
     }
 }
