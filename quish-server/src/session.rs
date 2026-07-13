@@ -56,6 +56,10 @@ pub async fn serve(stream: FullStream, allow_forward: bool) -> Result<()> {
             info!("writefile channel");
             transfer_write(send, reader, path, mode).await
         }
+        ChannelOpen::MkDir { path, mode } => {
+            info!("mkdir channel");
+            mkdir(send, path, mode).await
+        }
     }
 }
 
@@ -133,6 +137,26 @@ async fn transfer_write(
     let code = match writer.join() {
         Ok(Ok(())) => 0,
         _ => 1,
+    };
+    send_msg(&mut send, &ChannelMessage::ExitStatus(code)).await?;
+    send.finish().await.map_err(Into::into)
+}
+
+/// Dev-mode mkdir: create `path` with `mode` (an existing directory is
+/// success), then send the terminal `ExitStatus`. Dev mode is a single
+/// process with no privilege drop — the privsep helper (privdrop.rs)
+/// enforces the real per-user identity boundary.
+async fn mkdir(mut send: SendHalf, path: String, mode: u32) -> Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    let code = match std::fs::DirBuilder::new().mode(mode).create(&path) {
+        Ok(()) => 0,
+        Err(e)
+            if e.kind() == std::io::ErrorKind::AlreadyExists
+                && std::fs::metadata(&path).map(|m| m.is_dir()).unwrap_or(false) =>
+        {
+            0
+        }
+        Err(_) => 1,
     };
     send_msg(&mut send, &ChannelMessage::ExitStatus(code)).await?;
     send.finish().await.map_err(Into::into)
