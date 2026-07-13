@@ -161,68 +161,156 @@ fn run_client(server: &DevServer, args: &[&str], password: Option<&str>) -> Outp
     cmd.output().expect("spawn quish client")
 }
 
-/// Like `run_client` but pipes `stdin` into the client (for --upload).
-fn run_client_stdin(
-    server: &DevServer,
-    args: &[&str],
-    password: Option<&str>,
-    stdin: &[u8],
-) -> Output {
-    let quishd = PathBuf::from(env!("CARGO_BIN_EXE_quishd"));
-    let quish = quishd.with_file_name("quish");
-    if !quish.exists() {
-        panic!(
-            "quish client binary not found at {}; run `cargo build --workspace` first",
-            quish.display()
-        );
-    }
-
-    let home = fresh_temp_dir("quish-client-home");
-    let kh_dir = home.join(".config/quish");
-    std::fs::create_dir_all(&kh_dir).unwrap();
-    std::fs::write(
-        kh_dir.join("known_hosts"),
-        format!("{} {}\n", server.addr, server.fingerprint),
-    )
-    .unwrap();
-    let mut cmd = Command::new(&quish);
-    cmd.args(args).env("HOME", &home);
-    if let Some(p) = password {
-        cmd.env("QUISH_PASSWORD", p);
-    }
-    let mut child = cmd
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn quish client");
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(stdin)
-        .expect("write client stdin");
-    child.wait_with_output().expect("wait client")
-}
-
 #[test]
 #[ignore]
 fn upload_writes_file() {
     let server = DevServer::start("testuser");
-    let target = format!("testuser@{}", server.addr);
+    let ip = server.addr.ip();
+    let port = server.addr.port().to_string();
     let dir = fresh_temp_dir("quish-upload");
+    let src = dir.join("source.txt");
     let dest = dir.join("uploaded.txt");
     let body = b"quish-upload-smoke-marker\n";
-    let out = run_client_stdin(
+    std::fs::write(&src, body).unwrap();
+    let out = run_client(
         &server,
-        &[&target, "--upload", dest.to_str().unwrap()],
+        &[
+            "cp",
+            "-P",
+            &port,
+            src.to_str().unwrap(),
+            &format!("testuser@{ip}:{}", dest.to_str().unwrap()),
+        ],
         Some("anything"),
-        body,
     );
     assert!(out.status.success(), "upload failed: {out:?}");
     assert_eq!(std::fs::read(&dest).unwrap(), body);
-    let _ = std::fs::remove_file(&dest);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+#[ignore]
+fn cp_download_writes_into_directory() {
+    let server = DevServer::start("testuser");
+    let ip = server.addr.ip();
+    let port = server.addr.port().to_string();
+    let src_dir = fresh_temp_dir("quish-dl-src");
+    let src = src_dir.join("os-release");
+    let marker = b"quish-download-marker\n";
+    std::fs::write(&src, marker).unwrap();
+    let dst_dir = fresh_temp_dir("quish-dl-dst");
+    let out = run_client(
+        &server,
+        &[
+            "cp",
+            "-P",
+            &port,
+            &format!("testuser@{ip}:{}", src.to_str().unwrap()),
+            &format!("{}/", dst_dir.to_str().unwrap()),
+        ],
+        Some("anything"),
+    );
+    assert!(out.status.success(), "download failed: {out:?}");
+    let landed = dst_dir.join("os-release");
+    assert_eq!(std::fs::read(&landed).unwrap(), marker);
+    let leftover: Vec<_> = std::fs::read_dir(&dst_dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| n.contains("quish-part"))
+        .collect();
+    assert!(leftover.is_empty(), "temp part left behind: {leftover:?}");
+    let _ = std::fs::remove_dir_all(&src_dir);
+    let _ = std::fs::remove_dir_all(&dst_dir);
+}
+
+#[test]
+#[ignore]
+fn cp_download_missing_file_fails_cleanly() {
+    let server = DevServer::start("testuser");
+    let ip = server.addr.ip();
+    let port = server.addr.port().to_string();
+    let dst_dir = fresh_temp_dir("quish-dl-missing");
+    let out = run_client(
+        &server,
+        &[
+            "cp",
+            "-P",
+            &port,
+            &format!("testuser@{ip}:/nonexistent/quish-does-not-exist-xyz"),
+            &format!("{}/", dst_dir.to_str().unwrap()),
+        ],
+        Some("anything"),
+    );
+    assert!(!out.status.success(), "expected nonzero exit: {out:?}");
+    let entries: Vec<_> = std::fs::read_dir(&dst_dir).unwrap().collect();
+    assert!(entries.is_empty(), "dest dir should be empty: {entries:?}");
+    let _ = std::fs::remove_dir_all(&dst_dir);
+}
+
+#[test]
+#[ignore]
+fn cp_uploads_directory_recursively() {
+    use std::os::unix::fs::PermissionsExt;
+    let server = DevServer::start("testuser");
+    let ip = server.addr.ip();
+    let port = server.addr.port().to_string();
+    let base = fresh_temp_dir("quish-tree");
+    let src = base.join("src");
+    std::fs::create_dir_all(src.join("sub")).unwrap();
+    std::fs::create_dir_all(src.join("empty")).unwrap();
+    std::fs::write(src.join("a.txt"), b"alpha").unwrap();
+    std::fs::write(src.join("sub/b.txt"), b"bravo").unwrap();
+    std::fs::set_permissions(src.join("a.txt"), std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let dst = base.join("dst");
+    std::fs::create_dir_all(&dst).unwrap();
+    let out = run_client(
+        &server,
+        &[
+            "cp",
+            "-P",
+            &port,
+            src.to_str().unwrap(),
+            &format!("testuser@{ip}:{}/", dst.to_str().unwrap()),
+        ],
+        Some("anything"),
+    );
+    assert!(out.status.success(), "tree upload failed: {out:?}");
+    let root = dst.join("src");
+    assert_eq!(std::fs::read(root.join("a.txt")).unwrap(), b"alpha");
+    assert_eq!(std::fs::read(root.join("sub/b.txt")).unwrap(), b"bravo");
+    assert!(root.join("empty").is_dir(), "empty dir not created");
+    let mode = std::fs::metadata(root.join("a.txt"))
+        .unwrap()
+        .permissions()
+        .mode();
+    assert!(mode & 0o100 != 0, "exec bit not propagated: {mode:o}");
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+#[ignore]
+fn cp_rejects_two_remote_or_two_local() {
+    let quishd = PathBuf::from(env!("CARGO_BIN_EXE_quishd"));
+    let quish = quishd.with_file_name("quish");
+    let both_local = Command::new(&quish)
+        .args(["cp", "-P", "1", "a", "b"])
+        .env("HOME", fresh_temp_dir("quish-cp-reject-ll"))
+        .output()
+        .expect("spawn quish client");
+    assert!(
+        !both_local.status.success(),
+        "both-local should fail: {both_local:?}"
+    );
+    let both_remote = Command::new(&quish)
+        .args(["cp", "-P", "1", "h1:/x", "h2:/y"])
+        .env("HOME", fresh_temp_dir("quish-cp-reject-rr"))
+        .output()
+        .expect("spawn quish client");
+    assert!(
+        !both_remote.status.success(),
+        "both-remote should fail: {both_remote:?}"
+    );
 }
 
 #[test]
