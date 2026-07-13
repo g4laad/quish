@@ -61,6 +61,11 @@ pub const ENV_SESS_TRANSFER_WRITE_PATH: &str = "QUISH_SESS_TRANSFER_WRITE_PATH";
 /// The creation mode (decimal string of a u32) for an upload. Read only when
 /// `ENV_SESS_TRANSFER_WRITE_PATH` is set.
 pub const ENV_SESS_TRANSFER_MODE: &str = "QUISH_SESS_TRANSFER_MODE";
+/// Present (= directory path) only for MKDIR transfer channels: the helper
+/// mkdir()s this path AFTER dropping to the target user (mode from
+/// `ENV_SESS_TRANSFER_MODE`; an existing directory is success). Never set
+/// together with the other `ENV_SESS_TRANSFER_*` path vars.
+pub const ENV_SESS_MKDIR_PATH: &str = "QUISH_SESS_MKDIR_PATH";
 
 /// Read a required handoff env var (set by the monitor on the worker/session
 /// re-exec), or an error naming it.
@@ -111,6 +116,15 @@ pub enum Request {
     /// response passes the helper's stdin WRITE fd (SCM_RIGHTS); the worker pumps
     /// client bytes into it. The worker never resolves or opens the path.
     SpawnTransferWrite {
+        conn_id: u64,
+        path: String,
+        mode: u32,
+    },
+    /// Create a directory for `conn_id`'s authed user: the session helper drops
+    /// to the user, then mkdir()s the path (response passes the helper's stdout
+    /// read fd, used only to observe exit before reaping). The worker never
+    /// resolves the path.
+    SpawnMkdir {
         conn_id: u64,
         path: String,
         mode: u32,
