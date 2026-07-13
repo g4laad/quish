@@ -65,6 +65,11 @@ fn test_password() -> String {
     std::env::var("QUISH_TEST_PASSWORD")
         .expect("QUISH_TEST_PASSWORD must be set (see Containerfile)")
 }
+/// Root's password in the test container (see Containerfile, plan 020).
+fn root_password() -> String {
+    std::env::var("QUISH_TEST_ROOT_PASSWORD")
+        .expect("QUISH_TEST_ROOT_PASSWORD must be set (see Containerfile)")
+}
 
 /// A running privsep `quishd` (root monitor + chrooted worker), killed on drop
 /// so no daemon leaks if a test panics.
@@ -1006,5 +1011,194 @@ fn cp_download_relative_path_resolves_to_home_privsep() {
         got.as_deref(),
         Some(marker),
         "relative remote path did not resolve to the user's home: {out:?}"
+    );
+}
+
+#[test]
+#[ignore]
+fn exec_runs_command_as_root_privsep() {
+    // Invariant: root is a first-class login. The session/transfer helpers must
+    // NOT grow a root refusal — the worker's root checks in `drop_to_worker`
+    // (`user.uid.is_root()` bail + the `setuid(from_raw(0))` regain probe) are
+    // WORKER-ONLY. A failure here means a refactor copied one of those into the
+    // session path, silently breaking every root login.
+    let pw = root_password();
+    let server = PrivsepServer::start();
+    let target = format!("root@{}", server.addr);
+
+    let out = run_client(&server, &[&target, "id", "-u"], Some(&pw));
+
+    assert!(out.status.success(), "client failed: {out:?}");
+    // Exact trim, NOT `contains("0")` — that would pass for any uid ending in 0.
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "0",
+        "exec as root did not run as uid 0: {out:?}"
+    );
+}
+
+#[test]
+#[ignore]
+fn interactive_shell_as_root_privsep() {
+    // Invariant: root is a first-class login. The session helper must NOT grow a
+    // root refusal (the worker's root checks in `drop_to_worker` are worker-only).
+    // The interactive shell must run as uid 0 for a root login.
+    let server = PrivsepServer::start();
+
+    let mut child = spawn_interactive_client(&server, "root", &root_password());
+    let mut stdin = child.stdin.take().expect("piped stdin");
+    stdin
+        .write_all(b"echo shell-uid-$(id -u)\nexit\n")
+        .expect("write to client stdin");
+    stdin.flush().expect("flush client stdin");
+
+    let mut stdout = child.stdout.take().expect("piped stdout");
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let mut buf = String::new();
+        let _ = stdout.read_to_string(&mut buf);
+        let _ = tx.send(buf);
+    });
+    let out = match rx.recv_timeout(Duration::from_secs(10)) {
+        Ok(buf) => buf,
+        Err(_) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("interactive client produced no stdout within 10s");
+        }
+    };
+    let status = child.wait().expect("wait interactive client");
+
+    assert!(
+        out.contains("shell-uid-0"),
+        "root shell did not run as uid 0; status={status:?}, stdout={out:?}"
+    );
+}
+
+#[test]
+#[ignore]
+fn upload_writes_root_file_privsep() {
+    // Invariant: root is a first-class login. The transfer helper must NOT grow a
+    // root refusal (the worker's root checks in `drop_to_worker` are worker-only).
+    // /root is mode 0700 root-owned in the image, so only root can create there —
+    // a successful write PROVES the create/write ran as root.
+    use std::os::unix::fs::MetadataExt;
+    let pw = root_password();
+    let server = PrivsepServer::start();
+    let ip = server.addr.ip();
+    let port = server.addr.port().to_string();
+
+    let src = fresh_temp_dir("quish-ul-root-src").join("source.txt");
+    let body = b"quish-upload-root-marker\n";
+    std::fs::write(&src, body).expect("write source");
+
+    let dest = format!("/root/quish-e2e-root-upload-{}.txt", std::process::id());
+    let out = run_client(
+        &server,
+        &[
+            "cp",
+            "-P",
+            &port,
+            src.to_str().unwrap(),
+            &format!("root@{ip}:{dest}"),
+        ],
+        Some(&pw),
+    );
+
+    let contents = std::fs::read(&dest).ok();
+    let uid = std::fs::metadata(&dest).ok().map(|m| m.uid());
+    let _ = std::fs::remove_file(&dest);
+
+    assert!(out.status.success(), "upload failed: {out:?}");
+    assert_eq!(
+        contents.as_deref(),
+        Some(&body[..]),
+        "uploaded contents differ: {out:?}"
+    );
+    assert_eq!(
+        uid,
+        Some(0),
+        "uploaded file not owned by root — the write ran as the wrong identity: {out:?}"
+    );
+}
+
+#[test]
+#[ignore]
+fn download_reads_root_only_file_privsep() {
+    // Invariant: root is a first-class login. The transfer helper must NOT grow a
+    // root refusal (the worker's root checks in `drop_to_worker` are worker-only).
+    // A mode-0600 root-owned file is readable ONLY by root, so a successful
+    // download PROVES open() ran as root (inverse of
+    // `download_refuses_root_only_file_privsep`, which logs in as the non-root user).
+    use std::os::unix::fs::PermissionsExt;
+    let pw = root_password();
+    let server = PrivsepServer::start();
+    let ip = server.addr.ip();
+    let port = server.addr.port().to_string();
+
+    let marker = "quish-root-download-marker\n";
+    let path = std::env::temp_dir().join(format!("quish-e2e-root-dl-{}.txt", std::process::id()));
+    std::fs::write(&path, marker).expect("write root-only file"); // created as root
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+        .expect("chmod 600 root-only");
+
+    let dst_dir = fresh_temp_dir("quish-dl-root-ok-dst");
+    let out = run_client(
+        &server,
+        &[
+            "cp",
+            "-P",
+            &port,
+            &format!("root@{ip}:{}", path.to_str().unwrap()),
+            &format!("{}/", dst_dir.to_str().unwrap()),
+        ],
+        Some(&pw),
+    );
+    let landed = dst_dir.join(path.file_name().unwrap());
+    let got = std::fs::read_to_string(&landed).ok();
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_dir_all(&dst_dir);
+
+    assert!(
+        out.status.success(),
+        "root could not download a root-readable file: {out:?}"
+    );
+    assert!(
+        got.as_deref().is_some_and(|s| s.contains(marker.trim())),
+        "downloaded file missing the root marker: {out:?}"
+    );
+}
+
+#[test]
+#[ignore]
+fn pubkey_auth_as_root_privsep() {
+    // Invariant: root is a first-class login. Pubkey auth must work for root and
+    // the session helper must NOT grow a root refusal (the worker's root checks in
+    // `drop_to_worker` are worker-only). authorized_keys must be a REGULAR file —
+    // the monitor's reader refuses symlinks.
+    let keypath = fresh_temp_dir("quish-rootkey").join("id_ed25519");
+    let keypath_str = keypath.to_str().unwrap().to_string();
+    let keygen = Command::new("ssh-keygen")
+        .args(["-t", "ed25519", "-N", "", "-q", "-f", &keypath_str])
+        .status()
+        .expect("spawn ssh-keygen");
+    assert!(keygen.success(), "ssh-keygen failed to generate a key");
+
+    std::fs::create_dir_all("/root/.config/quish").expect("create /root/.config/quish");
+    let authorized = "/root/.config/quish/authorized_keys";
+    std::fs::copy(format!("{keypath_str}.pub"), authorized).expect("install root authorized_keys");
+
+    let server = PrivsepServer::start();
+    let target = format!("root@{}", server.addr);
+    let out = run_client(&server, &["-i", &keypath_str, &target, "id", "-u"], None);
+
+    // Remove the installed key BEFORE asserting so a failure can't leave it behind.
+    let _ = std::fs::remove_file(authorized);
+
+    assert!(out.status.success(), "pubkey auth as root failed: {out:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "0",
+        "pubkey login as root did not run as uid 0: {out:?}"
     );
 }
