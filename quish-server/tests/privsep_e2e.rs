@@ -231,6 +231,27 @@ fn exec_runs_command_and_returns_output_privsep() {
     );
 }
 
+#[test]
+#[ignore]
+fn no_seccomp_flag_still_serves_privsep() {
+    // Escape hatch: `--no-seccomp` puts the worker's seccomp filter in audit
+    // (log-only) mode instead of enforcing. Every other scenario in this suite
+    // runs with enforcement ON (the default), so those are the enforcing proof;
+    // this test only needs to show the opt-out path still completes a session.
+    let user = test_user();
+    let pw = test_password();
+    let server = PrivsepServer::start_with_args(&["--no-seccomp"]);
+    let target = format!("{user}@{}", server.addr);
+
+    let out = run_client(&server, &[&target, "echo", "no-seccomp-ok"], Some(&pw));
+
+    assert!(out.status.success(), "client failed: {out:?}");
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("no-seccomp-ok"),
+        "unexpected stdout: {out:?}"
+    );
+}
+
 /// Spawn the real `quish` client in INTERACTIVE (shell) mode against `server`,
 /// with piped stdin/stdout so a test can drive the PTY session from a pipe.
 /// `run_client`'s `.output()` closes stdin immediately, which won't do for a

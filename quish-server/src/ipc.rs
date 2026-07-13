@@ -37,6 +37,10 @@ pub const ENV_CERT: &str = "QUISH_CERT";
 /// Whether `-L` TCP forwarding is enabled; `"true"`/`"false"`. Set by the monitor
 /// on the worker re-exec, read by `worker::run`.
 pub const ENV_ALLOW_FORWARD: &str = "QUISH_ALLOW_FORWARD";
+/// Whether to DISABLE the worker's seccomp filter (escape hatch); `"true"`/
+/// `"false"`. Set by the monitor on the worker re-exec, read by `worker::run`.
+/// Absent/anything-but-`"true"` = enforcing (fail closed).
+pub const ENV_NO_SECCOMP: &str = "QUISH_NO_SECCOMP";
 
 /// Env vars for the `--internal-run-session` helper.
 pub const ENV_SESS_UID: &str = "QUISH_SESS_UID";

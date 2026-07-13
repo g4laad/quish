@@ -45,7 +45,10 @@ Full design + milestones: `~/.claude/plans/plan-a-new-project-gentle-charm.md`.
 `quishd` starts root and **re-execs a privilege-separated worker** (`nix::fork` is
 `unsafe`; `std::process::Command` forks+execs safely and gives the worker a fresh
 address space). The **worker** (child: binds UDP as root, then `chroot`s to
-`/run/quishd`, `setuid`s to `quish`, sets `no_new_privs`) runs all quinn/h3/rustls
+`/run/quishd`, `setuid`s to `quish`, sets `no_new_privs`, then installs an
+enforcing seccomp-bpf syscall allowlist — `WORKER_SYSCALLS` in `privdrop.rs`,
+so adding a worker syscall may need an allowlist edit; `--no-seccomp` disables
+it) runs all quinn/h3/rustls
 and untrusted parsing, pre- and post-auth. The **monitor** (root parent) holds the
 auth registry (PAM needs root), the host key, and session spawning. They talk over
 two `SOCK_SEQPACKET` socketpairs — a control RPC (auth / spawn / reap) and a

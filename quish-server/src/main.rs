@@ -73,6 +73,12 @@ struct Args {
     #[arg(long)]
     allow_forward: bool,
 
+    /// Disable the worker's seccomp-bpf syscall filter (privsep mode only).
+    /// Enforcing by default; use only to work around a kernel/glibc/tokio
+    /// regression where the allowlist SIGSYS-kills the worker.
+    #[arg(long)]
+    no_seccomp: bool,
+
     /// Internal: run as the privilege-dropped worker (spawned by the monitor).
     #[arg(long, hide = true)]
     internal_worker: bool,
@@ -129,6 +135,7 @@ fn main() -> anyhow::Result<()> {
         .or(file.max_auth_fails)
         .unwrap_or(transport::DEFAULT_MAX_AUTH_FAILS);
     let allow_forward = args.allow_forward || file.allow_forward.unwrap_or(false);
+    let no_seccomp = args.no_seccomp || file.no_seccomp.unwrap_or(false);
 
     if let Some(dev_user) = args.dev_insecure_user {
         return run_dev(listen, path, dev_user, max_auth_fails, allow_forward);
@@ -147,6 +154,7 @@ fn main() -> anyhow::Result<()> {
         host_key,
         max_auth_fails,
         allow_forward,
+        no_seccomp,
     })
 }
 

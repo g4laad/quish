@@ -102,6 +102,17 @@ keep-alive so idle shells survive); centralized constant-time auth-failure floor
 (identical 401 for every failure cause). The frame decoder is fuzzed
 (`cargo +nightly fuzz run decode --fuzz-dir quish-proto/fuzz`).
 
+The network-facing worker is privilege-separated: it binds as root, then
+`chroot`s to an empty dir, `setuid`s to the unprivileged `quish` account, and
+installs a **seccomp-bpf syscall allowlist** — after that the worker may call
+only the ~50 syscalls it legitimately makes (QUIC/TLS/H3 I/O, the tokio reactor,
+memory/thread management), so a memory-corruption exploit in the untrusted
+parsing can't reach `ptrace`, `execve`, `io_uring`, raw sockets, `openat`, etc.
+The filter is enforcing by default (unlisted syscall → the worker is killed and
+the connection drops); `--no-seccomp` (or `no_seccomp = true`) is an escape
+hatch for a kernel/glibc regression. The host key, auth verdicts, and session
+spawning stay in the root monitor, which the filter does not touch.
+
 ## License
 
 MIT OR Apache-2.0.

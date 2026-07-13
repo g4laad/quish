@@ -82,11 +82,16 @@ pub fn run() -> Result<()> {
         info!(user = %worker_user, "worker privilege-dropped");
 
         // Cap the worker's blast radius: an exploit in the untrusted QUIC/TLS/H3
-        // parsing can now only call the syscalls the worker legitimately makes.
-        // Audit mode for now (logs, blocks nothing) — enforcement is wired in a
-        // later step once the allowlist is proven complete.
-        crate::privdrop::install_seccomp(false)?;
-        info!("seccomp filter installed (audit mode)");
+        // parsing can now only call the ~50 syscalls the worker legitimately
+        // makes; anything else kills the process. Enforcing by default; the
+        // monitor sets QUISH_NO_SECCOMP=true only when the operator passes
+        // `--no-seccomp` (escape hatch for a kernel/glibc regression).
+        let enforce = !ipc::env_bool(ipc::ENV_NO_SECCOMP);
+        crate::privdrop::install_seccomp(enforce)?;
+        info!(
+            mode = if enforce { "enforcing" } else { "audit-only" },
+            "seccomp filter installed"
+        );
 
         // TLS with the signing proxy (host key stays in the monitor).
         let proxy = ProxySigningKey::new(sign_stream, scheme);

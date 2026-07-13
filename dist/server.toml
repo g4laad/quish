@@ -31,3 +31,11 @@ max_auth_fails = 6
 # Takes effect in both dev and privsep (daemon) modes, but only when this config
 # is actually loaded (`quishd --config /etc/quish/server.toml`).
 # allow_forward = false
+
+# Disable the network-facing worker's seccomp-bpf syscall filter. The filter is
+# ENFORCING by default (this key defaults to false): after dropping privileges
+# the worker may make only its ~50 legitimate syscalls; anything else kills it.
+# Set true only as an escape hatch if a kernel/glibc/tokio upgrade makes the
+# allowlist SIGSYS-kill the worker — the real fix is re-auditing the allowlist.
+# Privsep mode only (dev mode installs no filter). Overridden by `--no-seccomp`.
+# no_seccomp = false

@@ -22,6 +22,13 @@ pub struct FileConfig {
     /// hosts. Overridden by the `--allow-forward` CLI flag. Takes effect in both
     /// dev and privsep (daemon) modes.
     pub allow_forward: Option<bool>,
+    /// Disable the worker's seccomp-bpf syscall filter (privsep mode only). OFF
+    /// by default (`false` = the filter is enforcing). An escape hatch for a
+    /// kernel/glibc/tokio version where the allowlist starts SIGSYS-killing the
+    /// worker; the real fix is re-auditing the allowlist. Overridden by the
+    /// `--no-seccomp` CLI flag. No effect in dev mode (which does no privilege
+    /// drop and installs no filter).
+    pub no_seccomp: Option<bool>,
 }
 
 impl FileConfig {
