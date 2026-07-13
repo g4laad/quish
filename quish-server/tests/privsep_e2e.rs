@@ -727,11 +727,7 @@ fn download_refuses_root_only_file_privsep() {
     let mut part_leftover = false;
     for entry in std::fs::read_dir(&dst_dir).unwrap() {
         let entry = entry.unwrap();
-        if entry
-            .file_name()
-            .to_string_lossy()
-            .contains("quish-part")
-        {
+        if entry.file_name().to_string_lossy().contains("quish-part") {
             part_leftover = true;
         }
         if let Ok(body) = std::fs::read_to_string(entry.path())
@@ -897,8 +893,16 @@ fn cp_uploads_directory_recursively_privsep() {
     let _ = std::fs::remove_dir_all(&base);
 
     assert!(out.status.success(), "tree upload failed: {out:?}");
-    assert_eq!(a.as_deref(), Some(&b"alpha"[..]), "a.txt contents differ: {out:?}");
-    assert_eq!(b.as_deref(), Some(&b"bravo"[..]), "b.txt contents differ: {out:?}");
+    assert_eq!(
+        a.as_deref(),
+        Some(&b"alpha"[..]),
+        "a.txt contents differ: {out:?}"
+    );
+    assert_eq!(
+        b.as_deref(),
+        Some(&b"bravo"[..]),
+        "b.txt contents differ: {out:?}"
+    );
     assert_ne!(dir_uid, Some(0), "remote root dir created as root: {out:?}");
     assert_ne!(sub_uid, Some(0), "remote sub dir created as root: {out:?}");
     assert_ne!(file_uid, Some(0), "uploaded file created as root: {out:?}");
@@ -994,7 +998,10 @@ fn cp_download_relative_path_resolves_to_home_privsep() {
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_dir_all(&dst_dir);
 
-    assert!(out.status.success(), "relative-path download failed: {out:?}");
+    assert!(
+        out.status.success(),
+        "relative-path download failed: {out:?}"
+    );
     assert_eq!(
         got.as_deref(),
         Some(marker),

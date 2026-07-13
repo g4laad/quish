@@ -50,9 +50,7 @@ pub(crate) fn parse_cp_spec(s: &str) -> Result<CpSpec> {
     let first_colon = s.find(':');
     let first_slash = s.find('/');
     let (user, rest) = match s.find('@') {
-        Some(at)
-            if first_colon.is_none_or(|c| at < c) && first_slash.is_none_or(|sl| at < sl) =>
-        {
+        Some(at) if first_colon.is_none_or(|c| at < c) && first_slash.is_none_or(|sl| at < sl) => {
             (Some(s[..at].to_string()), &s[at + 1..])
         }
         _ => (None, s),
@@ -194,8 +192,14 @@ pub(crate) async fn run_cp(args: CpArgs) -> Result<i32> {
             let final_path = resolve_local_dst(&local, dst_is_dir, &remote)?;
             let (mut send_request, drive, authorization) =
                 crate::establish(&target, args.identity.as_deref()).await?;
-            let res =
-                download_one(&mut send_request, &target, &authorization, &remote, &final_path).await;
+            let res = download_one(
+                &mut send_request,
+                &target,
+                &authorization,
+                &remote,
+                &final_path,
+            )
+            .await;
             drop(send_request);
             let _ = drive.await;
             res
@@ -406,8 +410,8 @@ async fn upload_one(
     local: &std::path::Path,
     remote: &str,
 ) -> Result<i32> {
-    let meta = std::fs::metadata(local)
-        .with_context(|| format!("cannot access {}", local.display()))?;
+    let meta =
+        std::fs::metadata(local).with_context(|| format!("cannot access {}", local.display()))?;
     if !meta.is_file() {
         bail!("{} is not a regular file", local.display());
     }
@@ -421,8 +425,8 @@ async fn upload_one(
     .await
     .context("sending WriteFile open")?;
 
-    let mut file = std::fs::File::open(local)
-        .with_context(|| format!("opening {}", local.display()))?;
+    let mut file =
+        std::fs::File::open(local).with_context(|| format!("opening {}", local.display()))?;
     let mut buf = vec![0u8; 32 * 1024];
     loop {
         let n = file
@@ -571,7 +575,10 @@ mod tests {
 
     #[test]
     fn parse_local_slash_before_colon() {
-        assert_eq!(parse_cp_spec("./x:y").unwrap(), CpSpec::Local("./x:y".into()));
+        assert_eq!(
+            parse_cp_spec("./x:y").unwrap(),
+            CpSpec::Local("./x:y".into())
+        );
     }
 
     #[test]
@@ -581,7 +588,10 @@ mod tests {
 
     #[test]
     fn parse_local_plain() {
-        assert_eq!(parse_cp_spec("plain").unwrap(), CpSpec::Local("plain".into()));
+        assert_eq!(
+            parse_cp_spec("plain").unwrap(),
+            CpSpec::Local("plain".into())
+        );
     }
 
     #[test]

@@ -243,7 +243,9 @@ fn run_mkdir_helper(path: String) -> Result<()> {
         Ok(()) => Ok(()),
         Err(e)
             if e.kind() == std::io::ErrorKind::AlreadyExists
-                && std::fs::metadata(&path).map(|m| m.is_dir()).unwrap_or(false) =>
+                && std::fs::metadata(&path)
+                    .map(|m| m.is_dir())
+                    .unwrap_or(false) =>
         {
             Ok(())
         }

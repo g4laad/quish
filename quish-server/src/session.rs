@@ -152,7 +152,9 @@ async fn mkdir(mut send: SendHalf, path: String, mode: u32) -> Result<()> {
         Ok(()) => 0,
         Err(e)
             if e.kind() == std::io::ErrorKind::AlreadyExists
-                && std::fs::metadata(&path).map(|m| m.is_dir()).unwrap_or(false) =>
+                && std::fs::metadata(&path)
+                    .map(|m| m.is_dir())
+                    .unwrap_or(false) =>
         {
             0
         }
