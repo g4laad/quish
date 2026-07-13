@@ -79,6 +79,12 @@ pub enum ChannelOpen {
     /// terminal `ExitStatus` (nonzero on open/fstat/write failure). `mode` is the
     /// creation mode, applied subject to the user's umask.
     WriteFile { path: String, mode: u32 },
+    /// Create a directory on the server AS the authenticated user (mkdir happens
+    /// in the setuid'd session helper, never as root/worker). Single-level (the
+    /// client creates parents first, top-down). `mode` is the creation mode,
+    /// applied subject to the user's umask. An existing directory at `path` is
+    /// success; the server replies with a terminal `ExitStatus` only.
+    MkDir { path: String, mode: u32 },
 }
 
 /// A forwardable interrupt from the client's terminal (exec channels only).
@@ -229,6 +235,16 @@ mod tests {
         let open = ChannelOpen::WriteFile {
             path: "/tmp/x".into(),
             mode: 0o644,
+        };
+        let got: ChannelOpen = decode(&encode(&open).unwrap()[LEN_PREFIX..]).unwrap();
+        assert_eq!(got, open);
+    }
+
+    #[test]
+    fn mkdir_open_roundtrips() {
+        let open = ChannelOpen::MkDir {
+            path: "/tmp/d".into(),
+            mode: 0o755,
         };
         let got: ChannelOpen = decode(&encode(&open).unwrap()[LEN_PREFIX..]).unwrap();
         assert_eq!(got, open);
