@@ -80,6 +80,15 @@ work — the worker binds while still root, then drops privileges.
 Server identity is verified against the web PKI, else pinned trust-on-first-use in
 `~/.config/quish/known_hosts` (hard-fail on mismatch).
 
+### Root logins
+
+Root is a first-class login: shell, exec, upload, download, and both auth
+methods work for `root@host` (covered by the privsep e2e suite). Note that most
+distros ship the root *password* locked (`root:!` in `/etc/shadow`), which
+makes password auth fail for root — an environment policy, not a quish
+restriction. For root logins prefer pubkey auth: put the ed25519 public key in
+`/root/.config/quish/authorized_keys`.
+
 ## Deployment
 
 `dist/` ships a systemd unit, `pam.d/quish` (`pam_unix ... nodelay`), and a
