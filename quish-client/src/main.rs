@@ -21,10 +21,10 @@ use tokio::net::{TcpListener, TcpStream};
 use tracing::{info, warn};
 
 /// Halves of an open H3 channel stream (client side).
-type SendHalf = h3::client::RequestStream<h3_quinn::SendStream<Bytes>, Bytes>;
-type RecvHalf = h3::client::RequestStream<h3_quinn::RecvStream, Bytes>;
+pub(crate) type SendHalf = h3::client::RequestStream<h3_quinn::SendStream<Bytes>, Bytes>;
+pub(crate) type RecvHalf = h3::client::RequestStream<h3_quinn::RecvStream, Bytes>;
 /// The multiplexing handle used to open new channels on the authed connection.
-type SendRequest = h3::client::SendRequest<h3_quinn::OpenStreams, Bytes>;
+pub(crate) type SendRequest = h3::client::SendRequest<h3_quinn::OpenStreams, Bytes>;
 
 /// quish client (HTTP/3 remote shell).
 #[derive(Parser, Debug)]
@@ -92,11 +92,11 @@ enum KnownHostsAction {
 
 /// Parsed connection target.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct Target {
-    user: String,
-    host: String,
-    port: u16,
-    path: String,
+pub(crate) struct Target {
+    pub(crate) user: String,
+    pub(crate) host: String,
+    pub(crate) port: u16,
+    pub(crate) path: String,
 }
 
 fn parse_target(s: &str) -> Result<Target> {
@@ -230,7 +230,7 @@ fn socket_target(host: &str, port: u16) -> String {
     }
 }
 
-fn whoami() -> String {
+pub(crate) fn whoami() -> String {
     std::env::var("USER").unwrap_or_else(|_| "root".into())
 }
 
@@ -324,36 +324,7 @@ async fn run(
         .map(|s| parse_forward(s))
         .collect::<Result<Vec<_>>>()?;
 
-    let host_key = socket_target(&target.host, target.port);
-    let addr = tokio::net::lookup_host(&host_key)
-        .await
-        .context("resolving host")?
-        .next()
-        .with_context(|| format!("no address for {host_key}"))?;
-
-    let endpoint = connect::endpoint(host_key.clone())?;
-    let conn = endpoint
-        .connect(addr, &target.host)
-        .context("starting connection")?
-        .await
-        .context("connecting")?;
-    info!(%addr, "connected");
-
-    // Channel binding for pubkey tokens: export before `conn` moves into h3. Must
-    // match the server's label byte-for-byte.
-    let mut binding = [0u8; quish_proto::CHANNEL_BINDING_LEN];
-    conn.export_keying_material(&mut binding, quish_proto::CHANNEL_BINDING_LABEL, &[])
-        .map_err(|e| anyhow::anyhow!("exporting channel binding: {e:?}"))?;
-    let authorization = build_authorization(&target.user, identity.as_deref(), &binding)?;
-
-    let (mut driver, mut send_request) = h3::client::builder()
-        .enable_extended_connect(true)
-        .build::<_, _, Bytes>(h3_quinn::Connection::new(conn))
-        .await
-        .context("h3 handshake")?;
-    let drive = tokio::spawn(async move {
-        let _ = future::poll_fn(|cx| driver.poll_close(cx)).await;
-    });
+    let (mut send_request, drive, authorization) = establish(&target, identity.as_deref()).await?;
 
     // Forward mode: bind the local ports and tunnel each accepted connection over
     // its own Extended CONNECT channel. Runs until the listeners stop (Ctrl-C).
@@ -363,32 +334,9 @@ async fn run(
         return Ok(0);
     }
 
-    // Extended CONNECT to the secret path. :protocol must be a value h3 accepts
-    // (its Protocol enum is closed), so we use WEB_TRANSPORT and let the secret
-    // path + version header mark this as quish.
-    let req = build_connect_request(&target, &authorization);
-
-    let mut stream = send_request
-        .send_request(req)
-        .await
-        .context("sending CONNECT")?;
-    let resp = stream.recv_response().await.context("awaiting response")?;
-    match resp.status() {
-        http::StatusCode::OK => {}
-        http::StatusCode::UNAUTHORIZED => bail!("authentication failed"),
-        http::StatusCode::UPGRADE_REQUIRED => {
-            bail!(
-                "server rejected our protocol version (quish-version {}); client/server mismatch",
-                quish_proto::PROTOCOL_VERSION
-            )
-        }
-        s => bail!("server rejected session: HTTP {s}"),
-    }
-    info!(user = %target.user, "session authenticated");
-
-    // Open a channel on the authed stream: download if `--download`, else shell
-    // (no command) or exec.
-    let (send, recv) = stream.split();
+    // Open a channel on the authed connection: download if `--download`, upload if
+    // `--upload`, else shell (no command) or exec.
+    let (send, recv) = open_channel(&mut send_request, &target, &authorization).await?;
     if let Some(path) = upload {
         let code = upload_file(send, recv, path, mode).await?;
         drop(send_request);
@@ -419,6 +367,77 @@ async fn run(
     drop(send_request);
     let _ = drive.await;
     Ok(code)
+}
+
+/// Resolve, connect, and authenticate the QUIC/H3 connection, then spawn its
+/// driver task. Returns the multiplexing handle, the driver `JoinHandle`, and
+/// the channel-bound `Authorization` reused on every channel opened on this
+/// connection (it is bound to the connection, not the stream).
+pub(crate) async fn establish(
+    target: &Target,
+    identity: Option<&std::path::Path>,
+) -> Result<(SendRequest, tokio::task::JoinHandle<()>, String)> {
+    let host_key = socket_target(&target.host, target.port);
+    let addr = tokio::net::lookup_host(&host_key)
+        .await
+        .context("resolving host")?
+        .next()
+        .with_context(|| format!("no address for {host_key}"))?;
+
+    let endpoint = connect::endpoint(host_key.clone())?;
+    let conn = endpoint
+        .connect(addr, &target.host)
+        .context("starting connection")?
+        .await
+        .context("connecting")?;
+    info!(%addr, "connected");
+
+    // Channel binding for pubkey tokens: export before `conn` moves into h3. Must
+    // match the server's label byte-for-byte.
+    let mut binding = [0u8; quish_proto::CHANNEL_BINDING_LEN];
+    conn.export_keying_material(&mut binding, quish_proto::CHANNEL_BINDING_LABEL, &[])
+        .map_err(|e| anyhow::anyhow!("exporting channel binding: {e:?}"))?;
+    let authorization = build_authorization(&target.user, identity, &binding)?;
+
+    let (mut driver, send_request) = h3::client::builder()
+        .enable_extended_connect(true)
+        .build::<_, _, Bytes>(h3_quinn::Connection::new(conn))
+        .await
+        .context("h3 handshake")?;
+    let drive = tokio::spawn(async move {
+        let _ = future::poll_fn(|cx| driver.poll_close(cx)).await;
+    });
+    Ok((send_request, drive, authorization))
+}
+
+/// Open one Extended CONNECT channel on the authed connection and split it into
+/// send/recv halves. :protocol must be a value h3 accepts (its Protocol enum is
+/// closed), so we use WEB_TRANSPORT and let the secret path + version header mark
+/// this as quish. The status match maps auth/version failures to errors.
+pub(crate) async fn open_channel(
+    send_request: &mut SendRequest,
+    target: &Target,
+    authorization: &str,
+) -> Result<(SendHalf, RecvHalf)> {
+    let req = build_connect_request(target, authorization);
+    let mut stream = send_request
+        .send_request(req)
+        .await
+        .context("sending CONNECT")?;
+    let resp = stream.recv_response().await.context("awaiting response")?;
+    match resp.status() {
+        http::StatusCode::OK => {}
+        http::StatusCode::UNAUTHORIZED => bail!("authentication failed"),
+        http::StatusCode::UPGRADE_REQUIRED => {
+            bail!(
+                "server rejected our protocol version (quish-version {}); client/server mismatch",
+                quish_proto::PROTOCOL_VERSION
+            )
+        }
+        s => bail!("server rejected session: HTTP {s}"),
+    }
+    info!(user = %target.user, "session authenticated");
+    Ok(stream.split())
 }
 
 /// Download PoC: send a `ReadFile` open, then pump received `Data` frames to
@@ -651,13 +670,13 @@ async fn bridge(tcp: TcpStream, mut send: SendHalf, recv: RecvHalf) -> Result<()
 }
 
 /// Reassembles length-prefixed [`ChannelMessage`] frames off an H3 recv half.
-struct ChannelFrameReader {
+pub(crate) struct ChannelFrameReader {
     recv: RecvHalf,
     buf: BytesMut,
 }
 
 impl ChannelFrameReader {
-    fn new(recv: RecvHalf) -> Self {
+    pub(crate) fn new(recv: RecvHalf) -> Self {
         Self {
             recv,
             buf: BytesMut::new(),
@@ -665,7 +684,7 @@ impl ChannelFrameReader {
     }
 
     /// Next decoded message, or `None` at clean end of stream.
-    async fn next(&mut self) -> Result<Option<ChannelMessage>> {
+    pub(crate) async fn next(&mut self) -> Result<Option<ChannelMessage>> {
         loop {
             if let Some(body) = quish_proto::take_frame(&mut self.buf)? {
                 return Ok(Some(quish_proto::decode::<ChannelMessage>(&body)?));
