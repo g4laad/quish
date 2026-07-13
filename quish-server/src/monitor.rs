@@ -490,6 +490,34 @@ async fn serve_control(mut listener: UnixSeqpacketListener, registry: Arc<Regist
                 ipc::ctrl_send(&sock, &reply, &[]).await?;
             }
 
+            Request::SpawnMkdir {
+                conn_id,
+                path,
+                mode,
+            } => {
+                let reply = match st.users.get(&conn_id).cloned() {
+                    Some(user) => match spawn_mkdir(&user, &path, mode) {
+                        Ok((child, out)) => {
+                            let id = st.alloc(conn_id, child);
+                            ipc::ctrl_send(
+                                &sock,
+                                &Response::Spawned { session_id: id },
+                                &[out.as_fd()],
+                            )
+                            .await?;
+                            drop(out);
+                            continue;
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "spawn mkdir failed");
+                            Response::Failed
+                        }
+                    },
+                    None => Response::Failed,
+                };
+                ipc::ctrl_send(&sock, &reply, &[]).await?;
+            }
+
             Request::Reap { session_id } => {
                 let reply = match st.sessions.remove(&session_id) {
                     Some(child) => {
@@ -607,6 +635,23 @@ fn spawn_transfer(user: &str, path: &str) -> Result<(Child, std::os::fd::OwnedFd
         .stdout(Stdio::piped())
         .spawn()
         .context("spawn transfer session")?;
+    let o = child.stdout.take().context("no stdout")?;
+    Ok((child, o.into()))
+}
+
+/// Spawn a mkdir helper for `user` that creates `path` (as the user) with
+/// `mode`. Only stdout is piped — the helper writes nothing to it; the pipe
+/// exists solely so the worker can observe the helper's exit (EOF) before
+/// reaping, keeping the try_wait+kill reaper from SIGKILLing a live helper.
+fn spawn_mkdir(user: &str, path: &str, mode: u32) -> Result<(Child, std::os::fd::OwnedFd)> {
+    let u = crate::privdrop::lookup_user(user)?;
+    let mut child = session_command(&u)
+        .env(ipc::ENV_SESS_MKDIR_PATH, path)
+        .env(ipc::ENV_SESS_TRANSFER_MODE, mode.to_string())
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .spawn()
+        .context("spawn mkdir session")?;
     let o = child.stdout.take().context("no stdout")?;
     Ok((child, o.into()))
 }
