@@ -9,7 +9,12 @@ account    required   pam_unix.so
 # Session stage (plan 022): run when quish opens a login session around a shell.
 # Minimal login set, host policy — operators may add/remove modules.
 #   pam_limits    (required): apply /etc/security/limits.conf rlimits.
-#   pam_loginuid  (required): set the audit login uid for the session.
+#   pam_loginuid  (optional): set the audit login uid for the session. It is
+#     `optional` (not `required`) deliberately: a real login host has an UNSET
+#     loginuid so the module sets it fine, but where loginuid is already set and
+#     cannot be re-set (containers, nested sessions) `required` would abort an
+#     otherwise-valid, already-authenticated login. Operators who mandate audit
+#     integrity may switch this to `required` (host policy).
 #   pam_env       (optional): load /etc/environment + /etc/security/pam_env.conf.
 #   pam_lastlog   (optional, silent): record the login in lastlog/wtmp.
 # NOTE: `session optional pam_systemd.so` (logind session, XDG_RUNTIME_DIR,
@@ -17,6 +22,6 @@ account    required   pam_unix.so
 # rootless-podman e2e image has no systemd/logind/dbus (and no libpam-systemd),
 # so it cannot be exercised here. Re-add it on systemd hosts (see plan 022).
 session    required   pam_limits.so
-session    required   pam_loginuid.so
+session    optional   pam_loginuid.so
 session    optional   pam_env.so
 session    optional   pam_lastlog.so silent
