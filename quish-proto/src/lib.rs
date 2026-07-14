@@ -85,6 +85,22 @@ pub enum ChannelOpen {
     /// applied subject to the user's umask. An existing directory at `path` is
     /// success; the server replies with a terminal `ExitStatus` only.
     MkDir { path: String, mode: u32 },
+    /// Ask the server to bind a loopback listener at `bind:port` and forward
+    /// each inbound connection back to the client (`-R` remote forwarding). This
+    /// channel stays open as the CONTROL channel: for every accept the server
+    /// sends a [`ChannelMessage::Accepted`] naming a `conn_ref`; the client then
+    /// opens a [`ChannelOpen::RemoteForwardData`] channel for that `conn_ref`.
+    /// The server enforces its gate (off by default) and loopback-only/`<1024`
+    /// bind policy before binding. `bind` is a server-side address (e.g.
+    /// `127.0.0.1`/`::1`); `port` MUST be >= 1024.
+    RemoteForwardListen { bind: String, port: u16 },
+    /// Client-initiated DATA channel pairing with a parked inbound connection the
+    /// server accepted on a [`ChannelOpen::RemoteForwardListen`] listener. The
+    /// server looks up the parked socket by `conn_ref` (scoped to this
+    /// connection, so it cannot be forged to hijack another connection's pending
+    /// socket) and bridges it to this channel as `Data` frames. Both directions
+    /// carry `ChannelMessage::Data`, exactly like [`ChannelOpen::Forward`].
+    RemoteForwardData { conn_ref: u64 },
 }
 
 /// A forwardable interrupt from the client's terminal (exec channels only).
@@ -113,6 +129,11 @@ pub enum ChannelMessage {
     ExitStatus(i32),
     /// Deliver a signal to the remote process (client→server, exec only).
     Signal(Signal),
+    /// Server→client signal on a [`ChannelOpen::RemoteForwardListen`] control
+    /// channel: an inbound connection was accepted and parked under `conn_ref`.
+    /// The client responds by opening a [`ChannelOpen::RemoteForwardData`]
+    /// channel naming this `conn_ref`.
+    Accepted { conn_ref: u64 },
 }
 
 /// Codec errors. Framing (length prefix, cap) is the caller's job; these cover
@@ -248,6 +269,30 @@ mod tests {
         };
         let got: ChannelOpen = decode(&encode(&open).unwrap()[LEN_PREFIX..]).unwrap();
         assert_eq!(got, open);
+    }
+
+    #[test]
+    fn remote_forward_listen_open_roundtrips() {
+        let open = ChannelOpen::RemoteForwardListen {
+            bind: "127.0.0.1".into(),
+            port: 8080,
+        };
+        let got: ChannelOpen = decode(&encode(&open).unwrap()[LEN_PREFIX..]).unwrap();
+        assert_eq!(got, open);
+    }
+
+    #[test]
+    fn remote_forward_data_open_roundtrips() {
+        let open = ChannelOpen::RemoteForwardData { conn_ref: 42 };
+        let got: ChannelOpen = decode(&encode(&open).unwrap()[LEN_PREFIX..]).unwrap();
+        assert_eq!(got, open);
+    }
+
+    #[test]
+    fn accepted_frame_roundtrips() {
+        let msg = ChannelMessage::Accepted { conn_ref: 7 };
+        let got: ChannelMessage = decode(&encode(&msg).unwrap()[LEN_PREFIX..]).unwrap();
+        assert_eq!(got, msg);
     }
 
     #[test]
