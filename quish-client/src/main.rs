@@ -52,6 +52,13 @@ struct ConnectArgs {
     #[arg(short = 'L', long = "local-forward")]
     local_forward: Vec<String>,
 
+    /// Remote forward: `-R [bind:]rport:lhost:lport` (repeatable). Asks the
+    /// server to bind `rport` (loopback-only); each inbound connection is
+    /// tunneled back and dialed to `lhost:lport` on this client. Requires the
+    /// server's `--allow-remote-forward`.
+    #[arg(short = 'R', long = "remote-forward")]
+    remote_forward: Vec<String>,
+
     /// Command to run (empty = interactive shell).
     #[arg(trailing_var_arg = true)]
     command: Vec<String>,
@@ -172,6 +179,55 @@ fn parse_forward(s: &str) -> Result<ForwardSpec> {
         lport,
         rhost: rhost_tok.to_string(),
         rport,
+    })
+}
+
+/// A parsed `-R` remote-forward spec: ask the server to bind `bind:rport` and
+/// tunnel every inbound connection back to `lhost:lport` on the client side.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RemoteForwardSpec {
+    bind: IpAddr,
+    rport: u16,
+    lhost: String,
+    lport: u16,
+}
+
+/// Parse `-R [bind:]rport:lhost:lport` (mirrors [`parse_forward`]). Bracket IPv6
+/// literals (`[::1]`) so their colons don't split; a bare `bind` defaults to
+/// `127.0.0.1`. The server-side bind MUST be loopback (loopback-only policy; the
+/// server enforces this and the `<1024` refusal independently).
+fn parse_remote_forward(s: &str) -> Result<RemoteForwardSpec> {
+    let tokens = split_forward_tokens(s)?;
+    let (bind_tok, rport_tok, lhost_tok, lport_tok) = match tokens.as_slice() {
+        [r, lh, lp] => (None, r.as_str(), lh.as_str(), lp.as_str()),
+        [b, r, lh, lp] => (Some(b.as_str()), r.as_str(), lh.as_str(), lp.as_str()),
+        _ => bail!("remote forward spec `{s}` must be [bind:]rport:lhost:lport"),
+    };
+    let rport: u16 = rport_tok
+        .parse()
+        .with_context(|| format!("invalid remote port in remote forward spec `{s}`"))?;
+    let lport: u16 = lport_tok
+        .parse()
+        .with_context(|| format!("invalid local port in remote forward spec `{s}`"))?;
+    if lhost_tok.is_empty() {
+        bail!("missing local host in remote forward spec `{s}`");
+    }
+    let bind: IpAddr = match bind_tok {
+        Some(b) => b
+            .parse()
+            .with_context(|| format!("invalid bind address in remote forward spec `{s}`"))?,
+        None => IpAddr::V4(Ipv4Addr::LOCALHOST),
+    };
+    if !bind.is_loopback() {
+        bail!(
+            "refusing non-loopback bind address {bind} in remote forward spec `{s}` (loopback-only)"
+        );
+    }
+    Ok(RemoteForwardSpec {
+        bind,
+        rport,
+        lhost: lhost_tok.to_string(),
+        lport,
     })
 }
 
@@ -297,6 +353,7 @@ fn main() -> Result<()> {
             args.connect.identity,
             args.connect.command,
             args.connect.local_forward,
+            args.connect.remote_forward,
         ))?;
     std::process::exit(code);
 }
@@ -306,19 +363,24 @@ async fn run(
     identity: Option<std::path::PathBuf>,
     command: Vec<String>,
     local_forwards: Vec<String>,
+    remote_forwards: Vec<String>,
 ) -> Result<i32> {
     // Parse `-L` specs up front so a malformed spec fails before any network I/O.
     let forwards = local_forwards
         .iter()
         .map(|s| parse_forward(s))
         .collect::<Result<Vec<_>>>()?;
+    let remote_forwards = remote_forwards
+        .iter()
+        .map(|s| parse_remote_forward(s))
+        .collect::<Result<Vec<_>>>()?;
 
     let (mut send_request, drive, authorization) = establish(&target, identity.as_deref()).await?;
 
     // Forward mode: bind the local ports and tunnel each accepted connection over
     // its own Extended CONNECT channel. Runs until the listeners stop (Ctrl-C).
-    if !forwards.is_empty() {
-        run_forwards(send_request, forwards, target, authorization).await?;
+    if !forwards.is_empty() || !remote_forwards.is_empty() {
+        run_forwarding(send_request, forwards, remote_forwards, target, authorization).await?;
         let _ = drive.await;
         return Ok(0);
     }
@@ -439,12 +501,13 @@ fn build_connect_request(target: &Target, authorization: &str) -> http::Request<
         .expect("valid request")
 }
 
-/// Bind every `-L` listener, then serve accepted connections until a listener
-/// errors. Each listener runs on its own task; each accepted connection opens a
-/// fresh forward channel.
-async fn run_forwards(
+/// Bind every `-L` listener and open every `-R` control channel, then serve
+/// until a forward task ends (a listener/accept error, or the connection drops).
+/// Each `-L` listener and each `-R` control channel runs on its own task.
+async fn run_forwarding(
     send_request: SendRequest,
     forwards: Vec<ForwardSpec>,
+    remote_forwards: Vec<RemoteForwardSpec>,
     target: Target,
     authorization: String,
 ) -> Result<()> {
@@ -457,26 +520,138 @@ async fn run_forwards(
             bind = %spec.bind, lport = spec.lport, rhost = %spec.rhost, rport = spec.rport,
             "local forward listening"
         );
-        let send_request = send_request.clone();
-        let target = target.clone();
-        let authorization = authorization.clone();
         tasks.push(tokio::spawn(accept_loop(
             listener,
-            send_request,
+            send_request.clone(),
             spec,
-            target,
-            authorization,
+            target.clone(),
+            authorization.clone(),
         )));
     }
-    // Listeners run until they error; join so a bind/accept failure surfaces.
+    for spec in remote_forwards {
+        tasks.push(tokio::spawn(remote_forward_listen(
+            send_request.clone(),
+            spec,
+            target.clone(),
+            authorization.clone(),
+        )));
+    }
+    // Tasks run until they end; join so a bind/accept/channel failure surfaces.
     for task in tasks {
         match task.await {
             Ok(Ok(())) => {}
             Ok(Err(e)) => return Err(e),
-            Err(e) => return Err(anyhow::anyhow!("forward listener task panicked: {e}")),
+            Err(e) => return Err(anyhow::anyhow!("forward task panicked: {e}")),
         }
     }
     Ok(())
+}
+
+/// Open one `-R` control channel: request the server bind `bind:rport`, then for
+/// every `Accepted { conn_ref }` signal open a data channel and dial the local
+/// `lhost:lport`. The control channel (and thus the server-side listener) stays
+/// up until the connection drops or the server closes it.
+async fn remote_forward_listen(
+    mut send_request: SendRequest,
+    spec: RemoteForwardSpec,
+    target: Target,
+    authorization: String,
+) -> Result<()> {
+    let req = build_connect_request(&target, &authorization);
+    let mut stream = send_request
+        .send_request(req)
+        .await
+        .context("opening remote-forward control channel")?;
+    let resp = stream
+        .recv_response()
+        .await
+        .context("awaiting remote-forward control response")?;
+    if resp.status() != http::StatusCode::OK {
+        bail!(
+            "server rejected remote-forward control channel: HTTP {}",
+            resp.status()
+        );
+    }
+    let (mut send, recv) = stream.split();
+    // The send half is held (never finished) for the listener's lifetime so the
+    // server sees the control channel stay open.
+    send.send_data(Bytes::from(quish_proto::encode(
+        &ChannelOpen::RemoteForwardListen {
+            bind: spec.bind.to_string(),
+            port: spec.rport,
+        },
+    )?))
+    .await
+    .context("sending RemoteForwardListen open")?;
+    info!(
+        bind = %spec.bind, rport = spec.rport, lhost = %spec.lhost, lport = spec.lport,
+        "remote forward requested"
+    );
+
+    let mut reader = ChannelFrameReader::new(recv);
+    // The control channel carries only `AcceptedSignal` frames (server→client).
+    while let Some(body) = reader.next_frame().await? {
+        let quish_proto::AcceptedSignal { conn_ref } =
+            quish_proto::decode::<quish_proto::AcceptedSignal>(&body)
+                .context("decoding remote-forward accept signal")?;
+        let send_request = send_request.clone();
+        let target = target.clone();
+        let authorization = authorization.clone();
+        let lhost = spec.lhost.clone();
+        let lport = spec.lport;
+        tokio::spawn(async move {
+            if let Err(e) =
+                remote_forward_data(send_request, target, authorization, conn_ref, lhost, lport)
+                    .await
+            {
+                warn!(error = %e, "remote-forward connection ended");
+            }
+        });
+    }
+    Ok(())
+}
+
+/// Handle one inbound connection the server accepted for a `-R` forward: dial the
+/// local `lhost:lport`, open a `RemoteForwardData` channel for `conn_ref`, and
+/// bridge the two. If the local dial fails the inbound is dropped (the server's
+/// parked socket then times out).
+async fn remote_forward_data(
+    mut send_request: SendRequest,
+    target: Target,
+    authorization: String,
+    conn_ref: u64,
+    lhost: String,
+    lport: u16,
+) -> Result<()> {
+    let tcp = match TcpStream::connect((lhost.as_str(), lport)).await {
+        Ok(s) => s,
+        Err(e) => {
+            warn!(%lhost, %lport, error = %e, "remote-forward: local dial failed; dropping inbound");
+            return Ok(());
+        }
+    };
+    let req = build_connect_request(&target, &authorization);
+    let mut stream = send_request
+        .send_request(req)
+        .await
+        .context("opening remote-forward data channel")?;
+    let resp = stream
+        .recv_response()
+        .await
+        .context("awaiting remote-forward data response")?;
+    if resp.status() != http::StatusCode::OK {
+        bail!(
+            "server rejected remote-forward data channel: HTTP {}",
+            resp.status()
+        );
+    }
+    let (mut send, recv) = stream.split();
+    send.send_data(Bytes::from(quish_proto::encode(
+        &ChannelOpen::RemoteForwardData { conn_ref },
+    )?))
+    .await
+    .context("sending RemoteForwardData open")?;
+    bridge(tcp, send, recv).await
 }
 
 /// Accept connections on one local listener; tunnel each over its own channel.
@@ -587,11 +762,21 @@ impl ChannelFrameReader {
         }
     }
 
-    /// Next decoded message, or `None` at clean end of stream.
+    /// Next decoded [`ChannelMessage`], or `None` at clean end of stream.
     pub(crate) async fn next(&mut self) -> Result<Option<ChannelMessage>> {
+        match self.next_frame().await? {
+            Some(body) => Ok(Some(quish_proto::decode::<ChannelMessage>(&body)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Next raw frame body, or `None` at clean end of stream. Callers decode it
+    /// into the type their channel carries (data channels: [`ChannelMessage`];
+    /// a remote-forward control channel: [`quish_proto::AcceptedSignal`]).
+    pub(crate) async fn next_frame(&mut self) -> Result<Option<Bytes>> {
         loop {
             if let Some(body) = quish_proto::take_frame(&mut self.buf)? {
-                return Ok(Some(quish_proto::decode::<ChannelMessage>(&body)?));
+                return Ok(Some(body));
             }
             match self.recv.recv_data().await {
                 Ok(Some(chunk)) => self.buf.put(chunk),
@@ -715,5 +900,48 @@ mod tests {
         assert!(parse_forward("notaport:127.0.0.1:5432").is_err()); // bad lport
         assert!(parse_forward("8080:127.0.0.1:notaport").is_err()); // bad rport
         assert!(parse_forward("a:8080:127.0.0.1:5432").is_err()); // bad bind
+    }
+
+    #[test]
+    fn parse_remote_forward_rport_lhost_lport() {
+        let f = parse_remote_forward("8080:127.0.0.1:5432").unwrap();
+        assert_eq!(
+            f,
+            RemoteForwardSpec {
+                bind: IpAddr::V4(Ipv4Addr::LOCALHOST),
+                rport: 8080,
+                lhost: "127.0.0.1".into(),
+                lport: 5432,
+            }
+        );
+    }
+
+    #[test]
+    fn parse_remote_forward_bind_rport_lhost_lport() {
+        let f = parse_remote_forward("127.0.0.1:8080:127.0.0.1:5432").unwrap();
+        assert_eq!(
+            f,
+            RemoteForwardSpec {
+                bind: IpAddr::V4(Ipv4Addr::LOCALHOST),
+                rport: 8080,
+                lhost: "127.0.0.1".into(),
+                lport: 5432,
+            }
+        );
+    }
+
+    #[test]
+    fn parse_remote_forward_rejects_non_loopback_bind() {
+        assert!(parse_remote_forward("0.0.0.0:8080:127.0.0.1:5432").is_err());
+        assert!(parse_remote_forward("192.168.1.10:8080:127.0.0.1:5432").is_err());
+    }
+
+    #[test]
+    fn parse_remote_forward_rejects_malformed() {
+        assert!(parse_remote_forward("nonsense").is_err()); // too few fields
+        assert!(parse_remote_forward("8080:127.0.0.1").is_err()); // missing lport
+        assert!(parse_remote_forward("notaport:127.0.0.1:5432").is_err()); // bad rport
+        assert!(parse_remote_forward("8080:127.0.0.1:notaport").is_err()); // bad lport
+        assert!(parse_remote_forward("a:8080:127.0.0.1:5432").is_err()); // bad bind
     }
 }

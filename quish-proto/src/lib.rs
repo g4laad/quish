@@ -88,7 +88,7 @@ pub enum ChannelOpen {
     /// Ask the server to bind a loopback listener at `bind:port` and forward
     /// each inbound connection back to the client (`-R` remote forwarding). This
     /// channel stays open as the CONTROL channel: for every accept the server
-    /// sends a [`ChannelMessage::Accepted`] naming a `conn_ref`; the client then
+    /// sends an [`AcceptedSignal`] naming a `conn_ref`; the client then
     /// opens a [`ChannelOpen::RemoteForwardData`] channel for that `conn_ref`.
     /// The server enforces its gate (off by default) and loopback-only/`<1024`
     /// bind policy before binding. `bind` is a server-side address (e.g.
@@ -129,11 +129,19 @@ pub enum ChannelMessage {
     ExitStatus(i32),
     /// Deliver a signal to the remote process (client→server, exec only).
     Signal(Signal),
-    /// Server→client signal on a [`ChannelOpen::RemoteForwardListen`] control
-    /// channel: an inbound connection was accepted and parked under `conn_ref`.
-    /// The client responds by opening a [`ChannelOpen::RemoteForwardData`]
-    /// channel naming this `conn_ref`.
-    Accepted { conn_ref: u64 },
+}
+
+/// Standalone control-plane frame the server sends on a
+/// [`ChannelOpen::RemoteForwardListen`] control channel when an inbound
+/// connection is accepted and parked under `conn_ref`. Kept OUT of
+/// [`ChannelMessage`] deliberately: the byte-stream frame type stays focused on
+/// data plane, and control signaling rides its own type on its own (control)
+/// channel — no data-plane consumer has to handle a control-only variant. The
+/// client replies by opening a [`ChannelOpen::RemoteForwardData`] channel naming
+/// this `conn_ref`. Additive; `PROTOCOL_VERSION` stays 2.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]
+pub struct AcceptedSignal {
+    pub conn_ref: u64,
 }
 
 /// Codec errors. Framing (length prefix, cap) is the caller's job; these cover
@@ -289,9 +297,9 @@ mod tests {
     }
 
     #[test]
-    fn accepted_frame_roundtrips() {
-        let msg = ChannelMessage::Accepted { conn_ref: 7 };
-        let got: ChannelMessage = decode(&encode(&msg).unwrap()[LEN_PREFIX..]).unwrap();
+    fn accepted_signal_roundtrips() {
+        let msg = AcceptedSignal { conn_ref: 7 };
+        let got: AcceptedSignal = decode(&encode(&msg).unwrap()[LEN_PREFIX..]).unwrap();
         assert_eq!(got, msg);
     }
 

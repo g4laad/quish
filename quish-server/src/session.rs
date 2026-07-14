@@ -332,9 +332,11 @@ async fn exec(mut send: SendHalf, reader: FrameReader, command: String) -> Resul
     send.finish().await.map_err(Into::into)
 }
 
-/// Encode + send one frame. `Ok(false)` means the client hung up gracefully
-/// (H3_NO_ERROR) — the caller should stop, not treat it as an error.
-pub(crate) async fn send_msg(send: &mut SendHalf, msg: &ChannelMessage) -> Result<bool> {
+/// Encode + send one frame (any serializable frame type — [`ChannelMessage`] on
+/// data channels, [`quish_proto::AcceptedSignal`] on a remote-forward control
+/// channel). `Ok(false)` means the client hung up gracefully (H3_NO_ERROR) — the
+/// caller should stop, not treat it as an error.
+pub(crate) async fn send_msg<T: serde::Serialize>(send: &mut SendHalf, msg: &T) -> Result<bool> {
     match send.send_data(Bytes::from(quish_proto::encode(msg)?)).await {
         Ok(()) => Ok(true),
         Err(e) if e.is_h3_no_error() => Ok(false),
@@ -761,7 +763,8 @@ pub(crate) async fn serve_remote_forward_listen(
                         continue;
                     };
                     info!(%conn_ref, %peer, "remote-forward inbound accepted");
-                    if !send_msg(&mut send, &ChannelMessage::Accepted { conn_ref }).await? {
+                    let sig = quish_proto::AcceptedSignal { conn_ref };
+                    if !send_msg(&mut send, &sig).await? {
                         let _ = take_conn(conn_id, conn_ref).await; // client hung up
                         break;
                     }
