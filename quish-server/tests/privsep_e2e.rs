@@ -1333,3 +1333,123 @@ fn pam_session_registers_a_shell_login_privsep() {
     drop(stdin);
     let _ = reader.join();
 }
+
+#[test]
+#[ignore]
+fn pam_session_registers_an_exec_privsep() {
+    // Plan 022 Phase 2: an EXEC channel (`quish host cmd`, not an interactive
+    // shell) must also run the PAM *session* stack (`pam_open_session`) so a
+    // non-interactive login registers with host accounting exactly like a shell
+    // login. This is the exec analogue of
+    // `pam_session_registers_a_shell_login_privsep`.
+    //
+    // Accounting signal is wtmp via `pam_lastlog` (same as the shell test): we
+    // background a long-ish exec and, while it is live, assert an OPEN login
+    // record appears for the user above baseline. `who`/utmp and logind are not
+    // usable in the rootless image (see that test / the plan's Decision record),
+    // and session *close* has no observable wtmp signal here — it is verified
+    // structurally via the guard's Drop (pam_close_session + DELETE_CRED at
+    // Reap/Close), not by a logout record.
+    let user = test_user();
+    let pw = test_password();
+    let server = PrivsepServer::start();
+    let target = format!("{user}@{}", server.addr);
+
+    let open_before = count_open_login_records(&user);
+
+    let open_during = thread::scope(|s| {
+        // Background a long-ish exec so the PAM session stays open while we poll.
+        let bg = s.spawn(|| run_client(&server, &[&target, "sleep", "3"], Some(&pw)));
+
+        // Poll for the login record to appear: auth + spawn + open_session take a
+        // moment. Give up after ~2s, comfortably inside the `sleep 3` window.
+        let mut seen = open_before;
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            let now = count_open_login_records(&user);
+            if now > open_before {
+                seen = now;
+                break;
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+
+        let out = bg.join().expect("exec client thread panicked");
+        assert!(out.status.success(), "backgrounded exec failed: {out:?}");
+        seen
+    });
+
+    eprintln!("open_before={open_before} open_during={open_during}");
+    assert!(
+        open_during > open_before,
+        "PAM session did not register the exec login in wtmp \
+         (open records {open_before} -> {open_during}); pam_open_session/pam_lastlog did not run"
+    );
+}
+
+#[test]
+#[ignore]
+fn pam_session_registers_a_pubkey_login_privsep() {
+    // Plan 022 Phase 2 (Q2=A): the monitor opens the PAM session off `st.users`
+    // by username, independent of the auth method — so a PUBKEY login registers
+    // in host accounting just like a password login, with NO `pubkey.rs` change.
+    // This proves that method-agnostic open for a pubkey exec channel.
+    //
+    // Same wtmp-via-pam_lastlog signal and live-window technique as the exec
+    // test; same caveats apply (no utmp/logind in the image; session close has
+    // no observable wtmp signal here, verified structurally via the guard Drop).
+    let user = test_user();
+    let server = PrivsepServer::start();
+    let target = format!("{user}@{}", server.addr);
+
+    // Generate an ed25519 key and install its public half as the test user's
+    // authorized_keys. It must be a REGULAR file (the monitor's reader uses
+    // O_NOFOLLOW and refuses non-regular files); a root-created regular file is
+    // fine (no ownership check), mirroring `pubkey_auth_as_root_privsep`.
+    let keypath = fresh_temp_dir("quish-userkey").join("id_ed25519");
+    let keypath_str = keypath.to_str().unwrap().to_string();
+    let keygen = Command::new("ssh-keygen")
+        .args(["-t", "ed25519", "-N", "", "-q", "-f", &keypath_str])
+        .status()
+        .expect("spawn ssh-keygen");
+    assert!(keygen.success(), "ssh-keygen failed to generate a key");
+
+    let kh_dir = format!("/home/{user}/.config/quish");
+    std::fs::create_dir_all(&kh_dir).expect("create <home>/.config/quish");
+    let authorized = format!("{kh_dir}/authorized_keys");
+    std::fs::copy(format!("{keypath_str}.pub"), &authorized).expect("install user authorized_keys");
+
+    let open_before = count_open_login_records(&user);
+
+    let (out, open_during) = thread::scope(|s| {
+        // Background a long-ish PUBKEY exec: `-i <key>`, NO password.
+        let bg =
+            s.spawn(|| run_client(&server, &["-i", &keypath_str, &target, "sleep", "3"], None));
+
+        let mut seen = open_before;
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            let now = count_open_login_records(&user);
+            if now > open_before {
+                seen = now;
+                break;
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+
+        let out = bg.join().expect("pubkey exec client thread panicked");
+        (out, seen)
+    });
+
+    // Remove the installed key BEFORE asserting so a failure can't leave it behind.
+    let _ = std::fs::remove_file(&authorized);
+
+    assert!(out.status.success(), "pubkey exec failed: {out:?}");
+    eprintln!("open_before={open_before} open_during={open_during}");
+    assert!(
+        open_during > open_before,
+        "PAM session did not register the pubkey login in wtmp \
+         (open records {open_before} -> {open_during}); the monitor's method-agnostic \
+         session open did not run for a pubkey login"
+    );
+}
