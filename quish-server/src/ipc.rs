@@ -37,6 +37,10 @@ pub const ENV_CERT: &str = "QUISH_CERT";
 /// Whether `-L` TCP forwarding is enabled; `"true"`/`"false"`. Set by the monitor
 /// on the worker re-exec, read by `worker::run`.
 pub const ENV_ALLOW_FORWARD: &str = "QUISH_ALLOW_FORWARD";
+/// Whether `-R` remote TCP forwarding is enabled; `"true"`/`"false"`. Set by the
+/// monitor on the worker re-exec, read by `worker::run`. Absent/anything-but-
+/// `"true"` = disabled (fail closed).
+pub const ENV_ALLOW_REMOTE_FORWARD: &str = "QUISH_ALLOW_REMOTE_FORWARD";
 /// Whether to DISABLE the worker's seccomp filter (escape hatch); `"true"`/
 /// `"false"`. Set by the monitor on the worker re-exec, read by `worker::run`.
 /// Absent/anything-but-`"true"` = enforcing (fail closed).

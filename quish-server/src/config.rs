@@ -22,6 +22,14 @@ pub struct FileConfig {
     /// hosts. Overridden by the `--allow-forward` CLI flag. Takes effect in both
     /// dev and privsep (daemon) modes.
     pub allow_forward: Option<bool>,
+    /// Enable remote (`-R`) TCP port forwarding. OFF by default; set `true` to
+    /// allow it. When enabled, the server binds a loopback-only listener
+    /// (`127.0.0.0/8` / `::1`, port >= 1024) and forwards each inbound connection
+    /// back to the client, which dials the client-side target — so a remote
+    /// forward cannot expose a service to non-loopback peers. Overridden by the
+    /// `--allow-remote-forward` CLI flag. Takes effect in both dev and privsep
+    /// (daemon) modes.
+    pub allow_remote_forward: Option<bool>,
     /// Disable the worker's seccomp-bpf syscall filter (privsep mode only). OFF
     /// by default (`false` = the filter is enforcing). An escape hatch for a
     /// kernel/glibc/tokio version where the allowlist starts SIGSYS-killing the

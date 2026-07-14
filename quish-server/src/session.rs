@@ -9,15 +9,20 @@
 //! directly. A dedicated task ([`spawn_frame_reader`]) owns the recv half and
 //! feeds decoded frames into an mpsc the main loop selects over.
 
+use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::LazyLock;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use bytes::{BufMut, Bytes, BytesMut};
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use quish_proto::{ChannelMessage, ChannelOpen};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
-use tokio::sync::mpsc;
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::{Mutex, mpsc};
 use tracing::{info, warn};
 
 pub(crate) type FullStream = h3::server::RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>;
@@ -47,6 +52,17 @@ pub async fn serve(stream: FullStream, allow_forward: bool) -> Result<()> {
         ChannelOpen::Forward { host, port } => {
             info!(%port, "forward channel");
             serve_forward(send, reader, host, port, allow_forward).await
+        }
+        ChannelOpen::RemoteForwardListen { bind, port } => {
+            info!(%port, "remote-forward listen channel");
+            // Dev mode is a single insecure-by-design process with no conn_id;
+            // park sockets under a sentinel connection (0). The privsep worker
+            // (worker.rs) supplies the real conn_id that scopes conn_refs.
+            serve_remote_forward_listen(send, reader, 0, bind, port, allow_remote_forward()).await
+        }
+        ChannelOpen::RemoteForwardData { conn_ref } => {
+            info!(%conn_ref, "remote-forward data channel");
+            serve_remote_forward_data(send, reader, 0, conn_ref).await
         }
         ChannelOpen::ReadFile { path } => {
             info!("readfile channel");
@@ -607,5 +623,227 @@ pub(crate) fn write_loop<W: std::io::Write>(mut writer: W, mut rx: mpsc::Receive
         if writer.write_all(&bytes).is_err() || writer.flush().is_err() {
             break;
         }
+    }
+}
+
+// ---- remote (`-R`) forwarding -------------------------------------------
+
+/// Whether remote (`-R`) TCP forwarding is enabled. Process-global, set once at
+/// startup: `worker::run` from `QUISH_ALLOW_REMOTE_FORWARD`, `run_dev` from the
+/// merged config. Read at each `RemoteForwardListen` open. A process-global
+/// (rather than a threaded parameter) because the shared transport dispatch
+/// signatures are fixed; this mirrors how the worker reads its gate from env.
+static ALLOW_REMOTE_FORWARD: AtomicBool = AtomicBool::new(false);
+
+/// Set the process-wide remote-forward gate (startup only).
+pub(crate) fn set_allow_remote_forward(enabled: bool) {
+    ALLOW_REMOTE_FORWARD.store(enabled, Ordering::Relaxed);
+}
+
+/// Whether remote (`-R`) forwarding is enabled for this process.
+pub(crate) fn allow_remote_forward() -> bool {
+    ALLOW_REMOTE_FORWARD.load(Ordering::Relaxed)
+}
+
+/// How long an accepted-but-unpaired inbound connection stays parked before it
+/// is dropped (bounds a client that never opens the matching data channel).
+const PARK_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Ceiling on inbound connections parked at once across all listeners (bounds
+/// memory against an accept flood on an idle client).
+const MAX_PARKED: usize = 128;
+
+/// An accepted inbound connection awaiting its paired data channel. `conn_id`
+/// binds it to the control channel's connection so another connection cannot
+/// claim it by guessing a `conn_ref`.
+struct ParkedConn {
+    conn_id: u64,
+    tcp: TcpStream,
+}
+
+/// Inbound sockets accepted on remote-forward listeners, keyed by a globally
+/// unique `conn_ref`, awaiting their client-opened data channel. Held only for
+/// brief map ops (never across the byte pump), so a `tokio::sync::Mutex` guard
+/// is never parked across the forward's `.await`s.
+static PARKED: LazyLock<Mutex<HashMap<u64, ParkedConn>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+static NEXT_CONN_REF: AtomicU64 = AtomicU64::new(1);
+
+/// Park an accepted inbound socket, returning its `conn_ref`, or `None` when the
+/// park table is full (the caller drops the socket). A timeout task evicts the
+/// entry if the client never opens its data channel, so a parked socket cannot
+/// leak indefinitely.
+async fn park_conn(conn_id: u64, tcp: TcpStream) -> Option<u64> {
+    let conn_ref = NEXT_CONN_REF.fetch_add(1, Ordering::Relaxed);
+    {
+        let mut parked = PARKED.lock().await;
+        if parked.len() >= MAX_PARKED {
+            return None;
+        }
+        parked.insert(conn_ref, ParkedConn { conn_id, tcp });
+    }
+    tokio::spawn(async move {
+        tokio::time::sleep(PARK_TIMEOUT).await;
+        if PARKED.lock().await.remove(&conn_ref).is_some() {
+            warn!(%conn_ref, "remote-forward parked connection expired unpaired");
+        }
+    });
+    Some(conn_ref)
+}
+
+/// Reclaim a parked inbound socket for `conn_ref`, but only if it belongs to
+/// `conn_id` (a different connection cannot hijack a pending socket). `None` if
+/// unknown, expired, or owned by another connection.
+async fn take_conn(conn_id: u64, conn_ref: u64) -> Option<TcpStream> {
+    let mut parked = PARKED.lock().await;
+    match parked.get(&conn_ref) {
+        Some(p) if p.conn_id == conn_id => parked.remove(&conn_ref).map(|p| p.tcp),
+        _ => None,
+    }
+}
+
+/// Whether a remote-forward bind request passes the gate's bind policy: the port
+/// must be unprivileged (>= 1024) and every resolved address must be loopback.
+/// Pure, so the policy is unit-testable without DNS or a real bind.
+pub(crate) fn remote_bind_allowed(port: u16, addrs: &[SocketAddr]) -> bool {
+    port >= 1024 && !addrs.is_empty() && addrs.iter().all(|a| a.ip().is_loopback())
+}
+
+/// Serve a `RemoteForwardListen` control channel: enforce the gate, bind a
+/// loopback listener at `bind:port`, and for each inbound accept park the socket
+/// and signal the client with `Accepted { conn_ref }`. The channel stays open
+/// for the listener's lifetime and ends when the client closes it (recv EOF) or
+/// the listener errors. No stream is ever server-initiated: the server only
+/// sends `Accepted` down this already-open, client-opened channel.
+pub(crate) async fn serve_remote_forward_listen(
+    mut send: SendHalf,
+    reader: FrameReader,
+    conn_id: u64,
+    bind: String,
+    port: u16,
+    allow_remote_forward: bool,
+) -> Result<()> {
+    if !allow_remote_forward {
+        warn!(%port, "remote-forward listen refused: remote forwarding disabled");
+        return send.finish().await.map_err(Into::into);
+    }
+    // Resolve, then require the gate policy (loopback-only, unprivileged port).
+    let addrs: Vec<SocketAddr> = match tokio::net::lookup_host((bind.as_str(), port)).await {
+        Ok(it) => it.collect(),
+        Err(e) => {
+            warn!(%bind, %port, error = %e, "remote-forward listen refused: resolve failed");
+            return send.finish().await.map_err(Into::into);
+        }
+    };
+    if !remote_bind_allowed(port, &addrs) {
+        warn!(%bind, %port, "remote-forward listen refused: non-loopback bind or privileged port");
+        return send.finish().await.map_err(Into::into);
+    }
+    // Bind only an address already verified loopback + unprivileged.
+    let listener = match TcpListener::bind(addrs[0]).await {
+        Ok(l) => l,
+        Err(e) => {
+            warn!(addr = %addrs[0], error = %e, "remote-forward listen refused: bind failed");
+            return send.finish().await.map_err(Into::into);
+        }
+    };
+    info!(addr = %addrs[0], "remote-forward listener bound");
+
+    // The control channel carries no client→server frames; the reader is watched
+    // only for the client hanging up (recv EOF), which stops the listener.
+    let mut frames = spawn_frame_reader(reader);
+    loop {
+        tokio::select! {
+            accept = listener.accept() => match accept {
+                Ok((tcp, peer)) => {
+                    let Some(conn_ref) = park_conn(conn_id, tcp).await else {
+                        warn!(%peer, "remote-forward accept dropped: park table full");
+                        continue;
+                    };
+                    info!(%conn_ref, %peer, "remote-forward inbound accepted");
+                    if !send_msg(&mut send, &ChannelMessage::Accepted { conn_ref }).await? {
+                        let _ = take_conn(conn_id, conn_ref).await; // client hung up
+                        break;
+                    }
+                }
+                Err(e) => {
+                    warn!(error = %e, "remote-forward accept failed");
+                    break;
+                }
+            },
+            msg = frames.recv() => {
+                if msg.is_none() {
+                    break; // client closed the control channel
+                }
+                // control channel carries no client→server frames; ignore
+            }
+        }
+    }
+    send.finish().await.map_err(Into::into)
+}
+
+/// Serve a `RemoteForwardData` channel: reclaim the parked inbound socket for
+/// `conn_ref` (scoped to this connection) and bridge it to the H3 channel,
+/// reusing the `-L` forward pump. The channel closes without bridging when the
+/// `conn_ref` is unknown, expired, or belongs to another connection.
+pub(crate) async fn serve_remote_forward_data(
+    mut send: SendHalf,
+    reader: FrameReader,
+    conn_id: u64,
+    conn_ref: u64,
+) -> Result<()> {
+    let Some(tcp) = take_conn(conn_id, conn_ref).await else {
+        warn!(%conn_ref, "remote-forward data channel: no parked socket (expired or forged)");
+        return send.finish().await.map_err(Into::into);
+    };
+    info!(%conn_ref, "remote-forward data channel paired");
+    pump_forward(&mut send, reader, tcp).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+    fn sa(ip: IpAddr) -> SocketAddr {
+        SocketAddr::new(ip, 8080)
+    }
+
+    #[test]
+    fn remote_bind_allows_loopback_unprivileged() {
+        assert!(remote_bind_allowed(8080, &[sa(IpAddr::V4(Ipv4Addr::LOCALHOST))]));
+        assert!(remote_bind_allowed(1024, &[sa(IpAddr::V6(Ipv6Addr::LOCALHOST))]));
+    }
+
+    #[test]
+    fn remote_bind_refuses_privileged_port() {
+        assert!(!remote_bind_allowed(1023, &[sa(IpAddr::V4(Ipv4Addr::LOCALHOST))]));
+        assert!(!remote_bind_allowed(80, &[sa(IpAddr::V4(Ipv4Addr::LOCALHOST))]));
+        assert!(!remote_bind_allowed(0, &[sa(IpAddr::V4(Ipv4Addr::LOCALHOST))]));
+    }
+
+    #[test]
+    fn remote_bind_refuses_non_loopback() {
+        assert!(!remote_bind_allowed(
+            8080,
+            &[sa(IpAddr::V4(Ipv4Addr::UNSPECIFIED))]
+        ));
+        assert!(!remote_bind_allowed(
+            8080,
+            &[sa(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 10)))]
+        ));
+        // Any non-loopback address in the resolved set disqualifies the bind.
+        assert!(!remote_bind_allowed(
+            8080,
+            &[
+                sa(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+                sa(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))),
+            ]
+        ));
+    }
+
+    #[test]
+    fn remote_bind_refuses_empty() {
+        assert!(!remote_bind_allowed(8080, &[]));
     }
 }

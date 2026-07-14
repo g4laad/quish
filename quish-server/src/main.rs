@@ -73,6 +73,11 @@ struct Args {
     #[arg(long)]
     allow_forward: bool,
 
+    /// Enable remote (`-R`) TCP port forwarding (loopback-only). OFF by default;
+    /// this flag or `allow_remote_forward = true` in the config file turns it on.
+    #[arg(long)]
+    allow_remote_forward: bool,
+
     /// Disable the worker's seccomp-bpf syscall filter (privsep mode only).
     /// Enforcing by default; use only to work around a kernel/glibc/tokio
     /// regression where the allowlist SIGSYS-kills the worker.
@@ -135,10 +140,18 @@ fn main() -> anyhow::Result<()> {
         .or(file.max_auth_fails)
         .unwrap_or(transport::DEFAULT_MAX_AUTH_FAILS);
     let allow_forward = args.allow_forward || file.allow_forward.unwrap_or(false);
+    let allow_remote_forward = args.allow_remote_forward || file.allow_remote_forward.unwrap_or(false);
     let no_seccomp = args.no_seccomp || file.no_seccomp.unwrap_or(false);
 
     if let Some(dev_user) = args.dev_insecure_user {
-        return run_dev(listen, path, dev_user, max_auth_fails, allow_forward);
+        return run_dev(
+            listen,
+            path,
+            dev_user,
+            max_auth_fails,
+            allow_forward,
+            allow_remote_forward,
+        );
     }
     monitor::run(monitor::Config {
         listen,
@@ -154,6 +167,7 @@ fn main() -> anyhow::Result<()> {
         host_key,
         max_auth_fails,
         allow_forward,
+        allow_remote_forward,
         no_seccomp,
     })
 }
@@ -165,6 +179,7 @@ fn run_dev(
     dev_user: String,
     max_auth_fails: u32,
     allow_forward: bool,
+    allow_remote_forward: bool,
 ) -> anyhow::Result<()> {
     let backends: Vec<Box<dyn AuthBackend>> = vec![
         Box::new(DevInsecureBackend::new(dev_user)),
@@ -172,6 +187,7 @@ fn run_dev(
     ];
     let registry = Arc::new(Registry::new(backends, FAIL_DELAY));
     let backend = Arc::new(transport::Backend::Dev { registry });
+    session::set_allow_remote_forward(allow_remote_forward);
 
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()

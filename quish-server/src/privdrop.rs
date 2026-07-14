@@ -99,6 +99,10 @@ const WORKER_SYSCALLS: &[libc::c_long] = &[
     libc::SYS_getpeername,
     libc::SYS_getsockopt,
     libc::SYS_setsockopt,
+    // Remote (`-R`) forward listener: bind()/socket() are above; a listener also
+    // needs listen() + accept4() (tokio's TcpListener::accept uses accept4).
+    libc::SYS_listen,
+    libc::SYS_accept4,
     // PTY window-size (TIOCSWINSZ) + terminal probes (TCGETS).
     libc::SYS_ioctl,
     // tokio reactor: epoll + eventfd wakeups + futex.

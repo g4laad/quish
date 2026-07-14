@@ -24,8 +24,9 @@ use tracing::{info, warn};
 
 use crate::ipc::{self, Request, Response};
 use crate::session::{
-    FrameReader, FullStream, PumpEnd, SendHalf, pump_exec, pump_shell, read_loop, send_msg,
-    serve_forward, spawn_frame_reader, write_loop,
+    FrameReader, FullStream, PumpEnd, SendHalf, allow_remote_forward, pump_exec, pump_shell,
+    read_loop, send_msg, serve_forward, serve_remote_forward_data, serve_remote_forward_listen,
+    set_allow_remote_forward, spawn_frame_reader, write_loop,
 };
 use crate::signproxy::ProxySigningKey;
 
@@ -54,6 +55,7 @@ pub fn run() -> Result<()> {
         .parse::<u32>()
         .context("max_auth_fails")?;
     let allow_forward = ipc::env_bool(ipc::ENV_ALLOW_FORWARD);
+    set_allow_remote_forward(ipc::env_bool(ipc::ENV_ALLOW_REMOTE_FORWARD));
     let cert_der = CertificateDer::from(
         BASE64_STANDARD
             .decode(ipc::env(ipc::ENV_CERT)?)
@@ -308,6 +310,21 @@ pub async fn serve_channel(
             // Loopback-only egress policy + Data pump live in the shared helper;
             // no monitor RPC (the worker opens the socket unprivileged).
             serve_forward(send, reader, host, port, allow_forward).await
+        }
+        ChannelOpen::RemoteForwardListen { bind, port } => {
+            if !spawn_arg_ok(bind.len()) {
+                warn!(%conn_id, len = bind.len(), "rejecting over-length remote-forward bind");
+                return Ok(());
+            }
+            info!(%conn_id, %port, "remote-forward listen channel");
+            // No monitor RPC: the worker binds the loopback listener unprivileged
+            // (the gate + bind policy live in the shared helper).
+            serve_remote_forward_listen(send, reader, conn_id, bind, port, allow_remote_forward())
+                .await
+        }
+        ChannelOpen::RemoteForwardData { conn_ref } => {
+            info!(%conn_id, %conn_ref, "remote-forward data channel");
+            serve_remote_forward_data(send, reader, conn_id, conn_ref).await
         }
         ChannelOpen::ReadFile { path } => {
             if !spawn_arg_ok(path.len()) {

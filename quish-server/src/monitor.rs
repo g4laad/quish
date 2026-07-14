@@ -36,6 +36,7 @@ pub struct Config {
     pub host_key: Option<PathBuf>,
     pub max_auth_fails: u32,
     pub allow_forward: bool,
+    pub allow_remote_forward: bool,
     pub no_seccomp: bool,
 }
 
@@ -87,6 +88,10 @@ pub fn run(cfg: Config) -> Result<()> {
             .env(ipc::ENV_SIGN_SCHEME, u16::from(scheme).to_string())
             .env(ipc::ENV_MAX_AUTH_FAILS, cfg.max_auth_fails.to_string())
             .env(ipc::ENV_ALLOW_FORWARD, cfg.allow_forward.to_string())
+            .env(
+                ipc::ENV_ALLOW_REMOTE_FORWARD,
+                cfg.allow_remote_forward.to_string(),
+            )
             .env(ipc::ENV_NO_SECCOMP, cfg.no_seccomp.to_string())
             .env(ipc::ENV_CERT, BASE64_STANDARD.encode(&cert_der))
             .spawn()
