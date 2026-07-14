@@ -356,6 +356,12 @@ struct State {
     /// conn_id → its live session ids (for kill-on-close).
     conn_sessions: SessionIndex,
     next_session: u64,
+    /// session_id → open PAM session guard (Q1 = option B: one handle per
+    /// session, opened at spawn, closed on drop at reap/close). Keyed the same
+    /// as `sessions` so the guard's lifetime tracks the child's. Empty in
+    /// no-PAM builds.
+    #[cfg(feature = "pam")]
+    pam_sessions: HashMap<u64, quish_auth::pam::PamSession>,
 }
 
 async fn serve_control(mut listener: UnixSeqpacketListener, registry: Arc<Registry>) -> Result<()> {
@@ -392,23 +398,53 @@ async fn serve_control(mut listener: UnixSeqpacketListener, registry: Arc<Regist
 
             Request::SpawnShell { conn_id, term } => {
                 let reply = match st.users.get(&conn_id).cloned() {
-                    Some(user) => match spawn_shell(&user, &term) {
-                        Ok((child, master)) => {
-                            let id = st.alloc(conn_id, child);
-                            ipc::ctrl_send(
-                                &sock,
-                                &Response::Spawned { session_id: id },
-                                &[master.as_fd()],
-                            )
-                            .await?;
-                            drop(master);
-                            continue;
+                    Some(user) => {
+                        // Open a PAM login session (Q1=B: fresh handle, no
+                        // re-auth) BEFORE spawning so pam_env/limits/loginuid
+                        // apply and the login registers (who/utmp/lastlog). This
+                        // runs only post-`Allow`, so it never shapes an auth
+                        // failure. Fail-soft: a session-stage error is surfaced
+                        // (warn) but does not lock out an already-authenticated
+                        // user — a failing `required` module is logged, not fatal
+                        // (see plan 022 maintenance notes).
+                        #[cfg(feature = "pam")]
+                        let pam = match quish_auth::pam::open_session(&user) {
+                            Ok(s) => Some(s),
+                            Err(e) => {
+                                warn!(%conn_id, %user, error = %e, "pam open_session failed; spawning without a PAM session");
+                                None
+                            }
+                        };
+                        #[cfg(feature = "pam")]
+                        let pam_env = pam.as_ref().map(|s| ipc::encode_pam_env(s.env()));
+                        #[cfg(not(feature = "pam"))]
+                        let pam_env: Option<String> = None;
+
+                        match spawn_shell(&user, &term, pam_env.as_deref()) {
+                            Ok((child, master)) => {
+                                let id = st.alloc(conn_id, child);
+                                // Hold the guard for the session's lifetime; it
+                                // closes (pam_close_session + DELETE_CRED) when
+                                // dropped at Reap/Close.
+                                #[cfg(feature = "pam")]
+                                if let Some(guard) = pam {
+                                    st.pam_sessions.insert(id, guard);
+                                }
+                                ipc::ctrl_send(
+                                    &sock,
+                                    &Response::Spawned { session_id: id },
+                                    &[master.as_fd()],
+                                )
+                                .await?;
+                                drop(master);
+                                continue;
+                            }
+                            Err(e) => {
+                                warn!(error = %e, "spawn shell failed");
+                                Response::Failed
+                            }
                         }
-                        Err(e) => {
-                            warn!(error = %e, "spawn shell failed");
-                            Response::Failed
-                        }
-                    },
+                    }
                     None => Response::Failed,
                 };
                 ipc::ctrl_send(&sock, &reply, &[]).await?;
@@ -526,7 +562,13 @@ async fn serve_control(mut listener: UnixSeqpacketListener, registry: Arc<Regist
                         // child already taken from `sessions`; drop it from the
                         // reverse index too so `Close` doesn't double-reap.
                         st.forget_session(session_id);
-                        Response::Exited(reap_child(child).await)
+                        let code = reap_child(child).await;
+                        // Close the PAM session after the child has exited
+                        // (guard Drop → pam_close_session + setcred(DELETE_CRED)).
+                        // Balances the open at spawn; a missing entry is a no-op.
+                        #[cfg(feature = "pam")]
+                        drop(st.pam_sessions.remove(&session_id));
+                        Response::Exited(code)
                     }
                     None => Response::Failed,
                 };
@@ -539,6 +581,10 @@ async fn serve_control(mut listener: UnixSeqpacketListener, registry: Arc<Regist
                     if let Some(child) = st.sessions.remove(&sid) {
                         let _ = reap_child(child).await;
                     }
+                    // Close the PAM session too, so a client disconnect never
+                    // leaks a stale utmp/logind entry (plan 022 maintenance note).
+                    #[cfg(feature = "pam")]
+                    drop(st.pam_sessions.remove(&sid));
                 }
                 ipc::ctrl_send(&sock, &Response::Closed, &[]).await?;
             }
@@ -583,7 +629,11 @@ impl State {
 
 /// Spawn an interactive shell for `user` on a fresh PTY. Returns the child (for
 /// reaping) and the PTY master (its fd is passed to the worker).
-fn spawn_shell(user: &str, term: &str) -> Result<(Child, PtyMaster)> {
+///
+/// `pam_env` (when `Some`) is the serialized PAM environment from the open
+/// session (see `ipc::encode_pam_env`); it is handed to the session helper via
+/// `ENV_SESS_PAM_ENV`. Always `None` in no-PAM builds.
+fn spawn_shell(user: &str, term: &str, pam_env: Option<&str>) -> Result<(Child, PtyMaster)> {
     let u = crate::privdrop::lookup_user(user)?;
     let master = posix_openpt(OFlag::O_RDWR | OFlag::O_NOCTTY).context("posix_openpt")?;
     grantpt(&master).context("grantpt")?;
@@ -598,14 +648,16 @@ fn spawn_shell(user: &str, term: &str) -> Result<(Child, PtyMaster)> {
     let s1 = s0.try_clone()?;
     let s2 = s0.try_clone()?;
 
-    let child = session_command(&u)
-        .env(ipc::ENV_SESS_TERM, term)
+    let mut cmd = session_command(&u);
+    cmd.env(ipc::ENV_SESS_TERM, term)
         .env(ipc::ENV_SESS_TTY, &slave_path)
         .stdin(Stdio::from(s0))
         .stdout(Stdio::from(s1))
-        .stderr(Stdio::from(s2))
-        .spawn()
-        .context("spawn shell session")?;
+        .stderr(Stdio::from(s2));
+    if let Some(env) = pam_env {
+        cmd.env(ipc::ENV_SESS_PAM_ENV, env);
+    }
+    let child = cmd.spawn().context("spawn shell session")?;
     Ok((child, master))
 }
 
