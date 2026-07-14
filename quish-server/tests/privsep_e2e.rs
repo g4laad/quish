@@ -678,6 +678,94 @@ fn local_forward_refused_when_disabled_privsep() {
     let _ = client.wait();
 }
 
+/// Spawn the real `quish` client with a `-R` remote forward against `server`,
+/// stdin piped and held open so the client stays in forward mode (mirrors
+/// `spawn_forward_client`, but passes `-R` instead of `-L`).
+fn spawn_remote_forward_client(
+    server: &PrivsepServer,
+    user: &str,
+    password: &str,
+    spec: &str,
+) -> Child {
+    let quish = quish_client();
+    let home = server.client_home();
+    Command::new(&quish)
+        .args(["-R", spec, &format!("{user}@{}", server.addr)])
+        .env("HOME", &home)
+        .env("QUISH_PASSWORD", password)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn remote-forwarding quish client")
+}
+
+/// With `--allow-remote-forward`, a `-R` remote forward must round-trip through
+/// the REAL daemon under ENFORCING seccomp (the default): the worker binds a
+/// loopback listener (`listen()`), accepts inbound connections (`accept4()`),
+/// and bridges each back to the client, which dials its local echo service. If
+/// the worker's seccomp allowlist lacked `SYS_listen`/`SYS_accept4` the worker
+/// would be SIGSYS-killed and this round-trip would fail — that is the point of
+/// running it in privsep mode rather than only in dev mode.
+#[test]
+#[ignore]
+fn remote_forward_roundtrips_privsep() {
+    let user = test_user();
+    let pw = test_password();
+    let echo_port = spawn_echo_server(); // client-side target dialed on each accept
+    let rport = free_local_port(); // server-side listener port the client requests
+    let server = PrivsepServer::start_with_args(&["--allow-remote-forward"]);
+    let spec = format!("{rport}:127.0.0.1:{echo_port}");
+
+    let mut client = spawn_remote_forward_client(&server, &user, &pw, &spec);
+    // Keep the client's stdin open so it stays in forward mode.
+    let _stdin = client.stdin.take();
+
+    let mut conn = connect_retry(rport, Duration::from_secs(10));
+    conn.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let payload = b"quish-privsep-remote-forward-roundtrip";
+    conn.write_all(payload).expect("write to remote forward");
+    let mut got = vec![0u8; payload.len()];
+    conn.read_exact(&mut got)
+        .expect("read echo back through remote forward");
+    assert_eq!(&got, payload, "remote-forwarded bytes did not echo back");
+
+    drop(conn);
+    let _ = client.kill();
+    let _ = client.wait();
+}
+
+/// Default (no `--allow-remote-forward`): the real worker must refuse the
+/// `RemoteForwardListen` channel and never bind the requested server-side port,
+/// so nothing ever listens on it. (Unlike `-L`, the SERVER owns the bind, so a
+/// refusal means the port never becomes connectable — poll rather than read EOF.)
+#[test]
+#[ignore]
+fn remote_forward_refused_when_disabled_privsep() {
+    let user = test_user();
+    let pw = test_password();
+    let echo_port = spawn_echo_server();
+    let rport = free_local_port();
+    let server = PrivsepServer::start(); // default: remote forwarding disabled
+    let spec = format!("{rport}:127.0.0.1:{echo_port}");
+
+    let mut client = spawn_remote_forward_client(&server, &user, &pw, &spec);
+    let _stdin = client.stdin.take();
+
+    // The worker refuses the listener; poll the requested server-side port and
+    // confirm nothing ever binds it (a successful connect means the gate leaked).
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < deadline {
+        if TcpStream::connect(("127.0.0.1", rport)).is_ok() {
+            panic!("remote forwarding is disabled but the server bound port {rport}");
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+
+    let _ = client.kill();
+    let _ = client.wait();
+}
+
 #[test]
 #[ignore]
 fn download_streams_user_readable_file_privsep() {
