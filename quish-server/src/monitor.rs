@@ -452,24 +452,54 @@ async fn serve_control(mut listener: UnixSeqpacketListener, registry: Arc<Regist
 
             Request::SpawnExec { conn_id, command } => {
                 let reply = match st.users.get(&conn_id).cloned() {
-                    Some(user) => match spawn_exec(&user, &command) {
-                        Ok((child, io)) => {
-                            let id = st.alloc(conn_id, child);
-                            let [i, o, e] = &io;
-                            ipc::ctrl_send(
-                                &sock,
-                                &Response::Spawned { session_id: id },
-                                &[i.as_fd(), o.as_fd(), e.as_fd()],
-                            )
-                            .await?;
-                            drop(io);
-                            continue;
+                    Some(user) => {
+                        // Open a PAM login session (Q1=B) BEFORE spawning, exactly
+                        // as SpawnShell does, so an exec channel also registers in
+                        // who/utmp/lastlog and gets pam_env/limits/loginuid. The
+                        // monitor-side open is method-agnostic (keyed off
+                        // `st.users`), so pubkey exec logins register too. Runs
+                        // only post-`Allow`; fail-soft (warn, spawn without a
+                        // session) so a session-stage error never locks out an
+                        // already-authenticated user.
+                        #[cfg(feature = "pam")]
+                        let pam = match quish_auth::pam::open_session(&user) {
+                            Ok(s) => Some(s),
+                            Err(e) => {
+                                warn!(%conn_id, %user, error = %e, "pam open_session failed; spawning without a PAM session");
+                                None
+                            }
+                        };
+                        #[cfg(feature = "pam")]
+                        let pam_env = pam.as_ref().map(|s| ipc::encode_pam_env(s.env()));
+                        #[cfg(not(feature = "pam"))]
+                        let pam_env: Option<String> = None;
+
+                        match spawn_exec(&user, &command, pam_env.as_deref()) {
+                            Ok((child, io)) => {
+                                let id = st.alloc(conn_id, child);
+                                // Hold the guard for the session's lifetime; it
+                                // closes (pam_close_session + DELETE_CRED) when
+                                // dropped at Reap/Close.
+                                #[cfg(feature = "pam")]
+                                if let Some(guard) = pam {
+                                    st.pam_sessions.insert(id, guard);
+                                }
+                                let [i, o, e] = &io;
+                                ipc::ctrl_send(
+                                    &sock,
+                                    &Response::Spawned { session_id: id },
+                                    &[i.as_fd(), o.as_fd(), e.as_fd()],
+                                )
+                                .await?;
+                                drop(io);
+                                continue;
+                            }
+                            Err(e) => {
+                                warn!(error = %e, "spawn exec failed");
+                                Response::Failed
+                            }
                         }
-                        Err(e) => {
-                            warn!(error = %e, "spawn exec failed");
-                            Response::Failed
-                        }
-                    },
+                    }
                     None => Response::Failed,
                 };
                 ipc::ctrl_send(&sock, &reply, &[]).await?;
@@ -663,15 +693,25 @@ fn spawn_shell(user: &str, term: &str, pam_env: Option<&str>) -> Result<(Child, 
 
 /// Spawn `command` for `user` with piped stdio. Returns the child and the three
 /// pipe fds (stdin, stdout, stderr) passed to the worker.
-fn spawn_exec(user: &str, command: &str) -> Result<(Child, [std::os::fd::OwnedFd; 3])> {
+///
+/// `pam_env` (when `Some`) is the serialized PAM environment from the open
+/// session (see `ipc::encode_pam_env`); it is handed to the session helper via
+/// `ENV_SESS_PAM_ENV`. Always `None` in no-PAM builds.
+fn spawn_exec(
+    user: &str,
+    command: &str,
+    pam_env: Option<&str>,
+) -> Result<(Child, [std::os::fd::OwnedFd; 3])> {
     let u = crate::privdrop::lookup_user(user)?;
-    let mut child = session_command(&u)
-        .env(ipc::ENV_SESS_COMMAND, command)
+    let mut cmd = session_command(&u);
+    cmd.env(ipc::ENV_SESS_COMMAND, command)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .context("spawn exec session")?;
+        .stderr(Stdio::piped());
+    if let Some(env) = pam_env {
+        cmd.env(ipc::ENV_SESS_PAM_ENV, env);
+    }
+    let mut child = cmd.spawn().context("spawn exec session")?;
     let i = child.stdin.take().context("no stdin")?;
     let o = child.stdout.take().context("no stdout")?;
     let e = child.stderr.take().context("no stderr")?;
