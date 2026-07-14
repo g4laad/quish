@@ -63,3 +63,88 @@ impl AuthBackend for PamBackend {
         }
     }
 }
+
+/// An open PAM login session, held for the lifetime of a spawned session
+/// (Q1 = option B: a fresh `Context` per session, no re-authentication).
+///
+/// Created at spawn time by [`open_session`] for an already-authenticated user,
+/// it runs the account + session + credential stack (`acct_mgmt` +
+/// `open_session`, which itself does `setcred(ESTABLISH)` → `pam_open_session` →
+/// `setcred(REINITIALIZE)`) and captures the resulting PAM environment. The
+/// session is kept open across RPCs by `leak()`ing the borrowed `Session` back
+/// into a resumable [`SessionToken`] and owning the `Context` here; `Drop`
+/// resumes it with `unleak_session` and closes it (`pam_close_session` +
+/// `setcred(DELETE_CRED)`). `Context<ConvT>` is `Send` when `ConvT: Send`
+/// (`conv_null::Conversation` is an empty `Send` struct), so the guard can live
+/// in the monitor's per-connection `State`.
+///
+/// The whole type is behind `#[cfg(feature = "pam")]` (the `pam` module is
+/// feature-gated in `lib.rs`); the no-PAM build never sees it.
+pub struct PamSession {
+    // Field order matters for drop: `token` is consumed via `ctx` in `Drop`, so
+    // both must outlive it; Rust drops fields top-to-bottom but our `Drop` impl
+    // runs first and uses both, so ordering here is not load-bearing.
+    ctx: Context<pam_client::conv_null::Conversation>,
+    token: pam_client::SessionToken,
+    env: Vec<(std::ffi::OsString, std::ffi::OsString)>,
+}
+
+impl PamSession {
+    /// The PAM environment (`pam_getenvlist`) captured after `open_session`.
+    /// Propagated to the session helper so `pam_env`/`pam_systemd`-style vars
+    /// (`XDG_RUNTIME_DIR`, …) reach the login shell.
+    pub fn env(&self) -> &[(std::ffi::OsString, std::ffi::OsString)] {
+        &self.env
+    }
+}
+
+impl Drop for PamSession {
+    fn drop(&mut self) {
+        // Resume the leaked session on the owning context and drop it: that runs
+        // `pam_close_session` + `pam_setcred(DELETE_CRED)` (pam-client
+        // session.rs Drop). Balanced against the `open_session` below.
+        let session = self.ctx.unleak_session(self.token);
+        drop(session);
+    }
+}
+
+impl std::fmt::Debug for PamSession {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PamSession")
+            .field("env_vars", &self.env.len())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Open a PAM login session for an already-authenticated `username`, returning a
+/// guard that closes it on drop.
+///
+/// Runs a **no-authentication** pass with a null conversation: `acct_mgmt`
+/// (account stage) + `open_session` (session + credential stages). This is only
+/// ever called *after* a verdict is `Allow`, so it never shapes an auth failure
+/// and never runs before a successful auth. Blocking PAM C calls — the caller
+/// (the monitor) invokes this inline in its control loop like `spawn_shell`.
+///
+/// Works for both password and pubkey logins (Q2 = option A): the account +
+/// session pass is driven purely by username, independent of how the user
+/// authenticated.
+pub fn open_session(username: &str) -> anyhow::Result<PamSession> {
+    use anyhow::Context as _;
+    let mut ctx = Context::new(
+        SERVICE,
+        Some(username),
+        pam_client::conv_null::Conversation::new(),
+    )
+    .map_err(|e| anyhow::anyhow!("pam ctx for session: {e}"))?;
+    ctx.acct_mgmt(Flag::NONE)
+        .map_err(|e| anyhow::anyhow!("pam acct_mgmt (session): {e}"))?;
+    let session = ctx
+        .open_session(Flag::NONE)
+        .map_err(|e| anyhow::anyhow!("pam open_session: {e}"))
+        .context("opening PAM session")?;
+    // Capture the PAM env before leaking (needs the live `Session`); then leak
+    // to release the `&mut Context` borrow so `ctx` can move into the guard.
+    let env: Vec<(std::ffi::OsString, std::ffi::OsString)> = session.envlist().into();
+    let token = session.leak();
+    Ok(PamSession { ctx, token, env })
+}
