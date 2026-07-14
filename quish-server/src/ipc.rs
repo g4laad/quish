@@ -70,6 +70,63 @@ pub const ENV_SESS_TRANSFER_MODE: &str = "QUISH_SESS_TRANSFER_MODE";
 /// `ENV_SESS_TRANSFER_MODE`; an existing directory is success). Never set
 /// together with the other `ENV_SESS_TRANSFER_*` path vars.
 pub const ENV_SESS_MKDIR_PATH: &str = "QUISH_SESS_MKDIR_PATH";
+/// Present (base64) only when the `pam` feature opened a PAM session: the
+/// serialized PAM environment (`pam_getenvlist`) the monitor captured after
+/// `open_session`. Encoded by [`encode_pam_env`], merged by the session helper
+/// via [`decode_pam_env`] into its exec env (helper-set `HOME`/`USER`/… win).
+/// Absent in no-PAM builds, so the merge is a no-op there.
+pub const ENV_SESS_PAM_ENV: &str = "QUISH_SESS_PAM_ENV";
+
+/// Serialize a PAM env list into the value of [`ENV_SESS_PAM_ENV`].
+///
+/// Format: `\n`-joined `KEY=VALUE` records (each value may itself contain `=`),
+/// then base64 so arbitrary bytes and `=` in values survive the env round-trip.
+/// PAM env values do not contain NUL (they become `execve` env entries) nor, in
+/// practice, `\n`; a `\n` inside a value is the one unrepresentable edge and is
+/// not produced by standard PAM modules.
+/// Only the monitor (under `--features pam`) encodes; the helper always decodes.
+#[cfg(feature = "pam")]
+pub fn encode_pam_env(env: &[(std::ffi::OsString, std::ffi::OsString)]) -> String {
+    use base64::prelude::{BASE64_STANDARD, Engine};
+    use std::os::unix::ffi::OsStrExt;
+    let mut blob: Vec<u8> = Vec::new();
+    for (k, v) in env {
+        let kb = k.as_bytes();
+        let vb = v.as_bytes();
+        // Skip records that can't round-trip cleanly rather than corrupt the blob.
+        if kb.contains(&b'=') || kb.contains(&b'\n') || vb.contains(&b'\n') {
+            continue;
+        }
+        blob.extend_from_slice(kb);
+        blob.push(b'=');
+        blob.extend_from_slice(vb);
+        blob.push(b'\n');
+    }
+    BASE64_STANDARD.encode(blob)
+}
+
+/// Decode [`ENV_SESS_PAM_ENV`] back into `(key, value)` pairs. A malformed blob
+/// or a record without `=` is skipped (fail-soft: never abort the login over a
+/// mangled env passthrough).
+pub fn decode_pam_env(encoded: &str) -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
+    use base64::prelude::{BASE64_STANDARD, Engine};
+    use std::os::unix::ffi::OsStrExt;
+    let Ok(blob) = BASE64_STANDARD.decode(encoded) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for line in blob.split(|&b| b == b'\n') {
+        if line.is_empty() {
+            continue;
+        }
+        if let Some(eq) = line.iter().position(|&b| b == b'=') {
+            let key = std::ffi::OsStr::from_bytes(&line[..eq]).to_owned();
+            let val = std::ffi::OsStr::from_bytes(&line[eq + 1..]).to_owned();
+            out.push((key, val));
+        }
+    }
+    out
+}
 
 /// Read a required handoff env var (set by the monitor on the worker/session
 /// re-exec), or an error naming it.

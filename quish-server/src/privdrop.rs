@@ -248,17 +248,46 @@ pub fn run_session_helper() -> Result<()> {
 
     // Build a clean, login-like environment explicitly (std::env::set_var is
     // `unsafe` in edition 2024; execve takes the env array directly).
-    let envp: Vec<CString> = [
+    //
+    // The helper controls these six vars; they are security-relevant (they
+    // decide which account/home the shell runs as and its search PATH). PAM env
+    // (from `pam_env`/`pam_systemd`/…, passed via `ENV_SESS_PAM_ENV`) is merged
+    // in FIRST, then these overwrite any collision — helper-set values ALWAYS
+    // win, so a hostile PAM module cannot redirect HOME/USER/SHELL/etc. Extra
+    // PAM vars (XDG_RUNTIME_DIR, DBUS_SESSION_BUS_ADDRESS, …) pass through.
+    let helper_env = [
         format!("HOME={home}"),
         format!("USER={user}"),
         format!("LOGNAME={user}"),
         format!("SHELL={shell}"),
         format!("TERM={term}"),
         "PATH=/usr/local/bin:/usr/bin:/bin".to_string(),
-    ]
-    .into_iter()
-    .map(|s| CString::new(s).expect("env has no nul"))
-    .collect();
+    ];
+    const HELPER_KEYS: [&str; 6] = ["HOME", "USER", "LOGNAME", "SHELL", "TERM", "PATH"];
+
+    let mut envp: Vec<CString> = Vec::new();
+    // No-op in no-PAM builds (the var is absent) and for pubkey/first-slice paths
+    // that don't open a session.
+    if let Ok(encoded) = std::env::var(ipc::ENV_SESS_PAM_ENV) {
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+        for (k, v) in ipc::decode_pam_env(&encoded) {
+            // Drop any PAM entry that would collide with a helper-controlled key.
+            if HELPER_KEYS.iter().any(|hk| k.as_bytes() == hk.as_bytes()) {
+                continue;
+            }
+            let mut entry = k.into_vec();
+            entry.push(b'=');
+            entry.extend_from_slice(v.as_bytes());
+            if let Ok(c) = CString::new(entry) {
+                envp.push(c);
+            }
+        }
+    }
+    envp.extend(
+        helper_env
+            .into_iter()
+            .map(|s| CString::new(s).expect("env has no nul")),
+    );
 
     execve(&shell_c, &argv, &envp).context("exec shell")?;
     unreachable!("execve returned without error")
