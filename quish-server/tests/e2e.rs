@@ -551,3 +551,63 @@ fn local_forward_refused_when_disabled() {
     let _ = client.kill();
     let _ = client.wait();
 }
+
+/// With remote forwarding enabled, a `-R` remote forward exposes a client-side
+/// service on a server-side loopback port: an inbound connection to the server
+/// port is tunneled back to the client, which dials its local echo service, and
+/// bytes round-trip.
+#[test]
+#[ignore]
+fn remote_forward_roundtrips_when_enabled() {
+    let echo_port = spawn_echo_server(); // client-side target dialed on each accept
+    let rport = free_local_port(); // server-side listener port the client requests
+    let server = DevServer::start_with_args("testuser", &["--allow-remote-forward"]);
+    let target = format!("testuser@{}", server.addr);
+    let spec = format!("{rport}:127.0.0.1:{echo_port}");
+
+    let mut client = run_client_child(&server, &["-R", &spec, &target], Some("anything"));
+    // Keep the client's stdin open so it stays in forward mode.
+    let _stdin = client.stdin.take();
+
+    let mut conn = connect_retry(rport, Duration::from_secs(10));
+    conn.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let payload = b"quish-remote-forward-roundtrip";
+    conn.write_all(payload).expect("write to remote forward");
+    let mut got = vec![0u8; payload.len()];
+    conn.read_exact(&mut got)
+        .expect("read echo back through remote forward");
+    assert_eq!(&got, payload, "remote-forwarded bytes did not echo back");
+
+    drop(conn);
+    let _ = client.kill();
+    let _ = client.wait();
+}
+
+/// With remote forwarding disabled (the default — no `--allow-remote-forward`),
+/// the server must refuse the `RemoteForwardListen` channel and never bind the
+/// requested port, so nothing ever listens on it.
+#[test]
+#[ignore]
+fn remote_forward_refused_when_disabled() {
+    let echo_port = spawn_echo_server();
+    let rport = free_local_port();
+    let server = DevServer::start("testuser"); // default: remote forwarding disabled
+    let target = format!("testuser@{}", server.addr);
+    let spec = format!("{rport}:127.0.0.1:{echo_port}");
+
+    let mut client = run_client_child(&server, &["-R", &spec, &target], Some("anything"));
+    let _stdin = client.stdin.take();
+
+    // The server refuses the listener; poll the requested server-side port and
+    // confirm nothing ever binds it (a successful connect means the gate leaked).
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < deadline {
+        if TcpStream::connect(("127.0.0.1", rport)).is_ok() {
+            panic!("remote forwarding is disabled but the server bound port {rport}");
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+
+    let _ = client.kill();
+    let _ = client.wait();
+}
