@@ -12,8 +12,8 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::process::Stdio;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::LazyLock;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -814,15 +814,30 @@ mod tests {
 
     #[test]
     fn remote_bind_allows_loopback_unprivileged() {
-        assert!(remote_bind_allowed(8080, &[sa(IpAddr::V4(Ipv4Addr::LOCALHOST))]));
-        assert!(remote_bind_allowed(1024, &[sa(IpAddr::V6(Ipv6Addr::LOCALHOST))]));
+        assert!(remote_bind_allowed(
+            8080,
+            &[sa(IpAddr::V4(Ipv4Addr::LOCALHOST))]
+        ));
+        assert!(remote_bind_allowed(
+            1024,
+            &[sa(IpAddr::V6(Ipv6Addr::LOCALHOST))]
+        ));
     }
 
     #[test]
     fn remote_bind_refuses_privileged_port() {
-        assert!(!remote_bind_allowed(1023, &[sa(IpAddr::V4(Ipv4Addr::LOCALHOST))]));
-        assert!(!remote_bind_allowed(80, &[sa(IpAddr::V4(Ipv4Addr::LOCALHOST))]));
-        assert!(!remote_bind_allowed(0, &[sa(IpAddr::V4(Ipv4Addr::LOCALHOST))]));
+        assert!(!remote_bind_allowed(
+            1023,
+            &[sa(IpAddr::V4(Ipv4Addr::LOCALHOST))]
+        ));
+        assert!(!remote_bind_allowed(
+            80,
+            &[sa(IpAddr::V4(Ipv4Addr::LOCALHOST))]
+        ));
+        assert!(!remote_bind_allowed(
+            0,
+            &[sa(IpAddr::V4(Ipv4Addr::LOCALHOST))]
+        ));
     }
 
     #[test]

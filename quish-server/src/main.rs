@@ -140,7 +140,8 @@ fn main() -> anyhow::Result<()> {
         .or(file.max_auth_fails)
         .unwrap_or(transport::DEFAULT_MAX_AUTH_FAILS);
     let allow_forward = args.allow_forward || file.allow_forward.unwrap_or(false);
-    let allow_remote_forward = args.allow_remote_forward || file.allow_remote_forward.unwrap_or(false);
+    let allow_remote_forward =
+        args.allow_remote_forward || file.allow_remote_forward.unwrap_or(false);
     let no_seccomp = args.no_seccomp || file.no_seccomp.unwrap_or(false);
 
     if let Some(dev_user) = args.dev_insecure_user {

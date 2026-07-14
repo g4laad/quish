@@ -380,7 +380,14 @@ async fn run(
     // Forward mode: bind the local ports and tunnel each accepted connection over
     // its own Extended CONNECT channel. Runs until the listeners stop (Ctrl-C).
     if !forwards.is_empty() || !remote_forwards.is_empty() {
-        run_forwarding(send_request, forwards, remote_forwards, target, authorization).await?;
+        run_forwarding(
+            send_request,
+            forwards,
+            remote_forwards,
+            target,
+            authorization,
+        )
+        .await?;
         let _ = drive.await;
         return Ok(0);
     }
