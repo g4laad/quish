@@ -29,6 +29,10 @@ fork+exec — `nix::fork` is `unsafe`, which the workspace forbids):
 - **monitor** (root) — owns the host private key (signs TLS handshakes on the
   worker's behalf, so the key never enters the worker), the auth registry (PAM +
   pubkey), and session spawning (setuids each session to its authenticated user).
+  With `--features pam`, a password shell login also runs the PAM **session**
+  stack (`pam_open_session`/`setcred`, held for the session and closed at logout)
+  so the login integrates with the host — `pam_limits`, `pam_env`, and utmp/wtmp
+  accounting (`last`/`lastlog`); see `dist/pam.d/quish`.
 
 A fully compromised worker still can't read the host key, forge an identity, or
 `setuid`. See `CLAUDE.md` for the full design.
@@ -91,8 +95,9 @@ restriction. For root logins prefer pubkey auth: put the ed25519 public key in
 
 ## Deployment
 
-`dist/` ships a systemd unit, `pam.d/quish` (`pam_unix ... nodelay`), and a
-`sysusers.d` entry for the `quish` account.
+`dist/` ships a systemd unit, `pam.d/quish` (`pam_unix` auth/account plus the
+`--features pam` session stack: `pam_limits`/`pam_loginuid`/`pam_env`/`pam_lastlog`),
+and a `sysusers.d` entry for the `quish` account.
 
 ## Hardening
 
