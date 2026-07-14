@@ -338,7 +338,17 @@ async fn reap_child(mut child: Child) -> i32 {
             return status.code().unwrap_or(-1);
         }
         let p = nix::unistd::Pid::from_raw(pid as i32);
+        // Tear down the whole session process group, not just the leader. Shell and
+        // exec helpers setsid() (privdrop::run_session_helper), so pgid == pid and
+        // killpg reaches backgrounded jobs (`sleep 293 &`) the shell spawned — which a
+        // leader-only kill would orphan. killpg(pid) can only ever target THIS
+        // session's group (a group with id == pid exists only because that process
+        // setsid()'d) or nothing (ESRCH, harmless) — never the monitor's group. The
+        // direct kill(p, …) also covers non-setsid helpers (transfer/mkdir/upload),
+        // which are not group leaders. SIGHUP first (graceful), then SIGKILL.
+        let _ = nix::sys::signal::killpg(p, nix::sys::signal::Signal::SIGHUP);
         let _ = nix::sys::signal::kill(p, nix::sys::signal::Signal::SIGHUP);
+        let _ = nix::sys::signal::killpg(p, nix::sys::signal::Signal::SIGKILL);
         let _ = nix::sys::signal::kill(p, nix::sys::signal::Signal::SIGKILL);
         child.wait().map(|s| s.code().unwrap_or(-1)).unwrap_or(-1)
     })
