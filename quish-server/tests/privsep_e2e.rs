@@ -467,9 +467,11 @@ fn reap_does_not_wedge_the_monitor_privsep() {
 #[ignore]
 fn disconnect_kills_the_session_privsep() {
     // Guards plan 003 (part 2): when the client disconnects, the monitor's
-    // Close reap must SIGKILL the connection's sessions. A shell backgrounds a
-    // uniquely-named `sleep 293`; after we kill the client, that marker must
-    // die. The distinctive duration keeps pgrep from matching anything else.
+    // Close reap must SIGKILL the whole session process GROUP (killpg), not just
+    // the leader pid, so backgrounded jobs — even ones ignoring SIGHUP — are
+    // reaped. A shell backgrounds a uniquely-named `sleep 293`; after we kill the
+    // client, that marker must die. The distinctive duration keeps pgrep from
+    // matching anything else.
     let user = test_user();
     let pw = test_password();
     let server = PrivsepServer::start();
@@ -497,8 +499,14 @@ fn disconnect_kills_the_session_privsep() {
     });
 
     // Keep stdin OPEN so the shell stays live; background a marker process.
+    // `trap '' HUP` makes the shell (and the `sleep` it backgrounds, which inherits
+    // the ignore) immune to SIGHUP, so the PTY-hangup / leader-only-kill path can
+    // NOT reap the job. The marker then dies ONLY if the monitor's Close reap
+    // signals the whole process GROUP with SIGKILL (killpg). This turns a timing-
+    // dependent flake into a deterministic guard: it fails on a leader-only reap and
+    // passes on a group reap.
     stdin
-        .write_all(b"sleep 293 & echo started\n")
+        .write_all(b"trap '' HUP; sleep 293 & echo started\n")
         .expect("write to client stdin");
     stdin.flush().expect("flush client stdin");
 
