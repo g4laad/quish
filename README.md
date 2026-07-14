@@ -93,6 +93,25 @@ makes password auth fail for root — an environment policy, not a quish
 restriction. For root logins prefer pubkey auth: put the ed25519 public key in
 `/root/.config/quish/authorized_keys`.
 
+## Port forwarding
+
+Both directions are **off by default** and **loopback-only** — a forward can only
+reach or expose `127.0.0.0/8` / `::1`, never a routable address.
+
+- **Local (`-L [bind:]lport:rhost:rport`)** — enabled by the server's
+  `--allow-forward` (or `allow_forward = true`). Connections to the client's
+  local port tunnel to `rhost:rport` on the server.
+- **Remote (`-R [bind:]rport:lhost:lport`)** — enabled by the server's
+  `--allow-remote-forward` (or `allow_remote_forward = true`). The server binds a
+  loopback listener on `rport` (refusing non-loopback binds and ports `<1024`);
+  each inbound connection is tunneled back to the client, which dials
+  `lhost:lport`.
+
+```sh
+# expose the client's 127.0.0.1:3000 as 127.0.0.1:8080 on the server
+quish -R 8080:127.0.0.1:3000 user@host      # server started with --allow-remote-forward
+```
+
 ## Deployment
 
 `dist/` ships a systemd unit, `pam.d/quish` (`pam_unix` auth/account plus the

@@ -32,6 +32,14 @@ max_auth_fails = 6
 # is actually loaded (`quishd --config /etc/quish/server.toml`).
 # allow_forward = false
 
+# Enable remote (`-R`) TCP port forwarding. OFF by default; when enabled the
+# server binds a loopback-only listener (`127.0.0.0/8` / `::1`, port >= 1024) and
+# forwards each inbound connection back to the client, which dials the client-side
+# target — so a remote forward cannot expose a service to non-loopback peers.
+# Leave unset (or false) to refuse all remote-forward channels. Overridden by the
+# `--allow-remote-forward` CLI flag. Takes effect in both dev and privsep modes.
+# allow_remote_forward = false
+
 # Disable the network-facing worker's seccomp-bpf syscall filter. The filter is
 # ENFORCING by default (this key defaults to false): after dropping privileges
 # the worker may make only its ~50 legitimate syscalls; anything else kills it.
