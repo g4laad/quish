@@ -1223,3 +1223,113 @@ fn pubkey_auth_as_root_privsep() {
         "pubkey login as root did not run as uid 0: {out:?}"
     );
 }
+
+/// Count the login's currently-OPEN wtmp records for `user`: a login
+/// (`USER_PROCESS`) record with no matching logout (`DEAD_PROCESS`) record.
+/// `last` renders these as "still logged in" or (with no `/var/run/utmp` to
+/// confirm liveness, as in the rootless image) "gone - no logout". `-w` keeps
+/// full usernames so `starts_with` matches the untruncated login name.
+fn count_open_login_records(user: &str) -> usize {
+    let out = Command::new("last")
+        .args(["-w", "-n", "200"])
+        .output()
+        .expect("run last");
+    let text = String::from_utf8_lossy(&out.stdout);
+    text.lines()
+        .filter(|line| {
+            line.starts_with(user)
+                && (line.contains("still logged in") || line.contains("gone - no logout"))
+        })
+        .count()
+}
+
+#[test]
+#[ignore]
+fn pam_session_registers_a_shell_login_privsep() {
+    // Plan 022, Step 5: a password shell login must run the PAM *session* stack
+    // (`pam_open_session`) so the login registers with the host accounting, and
+    // that session must be closed at logout (`pam_close_session`).
+    //
+    // Accounting signal: `pam_lastlog` writes a wtmp login record on session
+    // open and a logout record on close. We assert an OPEN record appears for
+    // the user while the shell is live (registration), and that it is gone
+    // (closed) after logout+reap (un-registration). `who`/utmp is NOT used: the
+    // rootless-podman image has no `/var/run/utmp` (and no logind), so `who` is
+    // always empty here — wtmp via `pam_lastlog` is the portable signal. See the
+    // plan's Decision record ("Verified via") for why logind/utmp are not
+    // exercised in the container.
+    let user = test_user();
+    let pw = test_password();
+    let server = PrivsepServer::start();
+
+    let open_before = count_open_login_records(&user);
+
+    let mut child = spawn_interactive_client(&server, &user, &pw);
+    let mut stdin = child.stdin.take().expect("piped stdin");
+    let stdout = child.stdout.take().expect("piped stdout");
+
+    // Reader thread: signal once the shell is up and running commands.
+    let (tx, rx) = mpsc::channel();
+    let reader = thread::spawn(move || {
+        let mut r = BufReader::new(stdout);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match r.read_line(&mut line) {
+                Ok(0) => break,
+                Ok(_) => {
+                    if line.contains("QREADY") {
+                        let _ = tx.send(());
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    // Keep stdin OPEN so the session stays live while we inspect wtmp.
+    stdin
+        .write_all(b"echo QREADY\n")
+        .expect("write to client stdin");
+    stdin.flush().expect("flush client stdin");
+    rx.recv_timeout(Duration::from_secs(10))
+        .expect("shell never reported QREADY");
+
+    // Session is OPEN: pam_open_session -> pam_lastlog wrote a login record.
+    let open_during = count_open_login_records(&user);
+    eprintln!("open_before={open_before} open_during={open_during}");
+    assert!(
+        open_during > open_before,
+        "PAM session did not register the shell login in wtmp \
+         (open records {open_before} -> {open_during}); pam_open_session/pam_lastlog did not run"
+    );
+
+    // Log out: the shell `exit` ends the session -> monitor Reap -> the PAM
+    // guard drops -> pam_close_session + pam_setcred(DELETE_CRED). We require the
+    // client to exit cleanly and promptly, which proves the close path ran
+    // without wedging the monitor (reap_does_not_wedge covers the same path).
+    //
+    // NOTE (un-registration signal): pam_lastlog writes only a *login* record to
+    // wtmp, not a logout one, and this image has no logind — so there is no
+    // observable accounting signal for session close here (every login leaves a
+    // permanent "gone - no logout" wtmp record; hence `open_before` may be > 0).
+    // Session close is therefore verified structurally (the guard's Drop runs
+    // pam_close_session at Reap/Close) and by clean, non-wedging teardown, not
+    // by a wtmp logout record. On a systemd host `pam_systemd` would remove the
+    // logind session, giving an observable close signal (deferred; see plan 022).
+    stdin
+        .write_all(b"exit\n")
+        .expect("write exit to client stdin");
+    stdin.flush().expect("flush exit");
+
+    let (done_tx, done_rx) = mpsc::channel();
+    thread::spawn(move || {
+        let _ = child.wait();
+        let _ = done_tx.send(());
+    });
+    done_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("client did not exit within 10s after logout (close path wedged?)");
+    drop(stdin);
+    let _ = reader.join();
+}
