@@ -18,7 +18,7 @@ use nix::fcntl::OFlag;
 use nix::pty::{PtyMaster, grantpt, posix_openpt, ptsname_r, unlockpt};
 use nix::unistd::User;
 use quish_auth::pubkey::PubkeyBackend;
-use quish_auth::{AuthBackend, ConnInfo, Registry, Verdict};
+use quish_auth::{AuthBackend, ChallengeResponse, ConnInfo, Registry, Verdict};
 use rustls::SignatureScheme;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::sign::SigningKey;
@@ -38,6 +38,7 @@ pub struct Config {
     pub allow_forward: bool,
     pub allow_remote_forward: bool,
     pub no_seccomp: bool,
+    pub totp: bool,
 }
 
 /// Run the monitor: generate the host key, wire up sockets, launch the worker,
@@ -66,7 +67,7 @@ pub fn run(cfg: Config) -> Result<()> {
     spawn_sign_thread(sign_listener, signing_key, scheme);
 
     // Auth registry (pubkey per-user; PAM when compiled in).
-    let registry = build_registry();
+    let registry = build_registry(cfg.totp);
     let exe = std::env::current_exe().context("current_exe")?;
 
     // Everything below needs the reactor (seqpacket listener registers with it).
@@ -188,16 +189,34 @@ fn generate_identity() -> Result<(CertificateDer<'static>, PrivateKeyDer<'static
     Ok((cert_der, key_der, key_bytes))
 }
 
-fn build_registry() -> Arc<Registry> {
+fn build_registry(totp: bool) -> Arc<Registry> {
     let pubkey: Box<dyn AuthBackend> =
         Box::new(PubkeyBackend::with_resolver(Box::new(per_user_keys)));
     #[cfg(feature = "pam")]
-    let backends = vec![
-        pubkey,
-        Box::new(quish_auth::pam::PamBackend) as Box<dyn AuthBackend>,
-    ];
+    let backends = {
+        // With TOTP enabled, wrap PAM as the FIRST factor and require a per-user
+        // TOTP code as the second (always-challenge — a bogus user is challenged
+        // identically). Otherwise PAM stays single-shot. One vec entry either way.
+        let password: Box<dyn AuthBackend> = if totp {
+            Box::new(quish_auth::totp::TotpBackend::new(
+                Box::new(quish_auth::pam::PamBackend),
+                Box::new(per_user_totp_secret),
+            ))
+        } else {
+            Box::new(quish_auth::pam::PamBackend)
+        };
+        vec![pubkey, password]
+    };
     #[cfg(not(feature = "pam"))]
-    let backends = vec![pubkey];
+    let backends = {
+        if totp {
+            warn!(
+                "totp is enabled but this build lacks the `pam` feature; there is \
+                 no password first factor, so the TOTP backend is not wired"
+            );
+        }
+        vec![pubkey]
+    };
     Arc::new(Registry::new(backends, crate::FAIL_DELAY))
 }
 
@@ -205,6 +224,17 @@ fn build_registry() -> Arc<Registry> {
 fn per_user_keys(user: &str) -> Option<PathBuf> {
     let u = User::from_name(user).ok()??;
     Some(u.dir.join(".config/quish/authorized_keys"))
+}
+
+/// Resolve a user's TOTP shared secret from `~/.config/quish/totp` (base32,
+/// RFC 4648; root reads any home). `None` if the user/file is absent or the
+/// contents aren't valid base32. Only used under the `pam` feature (the first
+/// factor); gated so a no-PAM build doesn't carry a dead helper.
+#[cfg(feature = "pam")]
+fn per_user_totp_secret(user: &str) -> Option<Vec<u8>> {
+    let u = User::from_name(user).ok()??;
+    let text = std::fs::read_to_string(u.dir.join(".config/quish/totp")).ok()?;
+    quish_auth::totp::decode_base32_secret(&text)
 }
 
 /// Burst capacity of the host-key signing token bucket. One legitimate full TLS
@@ -370,6 +400,9 @@ struct State {
     sessions: HashMap<u64, Child>,
     /// conn_id → its live session ids (for kill-on-close).
     conn_sessions: SessionIndex,
+    /// conn_id → its parked multi-round challenge (bounded + TTL'd, keyed by the
+    /// server-assigned conn_id so it can never be resumed on another connection).
+    challenges: crate::transport::ChallengeStore,
     next_session: u64,
     /// session_id → open PAM session guard (Q1 = option B: one handle per
     /// session, opened at spawn, closed on drop at reap/close). Keyed the same
@@ -395,20 +428,42 @@ async fn serve_control(mut listener: UnixSeqpacketListener, registry: Arc<Regist
                 authorization,
                 peer,
                 channel_binding,
+                challenge_answer,
             } => {
-                let conn = ConnInfo {
+                let mut conn = ConnInfo {
                     peer_addr: peer
                         .parse()
                         .unwrap_or_else(|_| "0.0.0.0:0".parse().unwrap()),
                     channel_binding,
+                    challenge: None,
                 };
-                let verdict = registry.verdict(authorization.as_deref(), &conn).await;
-                let allow = matches!(verdict, Verdict::Allow { .. });
-                if let Verdict::Allow { user } = verdict {
-                    info!(%conn_id, %user, "authenticated");
-                    st.users.insert(conn_id, user);
+                // Resume a parked challenge only if the echoed token matches the
+                // state THIS connection parked (monitor owns the map, keyed by
+                // conn_id — the worker never holds it, so it cannot be spoofed
+                // across connections).
+                if let Some(ans) = challenge_answer {
+                    conn.challenge = st
+                        .challenges
+                        .take(conn_id, &ans.token)
+                        .map(|state| ChallengeResponse::new(state, ans.responses));
                 }
-                ipc::ctrl_send(&sock, &Response::Verdict(allow), &[]).await?;
+                let verdict = registry.verdict(authorization.as_deref(), &conn).await;
+                let response = match verdict {
+                    Verdict::Allow { user } => {
+                        info!(%conn_id, %user, "authenticated");
+                        st.users.insert(conn_id, user);
+                        Response::Verdict(true)
+                    }
+                    Verdict::Challenge { state, prompts } => {
+                        let token = state.token.clone();
+                        st.challenges.insert(conn_id, state);
+                        Response::Challenge {
+                            challenge: quish_proto::Challenge { token, prompts },
+                        }
+                    }
+                    Verdict::Deny => Response::Verdict(false),
+                };
+                ipc::ctrl_send(&sock, &response, &[]).await?;
             }
 
             Request::SpawnShell { conn_id, term } => {
@@ -622,6 +677,7 @@ async fn serve_control(mut listener: UnixSeqpacketListener, registry: Arc<Regist
 
             Request::Close { conn_id } => {
                 st.users.remove(&conn_id);
+                st.challenges.clear(conn_id);
                 for sid in st.conn_sessions.take_conn(conn_id) {
                     if let Some(child) = st.sessions.remove(&sid) {
                         let _ = reap_child(child).await;

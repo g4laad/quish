@@ -157,17 +157,22 @@ impl MonitorClient {
         &self,
         conn_id: u64,
         authorization: Option<&str>,
+        answer: Option<&quish_proto::ChallengeAnswer>,
         conn: &ConnInfo,
-    ) -> Result<bool> {
+    ) -> Result<crate::transport::AuthOutcome> {
+        use crate::transport::AuthOutcome;
         let req = Request::Authenticate {
             conn_id,
             authorization: authorization.map(str::to_string),
             peer: conn.peer_addr.to_string(),
             channel_binding: conn.channel_binding,
+            challenge_answer: answer.cloned(),
         };
         match self.call(&req).await?.0 {
-            Response::Verdict(allow) => Ok(allow),
-            _ => Ok(false),
+            Response::Verdict(true) => Ok(AuthOutcome::Allow),
+            Response::Verdict(false) => Ok(AuthOutcome::Deny),
+            Response::Challenge { challenge } => Ok(AuthOutcome::Challenge(challenge)),
+            _ => Ok(AuthOutcome::Deny),
         }
     }
 

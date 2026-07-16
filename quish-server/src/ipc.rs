@@ -159,6 +159,10 @@ pub enum Request {
         authorization: Option<String>,
         peer: String,
         channel_binding: [u8; 32],
+        /// Present only on a challenge follow-up round: the client's echoed token
+        /// + responses. The monitor matches the token against the per-connection
+        /// state it parked for `conn_id` (never trusting the worker to hold it).
+        challenge_answer: Option<quish_proto::ChallengeAnswer>,
     },
     /// Open a PTY shell for `conn_id`'s authed user (response passes the master fd).
     SpawnShell { conn_id: u64, term: String },
@@ -201,6 +205,9 @@ pub enum Request {
 pub enum Response {
     /// Auth verdict; `true` = allowed (identity kept monitor-side).
     Verdict(bool),
+    /// A further factor is required: the worker relays this to the client as a
+    /// `401` + challenge header. The monitor keeps the matching state parked.
+    Challenge { challenge: quish_proto::Challenge },
     /// Session spawned; fds ride alongside via `SCM_RIGHTS`.
     Spawned { session_id: u64 },
     /// Reaped exit code.

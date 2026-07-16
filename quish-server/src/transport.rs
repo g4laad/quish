@@ -2,9 +2,10 @@
 //! session spawning are abstracted behind [`Backend`] so the same transport
 //! drives an in-process registry (dev) or the monitor RPC client (privsep).
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -12,13 +13,69 @@ use bytes::Bytes;
 use h3::ext::Protocol;
 use http::{Method, Response, StatusCode};
 use quinn::crypto::rustls::QuicServerConfig;
-use quish_auth::{ConnInfo, Registry, Verdict};
+use quish_auth::{ChallengeResponse, ConnInfo, Registry, Verdict};
 use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
 use tokio::time::{Instant, timeout};
 use tracing::{info, warn};
 
 use crate::ratelimit::RateLimiter;
 use crate::worker::{MonitorClient, serve_channel};
+
+/// Outcome of one authentication attempt as the transport presents it.
+pub(crate) enum AuthOutcome {
+    /// Authenticated: bind identity and serve the channel.
+    Allow,
+    /// Terminal failure: an identical `401`, floored to the constant-time delay.
+    Deny,
+    /// A further factor is needed: reply `401` + challenge header and keep the
+    /// connection up for the client's follow-up CONNECT.
+    Challenge(quish_proto::Challenge),
+}
+
+/// How long a parked challenge stays resumable before it is dropped.
+pub(crate) const CHALLENGE_TTL: Duration = Duration::from_secs(60);
+
+/// Per-connection challenge state for the dev (in-process) path; the privsep
+/// monitor keeps its own equivalent in `State`. Keyed by the server-assigned
+/// `conn_id` and bounded to ONE pending challenge per connection, so a challenge
+/// can never be resumed on another connection and the map cannot grow unbounded.
+#[derive(Default)]
+pub(crate) struct ChallengeStore {
+    inner: Mutex<HashMap<u64, (quish_auth::ChallengeState, Instant)>>,
+}
+
+impl ChallengeStore {
+    /// Park a fresh challenge for `conn_id`, replacing any prior pending one.
+    pub(crate) fn insert(&self, conn_id: u64, state: quish_auth::ChallengeState) {
+        self.inner
+            .lock()
+            .expect("challenge store poisoned")
+            .insert(conn_id, (state, Instant::now()));
+    }
+
+    /// Remove and return the parked challenge IF it belongs to `conn_id`, matches
+    /// `token`, and has not expired. Any mismatch consumes the entry and fails
+    /// (a wrong/stale token cannot be retried against the same parked state).
+    pub(crate) fn take(&self, conn_id: u64, token: &str) -> Option<quish_auth::ChallengeState> {
+        let (state, created) = self
+            .inner
+            .lock()
+            .expect("challenge store poisoned")
+            .remove(&conn_id)?;
+        if created.elapsed() > CHALLENGE_TTL || state.token != token {
+            return None;
+        }
+        Some(state)
+    }
+
+    /// Drop any parked challenge for a gone connection.
+    pub(crate) fn clear(&self, conn_id: u64) {
+        self.inner
+            .lock()
+            .expect("challenge store poisoned")
+            .remove(&conn_id);
+    }
+}
 
 /// QUIC idle timeout: reaps dead connections. Interactive shells survive it
 /// because the client sends keep-alives well under this interval.
@@ -45,7 +102,10 @@ pub fn transport_config() -> Arc<quinn::TransportConfig> {
 /// How auth + session spawning are satisfied.
 pub enum Backend {
     /// Single-process dev mode: in-process registry, local session spawn.
-    Dev { registry: Arc<Registry> },
+    Dev {
+        registry: Arc<Registry>,
+        challenges: ChallengeStore,
+    },
     /// Privsep worker: everything goes to the monitor over RPC.
     Privsep { client: Arc<MonitorClient> },
 }
@@ -58,25 +118,44 @@ impl Backend {
         &self,
         conn_id: u64,
         authorization: Option<&str>,
+        answer: Option<&quish_proto::ChallengeAnswer>,
         conn: &ConnInfo,
-    ) -> bool {
+    ) -> AuthOutcome {
         match self {
-            Backend::Dev { registry } => {
-                matches!(
-                    registry.authenticate(authorization, conn).await,
-                    Verdict::Allow { .. }
-                )
+            Backend::Dev {
+                registry,
+                challenges,
+            } => {
+                let mut conn = conn.clone();
+                // Resume a parked challenge if this request answers one.
+                if let Some(ans) = answer {
+                    conn.challenge = challenges
+                        .take(conn_id, &ans.token)
+                        .map(|state| ChallengeResponse::new(state, ans.responses.clone()));
+                }
+                match registry.authenticate(authorization, &conn).await {
+                    Verdict::Allow { .. } => AuthOutcome::Allow,
+                    Verdict::Challenge { state, prompts } => {
+                        let token = state.token.clone();
+                        challenges.insert(conn_id, state);
+                        AuthOutcome::Challenge(quish_proto::Challenge { token, prompts })
+                    }
+                    Verdict::Deny => AuthOutcome::Deny,
+                }
             }
             Backend::Privsep { client } => {
                 let started = Instant::now();
-                let allow = client
-                    .authenticate(conn_id, authorization, conn)
+                let outcome = client
+                    .authenticate(conn_id, authorization, answer, conn)
                     .await
-                    .unwrap_or(false);
-                if !allow {
+                    .unwrap_or(AuthOutcome::Deny);
+                // The monitor returns a raw verdict; floor every non-success here
+                // (terminal Deny AND the intermediate Challenge) so a slow first
+                // factor never leaks account existence through response timing.
+                if !matches!(outcome, AuthOutcome::Allow) {
                     tokio::time::sleep_until(started + client.fail_delay).await;
                 }
-                allow
+                outcome
             }
         }
     }
@@ -96,8 +175,9 @@ impl Backend {
     }
 
     async fn close(&self, conn_id: u64) {
-        if let Backend::Privsep { client } = self {
-            client.close(conn_id).await;
+        match self {
+            Backend::Dev { challenges, .. } => challenges.clear(conn_id),
+            Backend::Privsep { client } => client.close(conn_id).await,
         }
     }
 }
@@ -191,6 +271,7 @@ async fn handle_connection(
     let conn_info = ConnInfo {
         peer_addr,
         channel_binding,
+        challenge: None,
     };
 
     let mut h3conn = h3::server::builder()
@@ -300,25 +381,44 @@ async fn handle_request(
         .headers()
         .get(quish_proto::HEADER_AUTHORIZATION)
         .and_then(|v| v.to_str().ok());
-    let allow = timeout(
+    // A challenge follow-up round echoes its opaque token + responses here.
+    let answer = req
+        .headers()
+        .get(quish_proto::HEADER_CHALLENGE_RESPONSE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(quish_proto::decode_challenge_answer);
+    let outcome = timeout(
         AUTH_DEADLINE,
-        backend.authenticate(conn_id, authorization, &conn_info),
+        backend.authenticate(conn_id, authorization, answer.as_ref(), &conn_info),
     )
     .await
-    .unwrap_or(false);
+    .unwrap_or(AuthOutcome::Deny);
 
-    if !allow {
-        limiter.record_failure(ip);
-        conn_fails.fetch_add(1, Ordering::Relaxed);
-        info!(%conn_id, peer = %conn_info.peer_addr, "auth failed");
-        respond(&mut stream, StatusCode::UNAUTHORIZED).await?;
-        return stream.finish().await.map_err(Into::into);
+    match outcome {
+        AuthOutcome::Deny => {
+            limiter.record_failure(ip);
+            conn_fails.fetch_add(1, Ordering::Relaxed);
+            info!(%conn_id, peer = %conn_info.peer_addr, "auth failed");
+            respond(&mut stream, StatusCode::UNAUTHORIZED).await?;
+            stream.finish().await.map_err(Into::into)
+        }
+        AuthOutcome::Challenge(challenge) => {
+            // Not a failure: leave conn_fails/limiter untouched. Reply 401 + the
+            // challenge header and finish this stream; the client answers on a
+            // fresh CONNECT (challenge state is parked server-side, keyed by
+            // conn_id). The conn_fails cap check above still guards terminal
+            // failures, and the per-IP backoff already ran before this attempt.
+            info!(%conn_id, "auth challenge issued");
+            respond_challenge(&mut stream, &challenge).await?;
+            stream.finish().await.map_err(Into::into)
+        }
+        AuthOutcome::Allow => {
+            limiter.record_success(ip);
+            info!(%conn_id, "quish session authenticated");
+            respond(&mut stream, StatusCode::OK).await?;
+            backend.serve(conn_id, stream, allow_forward).await
+        }
     }
-    limiter.record_success(ip);
-
-    info!(%conn_id, "quish session authenticated");
-    respond(&mut stream, StatusCode::OK).await?;
-    backend.serve(conn_id, stream, allow_forward).await
 }
 
 async fn respond(stream: &mut ReqStream, status: StatusCode) -> Result<()> {
@@ -327,4 +427,21 @@ async fn respond(stream: &mut ReqStream, status: StatusCode) -> Result<()> {
         .body(())
         .expect("valid response");
     stream.send_response(resp).await.context("send response")
+}
+
+/// Reply `401` with the challenge header (base64 postcard) so the client knows to
+/// run a challenge round rather than treat the `401` as a terminal failure.
+async fn respond_challenge(
+    stream: &mut ReqStream,
+    challenge: &quish_proto::Challenge,
+) -> Result<()> {
+    let resp = Response::builder()
+        .status(StatusCode::UNAUTHORIZED)
+        .header(
+            quish_proto::HEADER_CHALLENGE,
+            quish_proto::encode_challenge(challenge),
+        )
+        .body(())
+        .expect("valid response");
+    stream.send_response(resp).await.context("send challenge")
 }

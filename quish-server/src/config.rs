@@ -37,6 +37,11 @@ pub struct FileConfig {
     /// `--no-seccomp` CLI flag. No effect in dev mode (which does no privilege
     /// drop and installs no filter).
     pub no_seccomp: Option<bool>,
+    /// Require a per-user TOTP second factor (privsep mode). Reads each user's
+    /// base32 secret from `~/.config/quish/totp`. Needs the `pam` feature for the
+    /// password first factor. Overridden by the `--totp` CLI flag. No effect in
+    /// dev mode (use `--dev-insecure-totp-secret` there).
+    pub totp: Option<bool>,
 }
 
 impl FileConfig {

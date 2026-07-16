@@ -23,6 +23,7 @@ mod worker;
 use std::net::SocketAddr;
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
+use anyhow::Context;
 use clap::Parser;
 use quish_auth::{AuthBackend, DevInsecureBackend, Registry, pubkey::PubkeyBackend};
 
@@ -49,6 +50,18 @@ struct Args {
     /// drop — root-free local e2e.
     #[arg(long, value_name = "USER")]
     dev_insecure_user: Option<String>,
+
+    /// Dev mode only: also require a TOTP second factor after the dev password.
+    /// The value is the shared secret (base32, RFC 4648). Turns on the
+    /// challenge/2FA path for root-free local e2e.
+    #[arg(long, value_name = "BASE32")]
+    dev_insecure_totp_secret: Option<String>,
+
+    /// Require a per-user TOTP second factor (privsep mode). Each user's base32
+    /// secret is read from `~/.config/quish/totp`. Needs the `pam` feature for
+    /// the password first factor. Or set `totp = true` in the config file.
+    #[arg(long)]
+    totp: bool,
 
     /// Chroot directory for the worker (privsep mode). [default: /run/quishd]
     #[arg(long)]
@@ -143,12 +156,14 @@ fn main() -> anyhow::Result<()> {
     let allow_remote_forward =
         args.allow_remote_forward || file.allow_remote_forward.unwrap_or(false);
     let no_seccomp = args.no_seccomp || file.no_seccomp.unwrap_or(false);
+    let totp = args.totp || file.totp.unwrap_or(false);
 
     if let Some(dev_user) = args.dev_insecure_user {
         return run_dev(
             listen,
             path,
             dev_user,
+            args.dev_insecure_totp_secret,
             max_auth_fails,
             allow_forward,
             allow_remote_forward,
@@ -170,6 +185,7 @@ fn main() -> anyhow::Result<()> {
         allow_forward,
         allow_remote_forward,
         no_seccomp,
+        totp,
     })
 }
 
@@ -178,16 +194,34 @@ fn run_dev(
     listen: SocketAddr,
     path: String,
     dev_user: String,
+    dev_totp_secret: Option<String>,
     max_auth_fails: u32,
     allow_forward: bool,
     allow_remote_forward: bool,
 ) -> anyhow::Result<()> {
+    // With a dev TOTP secret, wrap the dev password backend so every password
+    // login must clear a second factor (always-challenge). One vec entry either
+    // way, exactly like the privsep registry.
+    let password: Box<dyn AuthBackend> = match dev_totp_secret {
+        Some(b32) => {
+            let secret = quish_auth::totp::decode_base32_secret(&b32)
+                .context("--dev-insecure-totp-secret is not valid base32")?;
+            Box::new(quish_auth::totp::TotpBackend::new(
+                Box::new(DevInsecureBackend::new(dev_user)),
+                Box::new(move |_user| Some(secret.clone())),
+            ))
+        }
+        None => Box::new(DevInsecureBackend::new(dev_user)),
+    };
     let backends: Vec<Box<dyn AuthBackend>> = vec![
-        Box::new(DevInsecureBackend::new(dev_user)),
+        password,
         Box::new(PubkeyBackend::new(authorized_keys_path()?)),
     ];
     let registry = Arc::new(Registry::new(backends, FAIL_DELAY));
-    let backend = Arc::new(transport::Backend::Dev { registry });
+    let backend = Arc::new(transport::Backend::Dev {
+        registry,
+        challenges: transport::ChallengeStore::default(),
+    });
     session::set_allow_remote_forward(allow_remote_forward);
 
     tokio::runtime::Builder::new_multi_thread()
