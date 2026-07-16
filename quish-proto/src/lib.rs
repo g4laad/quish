@@ -5,6 +5,7 @@
 //! directions exchange length-prefixed postcard frames: a leading [`ChannelOpen`]
 //! from the client, then [`ChannelMessage`]s each way.
 
+use base64::prelude::{BASE64_STANDARD, Engine};
 use bytes::{Buf, Bytes, BytesMut};
 use serde::{Serialize, de::DeserializeOwned};
 
@@ -51,6 +52,18 @@ pub fn cert_fingerprint(cert_der: &[u8]) -> String {
 
 /// HTTP header carrying credentials (`Basic ` password / `Bearer ` pubkey token).
 pub const HEADER_AUTHORIZATION: &str = "authorization";
+
+/// Response header the server sends on a `401` when it needs a further factor
+/// (multi-round auth). Value is base64(postcard([`Challenge`])). Its presence on
+/// a `401` is what tells the client to run a challenge round rather than treat
+/// the `401` as a terminal failure. Carries no signal about whether the first
+/// factor was valid — anti-enumeration requires an identical challenge for every
+/// login reaching a challenge-capable backend.
+pub const HEADER_CHALLENGE: &str = "quish-challenge";
+
+/// Request header the client sends on the follow-up CONNECT carrying its answer
+/// to a [`Challenge`]. Value is base64(postcard([`ChallengeAnswer`])).
+pub const HEADER_CHALLENGE_RESPONSE: &str = "quish-challenge-response";
 
 /// Hard cap on a single frame body (postcard-encoded, before the length prefix).
 /// Bounds the pre-auth parser. 64 KiB comfortably fits a PTY write plus overhead.
@@ -204,10 +217,85 @@ pub fn take_frame(buf: &mut BytesMut) -> Result<Option<Bytes>, CodecError> {
     Ok(Some(frame.freeze())) // -> Bytes, no copy
 }
 
+/// One prompt in a challenge round. `echo == false` marks a secret the client
+/// must read with terminal echo disabled (e.g. a one-time code); `true` is an
+/// ordinary visible field.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
+pub struct Prompt {
+    pub message: String,
+    pub echo: bool,
+}
+
+/// Server → client challenge (rides [`HEADER_CHALLENGE`]). `token` is an
+/// opaque, server-issued handle the client echoes back verbatim in its answer;
+/// it names the connection-bound challenge state the server parked and carries
+/// no first-factor signal. `prompts` is what the client must collect.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
+pub struct Challenge {
+    pub token: String,
+    pub prompts: Vec<Prompt>,
+}
+
+/// Client → server answer (rides [`HEADER_CHALLENGE_RESPONSE`]). Echoes
+/// the challenge `token` and supplies one response per prompt, in order.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
+pub struct ChallengeAnswer {
+    pub token: String,
+    pub responses: Vec<String>,
+}
+
+/// Encode a [`Challenge`] into its [`HEADER_CHALLENGE`] value: base64 of the
+/// postcard body (HTTP header values must be ASCII).
+pub fn encode_challenge(challenge: &Challenge) -> String {
+    BASE64_STANDARD.encode(postcard::to_allocvec(challenge).expect("challenge encodes"))
+}
+
+/// Decode a [`HEADER_CHALLENGE`] value. `None` on any malformed input.
+pub fn decode_challenge(value: &str) -> Option<Challenge> {
+    let bytes = BASE64_STANDARD.decode(value.trim()).ok()?;
+    postcard::from_bytes(&bytes).ok()
+}
+
+/// Encode a [`ChallengeAnswer`] into its [`HEADER_CHALLENGE_RESPONSE`] value.
+pub fn encode_challenge_answer(answer: &ChallengeAnswer) -> String {
+    BASE64_STANDARD.encode(postcard::to_allocvec(answer).expect("answer encodes"))
+}
+
+/// Decode a [`HEADER_CHALLENGE_RESPONSE`] value. `None` on any malformed input.
+pub fn decode_challenge_answer(value: &str) -> Option<ChallengeAnswer> {
+    let bytes = BASE64_STANDARD.decode(value.trim()).ok()?;
+    postcard::from_bytes(&bytes).ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use bytes::{BufMut, BytesMut};
+
+    #[test]
+    fn challenge_header_roundtrips() {
+        let c = Challenge {
+            token: "opaque-token-123".into(),
+            prompts: vec![Prompt {
+                message: "TOTP code: ".into(),
+                echo: false,
+            }],
+        };
+        let encoded = encode_challenge(&c);
+        assert_eq!(decode_challenge(&encoded), Some(c));
+        assert!(decode_challenge("!!! not base64").is_none());
+    }
+
+    #[test]
+    fn challenge_answer_roundtrips() {
+        let a = ChallengeAnswer {
+            token: "opaque-token-123".into(),
+            responses: vec!["123456".into()],
+        };
+        let encoded = encode_challenge_answer(&a);
+        assert_eq!(decode_challenge_answer(&encoded), Some(a));
+        assert!(decode_challenge_answer("%%%").is_none());
+    }
 
     #[test]
     fn frame_roundtrips() {
