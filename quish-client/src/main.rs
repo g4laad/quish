@@ -464,25 +464,93 @@ pub(crate) async fn open_channel(
     target: &Target,
     authorization: &str,
 ) -> Result<(SendHalf, RecvHalf)> {
-    let req = build_connect_request(target, authorization);
-    let mut stream = send_request
-        .send_request(req)
-        .await
-        .context("sending CONNECT")?;
-    let resp = stream.recv_response().await.context("awaiting response")?;
-    match resp.status() {
-        http::StatusCode::OK => {}
-        http::StatusCode::UNAUTHORIZED => bail!("authentication failed"),
-        http::StatusCode::UPGRADE_REQUIRED => {
-            bail!(
-                "server rejected our protocol version (quish-version {}); client/server mismatch",
-                quish_proto::PROTOCOL_VERSION
-            )
+    // One first attempt (no answer) plus up to MAX_CHALLENGE_ROUNDS follow-up
+    // rounds. Each CONNECT carries the same channel-bound `authorization`; a
+    // challenge round additionally echoes the server's opaque token + our
+    // responses. The per-connection challenge state lives server-side.
+    let mut answer: Option<String> = None;
+    for round in 0..=MAX_CHALLENGE_ROUNDS {
+        let req = build_connect_request_with(target, authorization, answer.as_deref());
+        let mut stream = send_request
+            .send_request(req)
+            .await
+            .context("sending CONNECT")?;
+        let resp = stream.recv_response().await.context("awaiting response")?;
+        match resp.status() {
+            http::StatusCode::OK => {
+                info!(user = %target.user, "session authenticated");
+                return Ok(stream.split());
+            }
+            http::StatusCode::UNAUTHORIZED => {
+                // A challenge header means "answer a further factor", not a
+                // terminal failure. Without it (or once rounds run out), the 401
+                // is final and indistinguishable from any other auth rejection.
+                let challenge = resp
+                    .headers()
+                    .get(quish_proto::HEADER_CHALLENGE)
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(quish_proto::decode_challenge);
+                match challenge {
+                    Some(challenge) if round < MAX_CHALLENGE_ROUNDS => {
+                        let a = build_challenge_answer(&challenge, read_prompt)?;
+                        answer = Some(quish_proto::encode_challenge_answer(&a));
+                    }
+                    _ => bail!("authentication failed"),
+                }
+            }
+            http::StatusCode::UPGRADE_REQUIRED => {
+                bail!(
+                    "server rejected our protocol version (quish-version {}); client/server mismatch",
+                    quish_proto::PROTOCOL_VERSION
+                )
+            }
+            s => bail!("server rejected session: HTTP {s}"),
         }
-        s => bail!("server rejected session: HTTP {s}"),
     }
-    info!(user = %target.user, "session authenticated");
-    Ok(stream.split())
+    bail!("authentication failed")
+}
+
+/// Cap on challenge follow-up rounds, so a misbehaving/hostile server can never
+/// loop the client forever prompting for codes.
+const MAX_CHALLENGE_ROUNDS: usize = 3;
+
+/// Assemble a [`ChallengeAnswer`] for `challenge`: echo its token and collect one
+/// response per prompt (in order) via `read`. Pure over `read` so it is unit-
+/// testable without a live terminal.
+fn build_challenge_answer(
+    challenge: &quish_proto::Challenge,
+    mut read: impl FnMut(&quish_proto::Prompt) -> Result<String>,
+) -> Result<quish_proto::ChallengeAnswer> {
+    let responses = challenge
+        .prompts
+        .iter()
+        .map(|p| read(p))
+        .collect::<Result<Vec<_>>>()?;
+    Ok(quish_proto::ChallengeAnswer {
+        token: challenge.token.clone(),
+        responses,
+    })
+}
+
+/// Read one prompt's response. Scripted runs set `QUISH_TOTP` (used for every
+/// prompt, matching how `QUISH_PASSWORD` drives the first factor). Interactively,
+/// echo-off prompts read with `rpassword`; visible prompts read a plain line.
+fn read_prompt(prompt: &quish_proto::Prompt) -> Result<String> {
+    if let Ok(v) = std::env::var("QUISH_TOTP") {
+        return Ok(v);
+    }
+    if prompt.echo {
+        use std::io::Write;
+        eprint!("{}", prompt.message);
+        std::io::stderr().flush().ok();
+        let mut line = String::new();
+        std::io::stdin()
+            .read_line(&mut line)
+            .context("reading challenge response")?;
+        Ok(line.trim_end_matches(['\r', '\n']).to_string())
+    } else {
+        rpassword::prompt_password(&prompt.message).context("reading challenge response")
+    }
 }
 
 /// Build the Extended CONNECT request every channel opens with. `:protocol` must
@@ -491,7 +559,17 @@ pub(crate) async fn open_channel(
 /// `authorization` is reused on every channel (it is bound to the connection, not
 /// the stream).
 fn build_connect_request(target: &Target, authorization: &str) -> http::Request<()> {
-    http::Request::builder()
+    build_connect_request_with(target, authorization, None)
+}
+
+/// Like [`build_connect_request`], but also attaches the challenge-response
+/// header when `answer` is `Some` (a follow-up round of a multi-round login).
+fn build_connect_request_with(
+    target: &Target,
+    authorization: &str,
+    answer: Option<&str>,
+) -> http::Request<()> {
+    let mut builder = http::Request::builder()
         .method(http::Method::CONNECT)
         .uri(format!(
             "https://{}{}",
@@ -503,9 +581,11 @@ fn build_connect_request(target: &Target, authorization: &str) -> http::Request<
             quish_proto::PROTOCOL_VERSION.to_string(),
         )
         .header(quish_proto::HEADER_AUTHORIZATION, authorization)
-        .extension(Protocol::WEB_TRANSPORT)
-        .body(())
-        .expect("valid request")
+        .extension(Protocol::WEB_TRANSPORT);
+    if let Some(a) = answer {
+        builder = builder.header(quish_proto::HEADER_CHALLENGE_RESPONSE, a);
+    }
+    builder.body(()).expect("valid request")
 }
 
 /// Bind every `-L` listener and open every `-R` control channel, then serve
@@ -798,6 +878,50 @@ impl ChannelFrameReader {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn challenge_answer_echoes_token_and_orders_responses() {
+        let challenge = quish_proto::Challenge {
+            token: "srv-token-xyz".into(),
+            prompts: vec![
+                quish_proto::Prompt {
+                    message: "TOTP code: ".into(),
+                    echo: false,
+                },
+                quish_proto::Prompt {
+                    message: "PIN: ".into(),
+                    echo: true,
+                },
+            ],
+        };
+        // Stub reader: response is derived from the prompt so we can assert order.
+        let answer = build_challenge_answer(&challenge, |p| {
+            Ok(if p.echo {
+                "pin-2".into()
+            } else {
+                "code-1".into()
+            })
+        })
+        .unwrap();
+        assert_eq!(answer.token, "srv-token-xyz");
+        assert_eq!(answer.responses, vec!["code-1".to_string(), "pin-2".into()]);
+        // Round-trips through the header codec the server decodes.
+        let encoded = quish_proto::encode_challenge_answer(&answer);
+        assert_eq!(quish_proto::decode_challenge_answer(&encoded), Some(answer));
+    }
+
+    #[test]
+    fn challenge_answer_propagates_a_read_error() {
+        let challenge = quish_proto::Challenge {
+            token: "t".into(),
+            prompts: vec![quish_proto::Prompt {
+                message: "x".into(),
+                echo: false,
+            }],
+        };
+        let err = build_challenge_answer(&challenge, |_p| bail!("no tty")).is_err();
+        assert!(err, "a failing prompt read must abort answer assembly");
+    }
 
     #[test]
     fn parses_full_target() {
