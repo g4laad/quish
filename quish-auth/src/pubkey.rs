@@ -228,6 +228,7 @@ mod tests {
         ConnInfo {
             peer_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1),
             channel_binding: binding,
+            challenge: None,
         }
     }
 

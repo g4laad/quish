@@ -14,6 +14,7 @@ use tokio::time::Instant;
 use zeroize::Zeroizing;
 
 pub mod pubkey;
+pub mod totp;
 
 #[cfg(feature = "pam")]
 pub mod pam;
@@ -25,6 +26,11 @@ pub mod pam;
 pub struct ConnInfo {
     pub peer_addr: SocketAddr,
     pub channel_binding: [u8; 32],
+    /// Set only on a challenge follow-up round: the server-held state parked at
+    /// the end of the previous round plus the client's responses. `None` on a
+    /// first (round-one) attempt. A challenge-capable backend inspects this to
+    /// decide whether to open a fresh challenge or complete a parked one.
+    pub challenge: Option<ChallengeResponse>,
 }
 
 /// A credential parsed from the `Authorization` header.
@@ -43,8 +49,67 @@ pub enum Credentials {
 /// username.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Verdict {
-    Allow { user: String },
+    Allow {
+        user: String,
+    },
+    /// A further factor is required before a terminal verdict. `state` is parked
+    /// server-side (keyed by connection) and `prompts` is sent to the client,
+    /// which answers on a follow-up round. Emitted identically for valid and
+    /// invalid first-factor input, so it leaks nothing about account existence;
+    /// the registry still floors its outward timing (see [`Registry::authenticate`]).
+    Challenge {
+        state: ChallengeState,
+        prompts: Vec<quish_proto::Prompt>,
+    },
     Deny,
+}
+
+/// Challenge state parked between rounds. Held ONLY server-side (the registry's
+/// owner keeps a per-connection map keyed by `conn_id`, bounded + TTL'd), so a
+/// client can never resume another connection's challenge. The client sees only
+/// the opaque [`token`](Self::token).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChallengeState {
+    /// Opaque handle echoed to the client and back; the server matches it against
+    /// the parked state for this connection before completing the round.
+    pub token: String,
+    /// The identity to bind on success, IF the first factor validated; `None`
+    /// otherwise. Never sent to the client — this is what keeps a challenge for a
+    /// bogus user indistinguishable from one for a real user.
+    pub pending_user: Option<String>,
+}
+
+/// A client's answer to a parked [`ChallengeState`], assembled server-side from
+/// the follow-up request. `responses` line up with the round's prompts.
+#[derive(Clone)]
+pub struct ChallengeResponse {
+    pub state: ChallengeState,
+    pub responses: Vec<Zeroizing<String>>,
+}
+
+impl std::fmt::Debug for ChallengeResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Never render the secret responses (they are one-time codes / factors).
+        f.debug_struct("ChallengeResponse")
+            .field("state", &self.state)
+            .field(
+                "responses",
+                &format_args!("<{} redacted>", self.responses.len()),
+            )
+            .finish()
+    }
+}
+
+impl ChallengeResponse {
+    /// Assemble from a wire answer: plain response strings are wrapped in
+    /// `Zeroizing` so they are scrubbed on drop. Lets callers (the server) build
+    /// a response without depending on `zeroize` themselves.
+    pub fn new(state: ChallengeState, responses: Vec<String>) -> Self {
+        Self {
+            state,
+            responses: responses.into_iter().map(Zeroizing::new).collect(),
+        }
+    }
 }
 
 /// An authentication method. Object-safe + async via `async_trait`.
@@ -76,13 +141,18 @@ impl Registry {
     }
 
     /// Parse the `Authorization` header, dispatch, and enforce anti-enumeration:
-    /// every failure (missing/garbled header, unsupported scheme, backend deny)
-    /// returns an identical `Deny` and blocks until `started + fail_delay`.
+    /// every non-success (missing/garbled header, unsupported scheme, backend
+    /// deny, OR an intermediate challenge) blocks until `started + fail_delay`,
+    /// so neither the terminal `Deny` nor a `Challenge` round leaks timing. Only
+    /// a successful `Allow` returns without the floor.
     pub async fn authenticate(&self, authorization: Option<&str>, conn: &ConnInfo) -> Verdict {
         let started = Instant::now();
         let verdict = self.verdict(authorization, conn).await;
-        if verdict == Verdict::Deny {
-            // Pad to the floor. Backends already returned; timing carries no signal.
+        if !matches!(verdict, Verdict::Allow { .. }) {
+            // Pad every non-success (terminal `Deny` AND intermediate `Challenge`)
+            // to the floor. Backends already returned; timing carries no signal —
+            // and flooring the challenge too keeps a slow first factor (e.g. PAM)
+            // from leaking account existence on the non-terminal round.
             tokio::time::sleep_until(started + self.fail_delay).await;
         }
         verdict
@@ -186,6 +256,7 @@ mod tests {
         ConnInfo {
             peer_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1),
             channel_binding: [0u8; 32],
+            challenge: None,
         }
     }
 
