@@ -118,10 +118,7 @@ pub struct TotpBackend {
 impl TotpBackend {
     /// Build a TOTP backend wrapping `first_factor`. `secret_for` maps a validated
     /// username to its shared secret.
-    pub fn new(
-        first_factor: Box<dyn AuthBackend>,
-        secret_for: SecretResolver,
-    ) -> Self {
+    pub fn new(first_factor: Box<dyn AuthBackend>, secret_for: SecretResolver) -> Self {
         Self {
             inner: first_factor,
             secret_for,
