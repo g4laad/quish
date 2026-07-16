@@ -159,9 +159,10 @@ pub enum Request {
         authorization: Option<String>,
         peer: String,
         channel_binding: [u8; 32],
-        /// Present only on a challenge follow-up round: the client's echoed token
-        /// + responses. The monitor matches the token against the per-connection
-        /// state it parked for `conn_id` (never trusting the worker to hold it).
+        /// Present only on a challenge follow-up round: the client's echoed
+        /// token plus its responses. The monitor matches the token against the
+        /// per-connection state it parked for `conn_id`, never trusting the
+        /// worker to hold it.
         challenge_answer: Option<quish_proto::ChallengeAnswer>,
     },
     /// Open a PTY shell for `conn_id`'s authed user (response passes the master fd).

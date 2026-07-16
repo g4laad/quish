@@ -611,3 +611,149 @@ fn remote_forward_refused_when_disabled() {
     let _ = client.kill();
     let _ = client.wait();
 }
+
+// ---- challenge / TOTP two-factor (plan 023) --------------------------------
+
+/// A shared TOTP secret for the challenge tests: its base32 form (passed to
+/// `quishd --dev-insecure-totp-secret`) and raw bytes (to compute a live code).
+fn totp_secret() -> (String, Vec<u8>) {
+    let raw = b"12345678901234567890".to_vec();
+    (quish_auth::totp::encode_base32_secret(&raw), raw)
+}
+
+/// Like [`run_client`] but also supplies `QUISH_TOTP` for the second factor and
+/// returns how long the whole client run took (to assert the anti-enumeration
+/// floor). Mirrors `run_client`'s known-hosts seeding.
+fn run_client_2fa(
+    server: &DevServer,
+    args: &[&str],
+    password: &str,
+    totp: Option<&str>,
+) -> (Output, Duration) {
+    let quishd = PathBuf::from(env!("CARGO_BIN_EXE_quishd"));
+    let quish = quishd.with_file_name("quish");
+    if !quish.exists() {
+        panic!(
+            "quish client binary not found at {}; run `cargo build --workspace` first",
+            quish.display()
+        );
+    }
+    let home = fresh_temp_dir("quish-client-home");
+    let kh_dir = home.join(".config/quish");
+    std::fs::create_dir_all(&kh_dir).unwrap();
+    std::fs::write(
+        kh_dir.join("known_hosts"),
+        format!("{} {}\n", server.addr, server.fingerprint),
+    )
+    .unwrap();
+    let mut cmd = Command::new(&quish);
+    cmd.args(args)
+        .env("HOME", &home)
+        .env("QUISH_PASSWORD", password);
+    if let Some(t) = totp {
+        cmd.env("QUISH_TOTP", t);
+    }
+    let start = Instant::now();
+    let out = cmd.output().expect("spawn quish client");
+    (out, start.elapsed())
+}
+
+/// A full two-round login (password + correct TOTP) authenticates and runs the
+/// remote command.
+#[test]
+#[ignore]
+fn totp_two_round_login_succeeds() {
+    let (b32, raw) = totp_secret();
+    let server =
+        DevServer::start_with_args("testuser", &["--dev-insecure-totp-secret", b32.as_str()]);
+    let target = format!("testuser@{}", server.addr);
+    let code = format!("{:06}", quish_auth::totp::current_code(&raw));
+
+    let (out, _) = run_client_2fa(&server, &[&target, "echo", "hello2fa"], "pw", Some(&code));
+    assert!(out.status.success(), "two-factor login failed: {out:?}");
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("hello2fa"),
+        "remote command output missing after 2FA login: {out:?}"
+    );
+}
+
+/// A wrong second factor is a terminal, uniform 401 — and the constant-time floor
+/// still applies (round-one challenge + terminal Deny are each floored).
+#[test]
+#[ignore]
+fn totp_wrong_code_fails_uniformly_and_is_floored() {
+    let (b32, _raw) = totp_secret();
+    let server =
+        DevServer::start_with_args("testuser", &["--dev-insecure-totp-secret", b32.as_str()]);
+    let target = format!("testuser@{}", server.addr);
+
+    let (out, elapsed) = run_client_2fa(&server, &[&target, "echo", "nope"], "pw", Some("000000"));
+    assert!(!out.status.success(), "wrong TOTP must fail: {out:?}");
+    assert!(
+        !String::from_utf8_lossy(&out.stdout).contains("nope"),
+        "command output leaked despite failed second factor: {out:?}"
+    );
+    assert!(
+        elapsed >= Duration::from_millis(1500),
+        "terminal Deny was not floored (elapsed {elapsed:?}); the FAIL_DELAY floor must survive the challenge path"
+    );
+}
+
+/// ANTI-ENUMERATION (the load-bearing assertion): an invalid username and a
+/// valid-username-with-wrong-TOTP produce indistinguishable observable behavior —
+/// both get a challenge round, both terminate in an identical `authentication
+/// failed`, and both are floored. Nothing reveals which account actually exists.
+#[test]
+#[ignore]
+fn totp_anti_enumeration_valid_and_invalid_user_indistinguishable() {
+    let (b32, _raw) = totp_secret();
+    let server =
+        DevServer::start_with_args("testuser", &["--dev-insecure-totp-secret", b32.as_str()]);
+
+    // (valid user, right password, WRONG second factor)
+    let valid_target = format!("testuser@{}", server.addr);
+    let (valid_out, valid_elapsed) =
+        run_client_2fa(&server, &[&valid_target, "echo", "x"], "pw", Some("000000"));
+
+    // (INVALID user) — never provisioned; must be challenged and denied the same.
+    let invalid_target = format!("ghostuser@{}", server.addr);
+    let (invalid_out, invalid_elapsed) = run_client_2fa(
+        &server,
+        &[&invalid_target, "echo", "x"],
+        "pw",
+        Some("000000"),
+    );
+
+    // Both fail, neither opens a session.
+    assert!(
+        !valid_out.status.success(),
+        "valid-wrong-2fa unexpectedly succeeded: {valid_out:?}"
+    );
+    assert!(
+        !invalid_out.status.success(),
+        "invalid user unexpectedly succeeded: {invalid_out:?}"
+    );
+
+    // Identical failure signature: the client saw a challenge then a plain 401 in
+    // both cases and reports the same generic error.
+    let valid_err = String::from_utf8_lossy(&valid_out.stderr);
+    let invalid_err = String::from_utf8_lossy(&invalid_out.stderr);
+    assert!(
+        valid_err.contains("authentication failed"),
+        "valid-wrong-2fa error not the generic failure: {valid_err}"
+    );
+    assert!(
+        invalid_err.contains("authentication failed"),
+        "invalid-user error not the generic failure: {invalid_err}"
+    );
+
+    // Both floored: neither took a distinguishable fast path.
+    assert!(
+        valid_elapsed >= Duration::from_millis(1500),
+        "valid-wrong-2fa not floored: {valid_elapsed:?}"
+    );
+    assert!(
+        invalid_elapsed >= Duration::from_millis(1500),
+        "invalid-user not floored: {invalid_elapsed:?}"
+    );
+}

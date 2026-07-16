@@ -519,12 +519,12 @@ const MAX_CHALLENGE_ROUNDS: usize = 3;
 /// testable without a live terminal.
 fn build_challenge_answer(
     challenge: &quish_proto::Challenge,
-    mut read: impl FnMut(&quish_proto::Prompt) -> Result<String>,
+    read: impl FnMut(&quish_proto::Prompt) -> Result<String>,
 ) -> Result<quish_proto::ChallengeAnswer> {
     let responses = challenge
         .prompts
         .iter()
-        .map(|p| read(p))
+        .map(read)
         .collect::<Result<Vec<_>>>()?;
     Ok(quish_proto::ChallengeAnswer {
         token: challenge.token.clone(),

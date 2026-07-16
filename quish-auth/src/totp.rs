@@ -35,6 +35,12 @@ pub fn decode_base32_secret(secret: &str) -> Option<Vec<u8>> {
     base32::decode(base32::Alphabet::Rfc4648 { padding: false }, secret.trim())
 }
 
+/// Base32-encode a raw secret (RFC 4648, no padding) — the enrollment form an
+/// authenticator app expects and [`decode_base32_secret`] reads back.
+pub fn encode_base32_secret(secret: &[u8]) -> String {
+    base32::encode(base32::Alphabet::Rfc4648 { padding: false }, secret)
+}
+
 /// One HOTP value (RFC 4226) for `counter` over `secret`.
 fn hotp(secret: &[u8], counter: u64) -> u32 {
     // HMAC keys are variable-length, so `new_from_slice` never rejects.
@@ -94,12 +100,16 @@ fn new_token() -> String {
     buf.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// Resolves a validated username to its raw (decoded) TOTP secret. `None` when
+/// the user has no enrolled secret.
+pub type SecretResolver = Box<dyn Fn(&str) -> Option<Vec<u8>> + Send + Sync>;
+
 /// A challenge-capable second-factor backend. See the module docs.
 pub struct TotpBackend {
     /// First factor (password/PAM). Its `supports()` also gates this backend.
     inner: Box<dyn AuthBackend>,
     /// Resolve a user's decoded TOTP secret (raw HMAC key). `None` = not enrolled.
-    secret_for: Box<dyn Fn(&str) -> Option<Vec<u8>> + Send + Sync>,
+    secret_for: SecretResolver,
     /// Prompt shown for the one-time code. Generic wording (no username) so it
     /// cannot enumerate.
     prompt: String,
@@ -110,7 +120,7 @@ impl TotpBackend {
     /// username to its shared secret.
     pub fn new(
         first_factor: Box<dyn AuthBackend>,
-        secret_for: Box<dyn Fn(&str) -> Option<Vec<u8>> + Send + Sync>,
+        secret_for: SecretResolver,
     ) -> Self {
         Self {
             inner: first_factor,
