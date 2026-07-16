@@ -47,3 +47,13 @@ max_auth_fails = 6
 # allowlist SIGSYS-kill the worker — the real fix is re-auditing the allowlist.
 # Privsep mode only (dev mode installs no filter). Overridden by `--no-seccomp`.
 # no_seccomp = false
+
+# Require a per-user TOTP second factor (RFC 6238) after the password. OFF by
+# default. When enabled, each user enrolls a base32 secret (the string an
+# authenticator app stores) at ~user/.config/quish/totp; login becomes a
+# two-round challenge (password, then one-time code). Needs the `pam` feature for
+# the password first factor. Anti-enumeration is preserved: a bogus user is
+# challenged identically and every failure is the same floored 401. Overridden by
+# the `--totp` CLI flag. Privsep mode only (in dev mode use
+# `--dev-insecure-totp-secret <base32>`).
+# totp = false

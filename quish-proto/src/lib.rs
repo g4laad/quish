@@ -10,6 +10,14 @@ use bytes::{Buf, Bytes, BytesMut};
 use serde::{Serialize, de::DeserializeOwned};
 
 /// Bumped on any incompatible wire change. Sent in the `quish-version` header.
+///
+/// Stays **2** across the plan 023 challenge / multi-round (2FA) addition: it is
+/// purely additive. The `quish-challenge` (response) and `quish-challenge-response`
+/// (request) headers are optional — a server that issues no challenge behaves
+/// exactly as before, an old client that never sends the answer header simply sees
+/// a challenge `401` as a generic auth failure, and a new client against an old
+/// server never observes a challenge header, so its round loop degrades to the
+/// original single CONNECT. No existing frame or pseudo-header changed shape.
 pub const PROTOCOL_VERSION: u32 = 2;
 
 /// ALPN for the QUIC/TLS handshake. quish speaks HTTP/3, so this is `h3`.

@@ -84,6 +84,31 @@ work — the worker binds while still root, then drops privileges.
 Server identity is verified against the web PKI, else pinned trust-on-first-use in
 `~/.config/quish/known_hosts` (hard-fail on mismatch).
 
+### Two-factor (TOTP)
+
+quish can require a second factor — a time-based one-time code (TOTP, RFC 6238,
+the standard authenticator-app scheme) — after the password. The login becomes a
+two-round HTTP exchange: the first CONNECT returns `401` carrying an opaque,
+per-connection challenge; the client collects the code and answers on a second
+CONNECT. The client prompts for the code interactively, or reads it from
+`QUISH_TOTP` for scripted runs (like `QUISH_PASSWORD` for the first factor):
+
+```sh
+QUISH_PASSWORD=… QUISH_TOTP=123456 quish user@host 'echo hi'
+```
+
+Enrollment is a per-user base32 secret (the same string an authenticator app
+stores) at the *server-side* `~user/.config/quish/totp`. Enable it with the
+server's `--totp` (privsep, needs `--features pam` for the password first factor)
+or, for local e2e, `--dev-insecure-totp-secret <base32>` in dev mode.
+
+**Anti-enumeration is preserved.** Every login reaching the second-factor backend
+gets an identical challenge — a bogus username is challenged exactly like a real
+one — and only the *terminal* verdict differs. A wrong second factor, a wrong
+password, and a nonexistent user all end in the same generic `401`, padded to the
+same constant-time floor (the floor covers both the challenge round and the
+terminal denial), so an attacker cannot tell which — if any — account exists.
+
 ### Root logins
 
 Root is a first-class login: shell, exec, upload, download, and both auth
