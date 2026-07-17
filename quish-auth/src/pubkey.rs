@@ -11,6 +11,7 @@ use std::{path::PathBuf, time::SystemTime};
 
 use base64::prelude::{BASE64_STANDARD, Engine};
 use ed25519_dalek::{Signer, Verifier};
+use rand_core::OsRng;
 use serde::{Deserialize, Serialize};
 
 use crate::{AuthBackend, ConnInfo, Credentials, Verdict};
@@ -117,6 +118,26 @@ pub fn build_token(
         .ok_or_else(|| anyhow::anyhow!("identity is not an ed25519 key"))?;
     let signing = ed25519_dalek::SigningKey::from_bytes(&kp.private.to_bytes());
     Ok(sign_token(&signing, username, binding, now_secs()))
+}
+
+/// Generate a fresh OpenSSH ed25519 identity for pubkey auth. Returns the
+/// private key as an OpenSSH PEM (wrapped in `Zeroizing` so it is wiped on
+/// drop) and the single `authorized_keys` line for the matching public key.
+/// Randomness is the OS CSPRNG (`rand_core::OsRng`); no `unsafe`.
+pub fn generate_keypair(
+    comment: &str,
+) -> anyhow::Result<(zeroize::Zeroizing<String>, String)> {
+    let mut key = ssh_key::PrivateKey::random(&mut OsRng, ssh_key::Algorithm::Ed25519)
+        .map_err(|e| anyhow::anyhow!("generating key: {e}"))?;
+    key.set_comment(comment);
+    let pem = key
+        .to_openssh(ssh_key::LineEnding::LF)
+        .map_err(|e| anyhow::anyhow!("encoding private key: {e}"))?;
+    let pub_line = key
+        .public_key()
+        .to_openssh()
+        .map_err(|e| anyhow::anyhow!("encoding public key: {e}"))?;
+    Ok((pem, pub_line))
 }
 
 /// Decode a Bearer credential back into a [`Token`]. `None` on any malformation —
@@ -318,6 +339,27 @@ hdCJRdj2c2cPkZBaxAutAAAAB2ZpeHR1cmUBAgMEBQY=\n\
         let binding = [11u8; 32];
 
         let b64 = build_token(TEST_OPENSSH_KEY.as_bytes(), "dave", &binding).unwrap();
+        let creds = Credentials::SignedToken(parse_token(&b64).unwrap());
+        assert!(matches!(
+            backend.authenticate(&conn(binding), &creds).await,
+            Verdict::Allow { user } if user == "dave"
+        ));
+    }
+
+    // `generate_keypair` output round-trips through the real auth path: the
+    // `.pub` line becomes an authorized_keys file and the PEM mints a token the
+    // `PubkeyBackend` accepts.
+    #[tokio::test]
+    async fn generated_key_logs_in() {
+        let (pem, pub_line) = generate_keypair("dave@testhost").unwrap();
+        let dir = std::env::temp_dir().join(format!("quish-gk-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("authorized_keys");
+        std::fs::write(&path, pub_line.as_bytes()).unwrap();
+        let backend = PubkeyBackend::new(path);
+        let binding = [12u8; 32];
+
+        let b64 = build_token(pem.as_bytes(), "dave", &binding).unwrap();
         let creds = Credentials::SignedToken(parse_token(&b64).unwrap());
         assert!(matches!(
             backend.authenticate(&conn(binding), &creds).await,
