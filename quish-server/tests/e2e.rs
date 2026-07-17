@@ -8,7 +8,7 @@
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc;
@@ -66,15 +66,24 @@ impl DevServer {
     /// Like [`start`], but appends `extra_args` to the `quishd` argv (e.g.
     /// `--allow-forward`, which enables `-L` forwarding).
     fn start_with_args(user: &str, extra_args: &[&str]) -> DevServer {
+        Self::start_full(user, extra_args, &fresh_temp_dir("quishd-home"))
+    }
+
+    /// Like [`start`], but with a caller-supplied `$HOME` so a test can seed the
+    /// server's `~/.config/quish/authorized_keys` before the daemon reads it.
+    fn start_with_home(user: &str, home: &Path) -> DevServer {
+        Self::start_full(user, &[], home)
+    }
+
+    fn start_full(user: &str, extra_args: &[&str], home: &Path) -> DevServer {
         let quishd = PathBuf::from(env!("CARGO_BIN_EXE_quishd"));
-        let home = fresh_temp_dir("quishd-home");
 
         // quishd's tracing writer defaults to stdout (unlike the client, which
         // sets stderr), so the readiness line arrives on stdout.
         let mut cmd = Command::new(&quishd);
         cmd.args(["--listen", "127.0.0.1:0", "--dev-insecure-user", user])
             .args(extra_args)
-            .env("HOME", &home)
+            .env("HOME", home)
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
         let mut child = cmd.spawn().expect("spawn quishd");
@@ -431,6 +440,65 @@ fn auth_rejects_unknown_user() {
     assert!(
         !String::from_utf8_lossy(&output.stdout).contains("nope"),
         "command output leaked despite rejected auth: {output:?}"
+    );
+}
+
+/// A `quish keygen`-generated identity, once its public line is installed in the
+/// server user's `authorized_keys`, authenticates a real login end to end. This
+/// exercises the full onboarding path the CLI now supports: generate → install
+/// → connect with `-i`.
+#[test]
+#[ignore]
+fn keygen_key_logs_in() {
+    let quishd = PathBuf::from(env!("CARGO_BIN_EXE_quishd"));
+    let quish = quishd.with_file_name("quish");
+    assert!(
+        quish.exists(),
+        "quish client binary not found; run `cargo build --workspace` first"
+    );
+
+    // Dev mode reads $HOME/.config/quish/authorized_keys, so give the server a
+    // controlled HOME we can seed after generating the key.
+    let server_home = fresh_temp_dir("quishd-home");
+    let key_path = server_home.join(".config/quish/id_ed25519");
+
+    // 1. Generate an identity via the client's keygen subcommand.
+    let keygen = Command::new(&quish)
+        .args(["keygen", "-o", key_path.to_str().unwrap()])
+        .output()
+        .expect("spawn quish keygen");
+    assert!(keygen.status.success(), "keygen failed: {keygen:?}");
+    let pub_line = String::from_utf8_lossy(&keygen.stdout)
+        .lines()
+        .next()
+        .expect("keygen printed a public line")
+        .to_string();
+    assert!(
+        pub_line.starts_with("ssh-ed25519 "),
+        "unexpected keygen output: {pub_line}"
+    );
+
+    // 2. Install the public line as the server user's authorized_keys.
+    let ak = server_home.join(".config/quish/authorized_keys");
+    std::fs::create_dir_all(ak.parent().unwrap()).unwrap();
+    std::fs::write(&ak, format!("{pub_line}\n")).unwrap();
+
+    // 3. Start the dev server with that HOME and log in with the generated key.
+    let server = DevServer::start_with_home("testuser", &server_home);
+    let target = format!("testuser@{}", server.addr);
+    let output = run_client(
+        &server,
+        &["-i", key_path.to_str().unwrap(), &target, "echo", "hi"],
+        None,
+    );
+
+    assert!(
+        output.status.success(),
+        "pubkey login with generated key failed: {output:?}"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("hi"),
+        "unexpected stdout: {output:?}"
     );
 }
 
