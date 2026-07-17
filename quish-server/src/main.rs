@@ -97,6 +97,15 @@ struct Args {
     #[arg(long)]
     no_seccomp: bool,
 
+    /// Only these users may log in (repeatable). Empty = all authenticated
+    /// users. `--deny-user` always wins. Or `allow_users = [...]` in the config.
+    #[arg(long = "allow-user", value_name = "USER")]
+    allow_users: Vec<String>,
+
+    /// Refuse these users even if they authenticate (repeatable).
+    #[arg(long = "deny-user", value_name = "USER")]
+    deny_users: Vec<String>,
+
     /// Internal: run as the privilege-dropped worker (spawned by the monitor).
     #[arg(long, hide = true)]
     internal_worker: bool,
@@ -157,6 +166,18 @@ fn main() -> anyhow::Result<()> {
         args.allow_remote_forward || file.allow_remote_forward.unwrap_or(false);
     let no_seccomp = args.no_seccomp || file.no_seccomp.unwrap_or(false);
     let totp = args.totp || file.totp.unwrap_or(false);
+    let policy = quish_auth::UserPolicy {
+        allow_users: if args.allow_users.is_empty() {
+            file.allow_users.unwrap_or_default()
+        } else {
+            args.allow_users
+        },
+        deny_users: if args.deny_users.is_empty() {
+            file.deny_users.unwrap_or_default()
+        } else {
+            args.deny_users
+        },
+    };
 
     if let Some(dev_user) = args.dev_insecure_user {
         return run_dev(
@@ -167,6 +188,7 @@ fn main() -> anyhow::Result<()> {
             max_auth_fails,
             allow_forward,
             allow_remote_forward,
+            policy,
         );
     }
     monitor::run(monitor::Config {
@@ -186,10 +208,12 @@ fn main() -> anyhow::Result<()> {
         allow_remote_forward,
         no_seccomp,
         totp,
+        policy,
     })
 }
 
 /// Single-process dev server: in-process registry + local session spawning.
+#[allow(clippy::too_many_arguments)]
 fn run_dev(
     listen: SocketAddr,
     path: String,
@@ -198,6 +222,7 @@ fn run_dev(
     max_auth_fails: u32,
     allow_forward: bool,
     allow_remote_forward: bool,
+    policy: quish_auth::UserPolicy,
 ) -> anyhow::Result<()> {
     // With a dev TOTP secret, wrap the dev password backend so every password
     // login must clear a second factor (always-challenge). One vec entry either
@@ -217,7 +242,7 @@ fn run_dev(
         password,
         Box::new(PubkeyBackend::new(authorized_keys_path()?)),
     ];
-    let registry = Arc::new(Registry::new(backends, FAIL_DELAY));
+    let registry = Arc::new(Registry::new(backends, FAIL_DELAY, policy));
     let backend = Arc::new(transport::Backend::Dev {
         registry,
         challenges: transport::ChallengeStore::default(),

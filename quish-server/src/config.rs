@@ -42,6 +42,16 @@ pub struct FileConfig {
     /// password first factor. Overridden by the `--totp` CLI flag. No effect in
     /// dev mode (use `--dev-insecure-totp-secret` there).
     pub totp: Option<bool>,
+    /// Users permitted to log in. Empty or unset = every authenticated user is
+    /// allowed. A non-empty list is an exhaustive allowlist (sshd-like); anyone
+    /// not named is refused even after a valid credential. `deny_users` still
+    /// wins over this. Overridden wholesale by any `--allow-user` CLI flag.
+    /// Takes effect in both dev and privsep (daemon) modes.
+    pub allow_users: Option<Vec<String>>,
+    /// Users refused even if they authenticate. Always wins over `allow_users`.
+    /// Overridden wholesale by any `--deny-user` CLI flag. Takes effect in both
+    /// dev and privsep (daemon) modes.
+    pub deny_users: Option<Vec<String>>,
 }
 
 impl FileConfig {

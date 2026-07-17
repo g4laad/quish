@@ -39,6 +39,7 @@ pub struct Config {
     pub allow_remote_forward: bool,
     pub no_seccomp: bool,
     pub totp: bool,
+    pub policy: quish_auth::UserPolicy,
 }
 
 /// Run the monitor: generate the host key, wire up sockets, launch the worker,
@@ -67,7 +68,7 @@ pub fn run(cfg: Config) -> Result<()> {
     spawn_sign_thread(sign_listener, signing_key, scheme);
 
     // Auth registry (pubkey per-user; PAM when compiled in).
-    let registry = build_registry(cfg.totp);
+    let registry = build_registry(cfg.totp, cfg.policy);
     let exe = std::env::current_exe().context("current_exe")?;
 
     // Everything below needs the reactor (seqpacket listener registers with it).
@@ -189,7 +190,7 @@ fn generate_identity() -> Result<(CertificateDer<'static>, PrivateKeyDer<'static
     Ok((cert_der, key_der, key_bytes))
 }
 
-fn build_registry(totp: bool) -> Arc<Registry> {
+fn build_registry(totp: bool, policy: quish_auth::UserPolicy) -> Arc<Registry> {
     let pubkey: Box<dyn AuthBackend> =
         Box::new(PubkeyBackend::with_resolver(Box::new(per_user_keys)));
     #[cfg(feature = "pam")]
@@ -217,7 +218,7 @@ fn build_registry(totp: bool) -> Arc<Registry> {
         }
         vec![pubkey]
     };
-    Arc::new(Registry::new(backends, crate::FAIL_DELAY))
+    Arc::new(Registry::new(backends, crate::FAIL_DELAY, policy))
 }
 
 /// Resolve a user's `~/.config/quish/authorized_keys` (root reads any home).
