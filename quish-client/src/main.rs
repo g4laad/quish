@@ -75,6 +75,16 @@ enum Command {
     /// SRC/DST is remote (`[user@]host:path`); a local folder SRC uploads
     /// recursively (symlinks are skipped, never followed).
     Cp(cp::CpArgs),
+    /// Generate an OpenSSH ed25519 identity for pubkey auth and print the
+    /// authorized_keys line to install server-side.
+    Keygen {
+        /// Output path. [default: ~/.config/quish/id_ed25519]
+        #[arg(short, long)]
+        output: Option<std::path::PathBuf>,
+        /// Key comment. [default: user@host]
+        #[arg(short, long)]
+        comment: Option<String>,
+    },
 }
 
 #[derive(clap::Subcommand, Debug)]
@@ -304,6 +314,65 @@ fn build_authorization(
     }
 }
 
+/// `quish keygen`: generate an OpenSSH ed25519 identity, write the private key
+/// (mode 0600, refusing to overwrite) and its `.pub` (mode 0644), then print the
+/// authorized_keys line and install instructions. Synchronous — no runtime.
+fn run_keygen(output: Option<std::path::PathBuf>, comment: Option<String>) -> Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let output = match output {
+        Some(p) => p,
+        None => {
+            let home = std::env::var("HOME").context("HOME not set")?;
+            std::path::PathBuf::from(home).join(".config/quish/id_ed25519")
+        }
+    };
+    let comment = comment.unwrap_or_else(|| {
+        let host = std::env::var("HOSTNAME").unwrap_or_else(|_| "quish".into());
+        format!("{}@{}", whoami(), host)
+    });
+
+    let (pem, pub_line) = quish_auth::pubkey::generate_keypair(&comment)?;
+
+    if let Some(parent) = output.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+
+    // Refuse to overwrite an existing identity; the private key is mode 0600.
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&output)
+        .with_context(|| format!("creating {} (refusing to overwrite)", output.display()))?;
+    f.write_all(pem.as_bytes())
+        .with_context(|| format!("writing {}", output.display()))?;
+
+    let mut pub_os = output.clone().into_os_string();
+    pub_os.push(".pub");
+    let pub_path = std::path::PathBuf::from(pub_os);
+    let mut pf = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o644)
+        .open(&pub_path)
+        .with_context(|| format!("creating {}", pub_path.display()))?;
+    writeln!(pf, "{pub_line}").with_context(|| format!("writing {}", pub_path.display()))?;
+
+    println!("{pub_line}");
+    println!();
+    println!("Wrote private key to {} (mode 0600)", output.display());
+    println!("Wrote public key to  {} (mode 0644)", pub_path.display());
+    println!();
+    println!("To authorize this key, append the public line above to the target");
+    println!("user's server-side ~<user>/.config/quish/authorized_keys, then connect:");
+    println!("  quish -i {} user@host", output.display());
+    Ok(())
+}
+
 fn main() -> Result<()> {
     // Logs go to stderr and stay quiet by default: stdout is the remote channel's
     // stdout (piping `quish host cmd > file` must yield clean output).
@@ -335,6 +404,9 @@ fn main() -> Result<()> {
                 .build()?
                 .block_on(cp::run_cp(a))?;
             std::process::exit(code);
+        }
+        Some(Command::Keygen { output, comment }) => {
+            return run_keygen(output, comment);
         }
         None => {}
     }
