@@ -57,3 +57,12 @@ max_auth_fails = 6
 # the `--totp` CLI flag. Privsep mode only (in dev mode use
 # `--dev-insecure-totp-secret <base32>`).
 # totp = false
+
+# Restrict which authenticated users may log in (sshd-style AllowUsers/DenyUsers).
+# `deny_users` always wins; a non-empty `allow_users` is an exhaustive allowlist
+# (anyone not named is refused). Both empty/unset = every authenticated user is
+# allowed. Enforced at the auth verdict, so a policy denial is byte- and
+# timing-identical to a bad credential (same floored 401). Overridden wholesale
+# by the repeatable `--allow-user` / `--deny-user` CLI flags. Both modes.
+# allow_users = []
+# deny_users = []

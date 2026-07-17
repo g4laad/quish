@@ -151,6 +151,14 @@ keep-alive so idle shells survive); centralized constant-time auth-failure floor
 (identical 401 for every failure cause). The frame decoder is fuzzed
 (`cargo +nightly fuzz run decode --fuzz-dir quish-proto/fuzz`).
 
+Server-side authorization: `allow_users` / `deny_users` (config keys, or the
+repeatable `--allow-user` / `--deny-user` flags) scope who may log in, sshd-style.
+`deny_users` always wins; a non-empty `allow_users` is an exhaustive allowlist;
+both empty means every authenticated user is permitted. The policy is enforced at
+the auth verdict, so a rejected user is indistinguishable from a bad credential
+(the same generic, constant-time-floored 401 — no policy-specific signal reaches
+the client). Both dev and privsep modes.
+
 The network-facing worker is privilege-separated: it binds as root, then
 `chroot`s to an empty dir, `setuid`s to the unprivileged `quish` account, and
 installs a **seccomp-bpf syscall allowlist** — after that the worker may call
