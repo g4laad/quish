@@ -344,4 +344,60 @@ mod tests {
         let wrong = basic_header("mallory", "whatever");
         assert_eq!(reg.authenticate(Some(&wrong), &conn()).await, Verdict::Deny);
     }
+    #[test]
+    fn policy_permits_semantics() {
+        // (allow_users, deny_users, user, expected)
+        let cases: &[(&[&str], &[&str], &str, bool)] = &[
+            (&[], &[], "anyone", true),
+            (&["alice"], &[], "alice", true),
+            (&["alice"], &[], "bob", false),
+            (&["alice"], &["alice"], "alice", false),
+            (&[], &["bob"], "alice", true),
+        ];
+        for (allow, deny, user, expected) in cases {
+            let policy = UserPolicy {
+                allow_users: allow.iter().map(|s| s.to_string()).collect(),
+                deny_users: deny.iter().map(|s| s.to_string()).collect(),
+            };
+            assert_eq!(
+                policy.permits(user),
+                *expected,
+                "allow={allow:?} deny={deny:?} user={user}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn policy_denied_user_gets_plain_deny() {
+        // A user the backend authenticates, but the allowlist excludes: the raw
+        // `verdict()` must fold the `Allow` into an indistinguishable `Deny`.
+        let reg = Registry::new(
+            vec![Box::new(DevInsecureBackend::new("dave".into()))],
+            Duration::from_millis(0),
+            UserPolicy {
+                allow_users: vec!["alice".into()],
+                deny_users: vec![],
+            },
+        );
+        let h = basic_header("dave", "whatever");
+        assert_eq!(reg.verdict(Some(&h), &conn()).await, Verdict::Deny);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn policy_denial_is_floored() {
+        // A policy denial must be padded to the same constant-time floor as any
+        // other failure, so it is indistinguishable through `authenticate()`.
+        let reg = Registry::new(
+            vec![Box::new(DevInsecureBackend::new("dave".into()))],
+            Duration::from_millis(500),
+            UserPolicy {
+                allow_users: vec!["alice".into()],
+                deny_users: vec![],
+            },
+        );
+        let h = basic_header("dave", "whatever");
+        let start = Instant::now();
+        assert_eq!(reg.authenticate(Some(&h), &conn()).await, Verdict::Deny);
+        assert_eq!(start.elapsed(), Duration::from_millis(500));
+    }
 }
