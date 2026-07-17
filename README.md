@@ -77,9 +77,12 @@ work — the worker binds while still root, then drops privileges.
 ## Client auth
 
 - **Password** (default): prompted, or `QUISH_PASSWORD` for scripts.
-- **Public key**: `quish -i ~/.config/quish/id_ed25519 user@host`. Put the public
-  key in the *server-side* `~user/.config/quish/authorized_keys` (deliberately
-  separate from `~/.ssh/authorized_keys`). ed25519 only.
+- **Public key**: generate an identity with `quish keygen` (writes
+  `~/.config/quish/id_ed25519` + `.pub` at mode 0600/0644, refuses to overwrite),
+  then install the printed line in the *server-side*
+  `~user/.config/quish/authorized_keys` (deliberately separate from
+  `~/.ssh/authorized_keys`) and connect with
+  `quish -i ~/.config/quish/id_ed25519 user@host`. ed25519 only.
 
 Server identity is verified against the web PKI, else pinned trust-on-first-use in
 `~/.config/quish/known_hosts` (hard-fail on mismatch).
@@ -97,10 +100,13 @@ CONNECT. The client prompts for the code interactively, or reads it from
 QUISH_PASSWORD=… QUISH_TOTP=123456 quish user@host 'echo hi'
 ```
 
-Enrollment is a per-user base32 secret (the same string an authenticator app
-stores) at the *server-side* `~user/.config/quish/totp`. Enable it with the
-server's `--totp` (privsep, needs `--features pam` for the password first factor)
-or, for local e2e, `--dev-insecure-totp-secret <base32>` in dev mode.
+Enroll with `quish totp generate <user> <host>`: it prints the per-user base32
+secret (the same string an authenticator app stores), an `otpauth://` URI, a
+scannable QR code, and the current code to cross-check your app. Install the
+printed secret at the *server-side* `~user/.config/quish/totp` (mode 0600).
+Enable it with the server's `--totp` (privsep, needs `--features pam` for the
+password first factor) or, for local e2e, `--dev-insecure-totp-secret <base32>`
+in dev mode.
 
 **Anti-enumeration is preserved.** Every login reaching the second-factor backend
 gets an identical challenge — a bogus username is challenged exactly like a real
