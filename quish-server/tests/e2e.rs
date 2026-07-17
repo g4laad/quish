@@ -757,3 +757,81 @@ fn totp_anti_enumeration_valid_and_invalid_user_indistinguishable() {
         "invalid-user not floored: {invalid_elapsed:?}"
     );
 }
+
+/// An `--allow-user` naming the login user lets an authenticated login through:
+/// the allowlist is satisfied, so the exec channel opens and runs.
+#[test]
+#[ignore]
+fn policy_allow_user_permits_login() {
+    let server = DevServer::start_with_args("testuser", &["--allow-user", "testuser"]);
+    let target = format!("testuser@{}", server.addr);
+
+    let out = run_client(&server, &[&target, "echo", "hi"], Some("anything"));
+    assert!(out.status.success(), "allowlisted login failed: {out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("hi"),
+        "remote command output missing for allowlisted user: {out:?}"
+    );
+}
+
+/// A `--deny-user` refuses a user who otherwise authenticates. The denial is
+/// indistinguishable from a bad credential: same generic `authentication
+/// failed`, no policy-specific wording, and the constant-time floor still applies.
+#[test]
+#[ignore]
+fn policy_deny_user_refuses_login() {
+    let server = DevServer::start_with_args("testuser", &["--deny-user", "testuser"]);
+    let target = format!("testuser@{}", server.addr);
+
+    let (out, elapsed) = run_client_2fa(&server, &[&target, "echo", "nope"], "anything", None);
+    assert!(!out.status.success(), "denied user must fail: {out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !stdout.contains("nope"),
+        "command output leaked despite policy denial: {out:?}"
+    );
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("authentication failed"),
+        "policy denial did not present the generic auth failure: {err}"
+    );
+    let lower = err.to_lowercase();
+    assert!(
+        !lower.contains("policy") && !lower.contains("deny"),
+        "policy denial leaked distinct wording to the client: {err}"
+    );
+    assert!(
+        elapsed >= Duration::from_secs(1),
+        "policy denial was not floored (elapsed {elapsed:?}); the FAIL_DELAY floor must apply"
+    );
+}
+
+/// A non-empty `--allow-user` is an exhaustive allowlist: a user not named is
+/// refused even after authenticating, identically to a bad credential.
+#[test]
+#[ignore]
+fn policy_allowlist_excludes_other_users() {
+    let server = DevServer::start_with_args("testuser", &["--allow-user", "not-testuser"]);
+    let target = format!("testuser@{}", server.addr);
+
+    let (out, elapsed) = run_client_2fa(&server, &[&target, "echo", "nope"], "anything", None);
+    assert!(
+        !out.status.success(),
+        "user excluded by the allowlist must fail: {out:?}"
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !stdout.contains("nope"),
+        "command output leaked despite allowlist exclusion: {out:?}"
+    );
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("authentication failed"),
+        "allowlist exclusion did not present the generic auth failure: {err}"
+    );
+    assert!(
+        elapsed >= Duration::from_secs(1),
+        "allowlist exclusion was not floored (elapsed {elapsed:?})"
+    );
+}
