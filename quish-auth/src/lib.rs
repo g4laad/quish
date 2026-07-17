@@ -124,19 +124,46 @@ pub trait AuthBackend: Send + Sync {
     async fn authenticate(&self, conn: &ConnInfo, creds: &Credentials) -> Verdict;
 }
 
+/// Operator policy applied to every successful authentication, centralized in
+/// the registry so a policy denial is indistinguishable from any other failure
+/// (identical verdict, same constant-time floor).
+///
+/// Semantics (sshd-like): `deny_users` always wins; a non-empty `allow_users`
+/// is an exhaustive allowlist; both empty = every authenticated user permitted.
+#[derive(Debug, Clone, Default)]
+pub struct UserPolicy {
+    pub allow_users: Vec<String>,
+    pub deny_users: Vec<String>,
+}
+impl UserPolicy {
+    pub fn permits(&self, user: &str) -> bool {
+        if self.deny_users.iter().any(|u| u == user) {
+            return false;
+        }
+        self.allow_users.is_empty() || self.allow_users.iter().any(|u| u == user)
+    }
+}
+
 /// The compiled-in set of backends + the centralized failure contract.
 pub struct Registry {
     backends: Vec<Box<dyn AuthBackend>>,
     fail_delay: Duration,
+    policy: UserPolicy,
 }
 
 impl Registry {
     /// Build a registry. `fail_delay` is the constant-time floor every failure is
     /// padded to (mask backend timing differences, e.g. PAM vs a fast reject).
-    pub fn new(backends: Vec<Box<dyn AuthBackend>>, fail_delay: Duration) -> Self {
+    /// `policy` filters otherwise-successful authentications (allow/deny users).
+    pub fn new(
+        backends: Vec<Box<dyn AuthBackend>>,
+        fail_delay: Duration,
+        policy: UserPolicy,
+    ) -> Self {
         Self {
             backends,
             fail_delay,
+            policy,
         }
     }
 
@@ -163,9 +190,16 @@ impl Registry {
     /// a slow PAM never stalls the monitor's serial RPC loop. Still uniform in
     /// outcome — the caller maps every `Deny` to the same 401.
     pub async fn verdict(&self, authorization: Option<&str>, conn: &ConnInfo) -> Verdict {
-        match parse_authorization(authorization) {
+        let verdict = match parse_authorization(authorization) {
             Some(creds) => self.dispatch(&creds, conn).await,
             None => Verdict::Deny,
+        };
+        match verdict {
+            Verdict::Allow { user } if !self.policy.permits(&user) => {
+                tracing::info!(%user, "authenticated but denied by policy (allow_users/deny_users)");
+                Verdict::Deny
+            }
+            v => v,
         }
     }
 
@@ -285,6 +319,7 @@ mod tests {
         let reg = Registry::new(
             vec![Box::new(DevInsecureBackend::new("alice".into()))],
             Duration::from_millis(500),
+            UserPolicy::default(),
         );
         // No header at all: still floored (paused clock makes this exact + instant).
         let start = Instant::now();
@@ -297,6 +332,7 @@ mod tests {
         let reg = Registry::new(
             vec![Box::new(DevInsecureBackend::new("alice".into()))],
             Duration::from_millis(0),
+            UserPolicy::default(),
         );
         let h = basic_header("alice", "whatever");
         assert_eq!(

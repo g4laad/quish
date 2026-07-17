@@ -1500,6 +1500,7 @@ dependencies = [
  "ssh-key",
  "thiserror 2.0.18",
  "tokio",
+ "tracing",
  "zeroize",
 ]
 
