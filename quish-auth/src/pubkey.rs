@@ -124,9 +124,7 @@ pub fn build_token(
 /// private key as an OpenSSH PEM (wrapped in `Zeroizing` so it is wiped on
 /// drop) and the single `authorized_keys` line for the matching public key.
 /// Randomness is the OS CSPRNG (`rand_core::OsRng`); no `unsafe`.
-pub fn generate_keypair(
-    comment: &str,
-) -> anyhow::Result<(zeroize::Zeroizing<String>, String)> {
+pub fn generate_keypair(comment: &str) -> anyhow::Result<(zeroize::Zeroizing<String>, String)> {
     let mut key = ssh_key::PrivateKey::random(&mut OsRng, ssh_key::Algorithm::Ed25519)
         .map_err(|e| anyhow::anyhow!("generating key: {e}"))?;
     key.set_comment(comment);

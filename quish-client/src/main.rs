@@ -416,13 +416,14 @@ fn run_totp(action: TotpAction) -> Result<()> {
                 .build();
             println!("{qr}");
             // Zero-padded to DIGITS (6) so it matches the authenticator display.
-            println!("current code: {:06}", quish_auth::totp::current_code(&secret));
+            println!(
+                "current code: {:06}",
+                quish_auth::totp::current_code(&secret)
+            );
             println!();
             println!("Install server-side: write the base32 secret above to");
             println!("  ~{user}/.config/quish/totp   (mode 0600)");
-            println!(
-                "then enable TOTP on the server (--totp, or `totp = true` in its config)."
-            );
+            println!("then enable TOTP on the server (--totp, or `totp = true` in its config).");
             Ok(())
         }
     }
