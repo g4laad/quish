@@ -41,6 +41,16 @@ pub fn encode_base32_secret(secret: &[u8]) -> String {
     base32::encode(base32::Alphabet::Rfc4648 { padding: false }, secret)
 }
 
+/// Generate a fresh 20-byte (160-bit) TOTP secret from the OS CSPRNG — the
+/// enrollment input for [`encode_base32_secret`]. 20 bytes is the RFC 6238
+/// recommended key length for HMAC-SHA1. No `unsafe`.
+pub fn generate_totp_secret() -> Vec<u8> {
+    use rand_core::RngCore;
+    let mut secret = vec![0u8; 20];
+    rand_core::OsRng.fill_bytes(&mut secret);
+    secret
+}
+
 /// One HOTP value (RFC 4226) for `counter` over `secret`.
 fn hotp(secret: &[u8], counter: u64) -> u32 {
     // HMAC keys are variable-length, so `new_from_slice` never rejects.

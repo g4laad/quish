@@ -85,6 +85,12 @@ enum Command {
         #[arg(short, long)]
         comment: Option<String>,
     },
+    /// Generate a TOTP second-factor secret: prints the base32 secret, an
+    /// otpauth:// URI, a QR code, and where to install it server-side.
+    Totp {
+        #[command(subcommand)]
+        action: TotpAction,
+    },
 }
 
 #[derive(clap::Subcommand, Debug)]
@@ -93,6 +99,12 @@ enum KnownHostsAction {
     List,
     /// Remove a pinned host (like `ssh-keygen -R`). HOST is the `host:port` shown by `list`.
     Remove { host: String },
+}
+
+#[derive(clap::Subcommand, Debug)]
+enum TotpAction {
+    /// Generate a fresh secret for USER on HOST (labels the authenticator entry).
+    Generate { user: String, host: String },
 }
 
 /// Parsed connection target.
@@ -373,6 +385,49 @@ fn run_keygen(output: Option<std::path::PathBuf>, comment: Option<String>) -> Re
     Ok(())
 }
 
+/// Build the `otpauth://` enrollment URI an authenticator app scans. The
+/// `algorithm`/`digits`/`period` values MUST match the server's TOTP constants
+/// in `quish-auth/src/totp.rs:26-28` (`STEP_SECS = 30`, `DIGITS = 6`,
+/// HMAC-SHA1) or generated codes will not verify. The label is emitted as
+/// `quish:<user>@<host>` verbatim (no percent-encoding); callers pass plain
+/// user/host tokens.
+fn otpauth_uri(user: &str, host: &str, b32: &str) -> String {
+    format!(
+        "otpauth://totp/quish:{user}@{host}?secret={b32}&issuer=quish&algorithm=SHA1&digits=6&period=30"
+    )
+}
+
+/// `quish totp generate`: mint a fresh second-factor secret and print it (base32),
+/// its `otpauth://` URI, a terminal QR code, the current code, and server-side
+/// install instructions. The secret goes to stdout only — never logged, never
+/// written to a client-side file. Synchronous — no runtime.
+fn run_totp(action: TotpAction) -> Result<()> {
+    match action {
+        TotpAction::Generate { user, host } => {
+            let secret = quish_auth::totp::generate_totp_secret();
+            let b32 = quish_auth::totp::encode_base32_secret(&secret);
+            let uri = otpauth_uri(&user, &host, &b32);
+
+            println!("secret: {b32}");
+            println!("{uri}");
+            let qr = qrcode::QrCode::new(&uri)
+                .map_err(|e| anyhow::anyhow!("building QR code: {e}"))?
+                .render::<qrcode::render::unicode::Dense1x2>()
+                .build();
+            println!("{qr}");
+            // Zero-padded to DIGITS (6) so it matches the authenticator display.
+            println!("current code: {:06}", quish_auth::totp::current_code(&secret));
+            println!();
+            println!("Install server-side: write the base32 secret above to");
+            println!("  ~{user}/.config/quish/totp   (mode 0600)");
+            println!(
+                "then enable TOTP on the server (--totp, or `totp = true` in its config)."
+            );
+            Ok(())
+        }
+    }
+}
+
 fn main() -> Result<()> {
     // Logs go to stderr and stay quiet by default: stdout is the remote channel's
     // stdout (piping `quish host cmd > file` must yield clean output).
@@ -407,6 +462,9 @@ fn main() -> Result<()> {
         }
         Some(Command::Keygen { output, comment }) => {
             return run_keygen(output, comment);
+        }
+        Some(Command::Totp { action }) => {
+            return run_totp(action);
         }
         None => {}
     }
@@ -993,6 +1051,18 @@ mod tests {
         };
         let err = build_challenge_answer(&challenge, |_p| bail!("no tty")).is_err();
         assert!(err, "a failing prompt read must abort answer assembly");
+    }
+
+    #[test]
+    fn otpauth_uri_formats_exactly() {
+        // The URI must carry the server's fixed TOTP parameters verbatim
+        // (SHA1/6/30) and label the entry `quish:<user>@<host>`.
+        let uri = otpauth_uri("alice", "example.com", "JBSWY3DPEHPK3PXP");
+        assert_eq!(
+            uri,
+            "otpauth://totp/quish:alice@example.com?secret=JBSWY3DPEHPK3PXP\
+             &issuer=quish&algorithm=SHA1&digits=6&period=30"
+        );
     }
 
     #[test]
