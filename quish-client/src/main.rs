@@ -1305,4 +1305,140 @@ mod tests {
         assert!(parse_remote_forward("8080:127.0.0.1:notaport").is_err()); // bad lport
         assert!(parse_remote_forward("a:8080:127.0.0.1:5432").is_err()); // bad bind
     }
+
+    /// A `HostBlock` with only `host` set; callers fill the fields they exercise.
+    fn empty_block(host: &str) -> config::HostBlock {
+        config::HostBlock {
+            host: host.into(),
+            port: None,
+            user: None,
+            path: None,
+            identity: None,
+            local_forward: vec![],
+            remote_forward: vec![],
+        }
+    }
+
+    #[test]
+    fn alias_hit_pulls_host_user_port_from_block() {
+        let mut cfg = config::ClientConfig::default();
+        let mut b = empty_block("prod.example.com");
+        b.user = Some("alice".into());
+        b.port = Some(2222);
+        cfg.hosts.insert("prod".into(), b);
+        let r = resolve_target(parse_target("prod").unwrap(), &cfg);
+        assert_eq!(r.target.host, "prod.example.com");
+        assert_eq!(r.target.user, "alice");
+        assert_eq!(r.target.port, 2222);
+    }
+
+    #[test]
+    fn cli_beats_block_for_user_and_port() {
+        let mut cfg = config::ClientConfig::default();
+        let mut b = empty_block("prod.example.com");
+        b.user = Some("alice".into());
+        b.port = Some(2222);
+        cfg.hosts.insert("prod".into(), b);
+        let r = resolve_target(parse_target("bob@prod:9000").unwrap(), &cfg);
+        assert_eq!(r.target.user, "bob");
+        assert_eq!(r.target.port, 9000);
+        // Host still comes from the block (the CLI token only names the alias).
+        assert_eq!(r.target.host, "prod.example.com");
+    }
+
+    #[test]
+    fn alias_miss_applies_defaults_identity_only() {
+        let mut cfg = config::ClientConfig::default();
+        cfg.defaults.identity = Some("~/id_default".into());
+        let r = resolve_target(parse_target("literal.example.com").unwrap(), &cfg);
+        assert_eq!(r.target.host, "literal.example.com");
+        assert_eq!(r.target.port, 4433);
+        assert_eq!(r.identity.as_deref(), Some("~/id_default"));
+    }
+
+    #[test]
+    fn identity_chain_flag_then_block_then_defaults() {
+        let mut cfg = config::ClientConfig::default();
+        cfg.defaults.identity = Some("~/id_default".into());
+        let mut b = empty_block("h");
+        b.identity = Some("~/id_block".into());
+        cfg.hosts.insert("prod".into(), b);
+        // Block identity beats [defaults].
+        let r = resolve_target(parse_target("prod").unwrap(), &cfg);
+        assert_eq!(r.identity.as_deref(), Some("~/id_block"));
+        // With no block identity, [defaults] is used.
+        let mut cfg2 = config::ClientConfig::default();
+        cfg2.defaults.identity = Some("~/id_default".into());
+        cfg2.hosts.insert("prod".into(), empty_block("h"));
+        let r2 = resolve_target(parse_target("prod").unwrap(), &cfg2);
+        assert_eq!(r2.identity.as_deref(), Some("~/id_default"));
+        // The `-i` flag wins over both (mirrors main()'s chain).
+        let flag: Option<std::path::PathBuf> = Some("/flag/id".into());
+        let chosen = match flag {
+            Some(p) => Some(p),
+            None => r
+                .identity
+                .map(|s| config::expand_tilde(&s))
+                .transpose()
+                .unwrap(),
+        };
+        assert_eq!(chosen, Some(std::path::PathBuf::from("/flag/id")));
+    }
+
+    #[test]
+    fn forwards_append_block_then_cli() {
+        let mut cfg = config::ClientConfig::default();
+        let mut b = empty_block("h");
+        b.local_forward = vec!["5432:127.0.0.1:5432".into()];
+        cfg.hosts.insert("prod".into(), b);
+        let r = resolve_target(parse_target("prod").unwrap(), &cfg);
+        // main() appends CLI -L after the block's list.
+        let mut local = r.local_forward.clone();
+        local.extend(vec!["8080:127.0.0.1:80".to_string()]);
+        assert_eq!(
+            local,
+            vec![
+                "5432:127.0.0.1:5432".to_string(),
+                "8080:127.0.0.1:80".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn expand_tilde_expands_home_and_passes_absolute() {
+        let home = std::env::var("HOME").unwrap();
+        assert_eq!(
+            config::expand_tilde("~/x").unwrap(),
+            std::path::PathBuf::from(format!("{home}/x"))
+        );
+        assert_eq!(
+            config::expand_tilde("/abs/x").unwrap(),
+            std::path::PathBuf::from("/abs/x")
+        );
+    }
+
+    #[test]
+    fn load_rejects_malformed_and_unknown_fields() {
+        let dir = std::env::temp_dir();
+        let bad_key = dir.join("quish-cfg-unknown-key.toml");
+        std::fs::write(&bad_key, "[defaults]\nbogus = 1\n").unwrap();
+        let unknown = config::load_from(&bad_key);
+        let _ = std::fs::remove_file(&bad_key);
+        assert!(unknown.is_err(), "unknown field must fail loud");
+
+        let syntax = dir.join("quish-cfg-malformed.toml");
+        std::fs::write(&syntax, "this is not = = toml\n").unwrap();
+        let malformed = config::load_from(&syntax);
+        let _ = std::fs::remove_file(&syntax);
+        assert!(malformed.is_err(), "malformed TOML must fail loud");
+    }
+
+    #[test]
+    fn load_missing_file_is_ok_default() {
+        let path = std::env::temp_dir().join("quish-cfg-does-not-exist-xyzzy.toml");
+        let _ = std::fs::remove_file(&path);
+        let cfg = config::load_from(&path).unwrap();
+        assert!(cfg.hosts.is_empty());
+        assert!(cfg.defaults.identity.is_none());
+    }
 }

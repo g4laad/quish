@@ -54,7 +54,13 @@ pub(crate) fn load() -> Result<ClientConfig> {
                 .join("config.toml")
         }
     };
-    let text = match std::fs::read_to_string(&path) {
+    load_from(&path)
+}
+
+/// Read and parse the config at `path`. A missing file is not an error (returns
+/// the empty default); a read/parse error is (with the file path in context).
+pub(crate) fn load_from(path: &std::path::Path) -> Result<ClientConfig> {
+    let text = match std::fs::read_to_string(path) {
         Ok(t) => t,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(ClientConfig::default()),
         Err(e) => return Err(e).with_context(|| format!("reading config {}", path.display())),
