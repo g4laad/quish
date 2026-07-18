@@ -26,9 +26,9 @@ pub(crate) struct CpArgs {
     /// Server UDP port. [default: host block `port`, else 4433]
     #[arg(short = 'P', long)]
     pub(crate) port: Option<u16>,
-    /// Secret HTTP/3 connect path the server was configured with.
-    #[arg(long, default_value = quish_proto::DEFAULT_PATH)]
-    pub(crate) connect_path: String,
+    /// Secret HTTP/3 connect path. [default: host block `path`, else /quish]
+    #[arg(long)]
+    pub(crate) connect_path: Option<String>,
 }
 
 /// One side of a `quish cp` invocation.
@@ -159,7 +159,9 @@ fn part_path(final_path: &std::path::Path) -> std::path::PathBuf {
 /// aliases (the same merge matrix as the connect path), and compute the
 /// identity chain (`-i` flag → block identity → `[defaults]` identity → none).
 /// `--port` is `Option<u16>` so a missing flag lets a host block's `port` win,
-/// with 4433 as the final fallback; `--connect-path` is the secret HTTP path.
+/// with 4433 as the final fallback. `--connect-path` is `Option<String>` for the
+/// same reason: a missing flag lets a host block's `path` win, with `/quish` as
+/// the final fallback (identical to the connect path's `parse_target`).
 fn resolve_cp_target(
     user: Option<String>,
     host: String,
@@ -170,7 +172,7 @@ fn resolve_cp_target(
         user,
         host,
         port: args.port,
-        path: Some(args.connect_path.clone()),
+        path: args.connect_path.clone(),
     };
     let resolved = crate::resolve_target(raw, cfg);
     let identity = match args.identity.clone() {
@@ -671,5 +673,63 @@ mod tests {
     #[test]
     fn resolve_remote_exact() {
         assert_eq!(resolve_remote_dst("exact", "f"), "exact");
+    }
+
+    /// A `CpArgs` with only the resolution-relevant fields set; src/dst are
+    /// unused by `resolve_cp_target` (it takes user/host separately).
+    fn cp_args(port: Option<u16>, connect_path: Option<String>) -> CpArgs {
+        CpArgs {
+            src: "x".into(),
+            dst: "y".into(),
+            identity: None,
+            port,
+            connect_path,
+        }
+    }
+
+    /// A `[hosts.<alias>]` block carrying a custom secret `path`.
+    fn block_with_path(host: &str, path: &str) -> crate::config::HostBlock {
+        crate::config::HostBlock {
+            host: host.into(),
+            port: None,
+            user: None,
+            path: Some(path.into()),
+            identity: None,
+            local_forward: vec![],
+            remote_forward: vec![],
+        }
+    }
+
+    // The regression: no --connect-path flag → a host block's `path` wins.
+    #[test]
+    fn cp_uses_block_path_when_flag_absent() {
+        let mut cfg = crate::config::ClientConfig::default();
+        cfg.hosts
+            .insert("box".into(), block_with_path("host.example.com", "/custom"));
+        let args = cp_args(None, None);
+        let (target, _) = resolve_cp_target(None, "box".into(), &args, &cfg).unwrap();
+        assert_eq!(target.host, "host.example.com");
+        assert_eq!(target.path, "/custom");
+    }
+
+    // An explicit --connect-path still overrides a block's `path`.
+    #[test]
+    fn cp_flag_beats_block_path() {
+        let mut cfg = crate::config::ClientConfig::default();
+        cfg.hosts
+            .insert("box".into(), block_with_path("host.example.com", "/custom"));
+        let args = cp_args(None, Some("/flag".into()));
+        let (target, _) = resolve_cp_target(None, "box".into(), &args, &cfg).unwrap();
+        assert_eq!(target.path, "/flag");
+    }
+
+    // No flag and no block: the built-in default.
+    #[test]
+    fn cp_defaults_to_quish_path() {
+        let cfg = crate::config::ClientConfig::default();
+        let args = cp_args(None, None);
+        let (target, _) =
+            resolve_cp_target(None, "literal.example.com".into(), &args, &cfg).unwrap();
+        assert_eq!(target.path, quish_proto::DEFAULT_PATH);
     }
 }
