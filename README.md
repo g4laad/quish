@@ -124,6 +124,32 @@ makes password auth fail for root — an environment policy, not a quish
 restriction. For root logins prefer pubkey auth: put the ed25519 public key in
 `/root/.config/quish/authorized_keys`.
 
+## Client configuration
+
+An optional `~/.config/quish/config.toml` gives the flags-only CLI an
+`ssh_config`-style equivalent: a `[defaults]` table and per-alias
+`[hosts.<alias>]` blocks, so `quish prod` and `quish cp prod:file .` resolve
+the same host. Set `QUISH_CONFIG` to point elsewhere. A missing file is fine; a
+malformed file (or an unknown key) fails loud, naming the file.
+
+```toml
+[defaults]
+identity = "~/.config/quish/id_ed25519"   # optional; tilde-expanded
+
+[hosts.prod]                    # "prod" is the alias used on the CLI
+host = "prod.example.com"       # required in every [hosts.*] block
+port = 4433                     # optional
+user = "alice"                  # optional
+path = "/quish"                 # optional secret path
+identity = "~/.config/quish/id_prod"      # optional; overrides [defaults]
+local_forward = ["5432:127.0.0.1:5432"]   # optional; same syntax as -L
+remote_forward = []                        # optional; same syntax as -R
+```
+
+Precedence: CLI flags beat the host block, which beats `[defaults]`, which
+beats the built-in default; forwards append (the block's `-L`/`-R` lists plus
+any given on the CLI both apply).
+
 ## File transfer
 
 `quish cp` copies files and folders to or from a server, scp-style. Exactly one of

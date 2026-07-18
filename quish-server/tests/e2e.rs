@@ -903,3 +903,62 @@ fn policy_allowlist_excludes_other_users() {
         "allowlist exclusion was not floored (elapsed {elapsed:?})"
     );
 }
+
+/// A config-file alias resolves to a live server: write a `config.toml` with a
+/// `[hosts.devbox]` block pointing at the spawned dev server, then run the
+/// client as `quish devbox 'echo hi'` with `QUISH_CONFIG` set. The alias must
+/// supply the host/port/user so the bare token connects and echoes `hi`.
+#[test]
+#[ignore]
+fn config_alias_connects() {
+    let server = DevServer::start("testuser");
+
+    let quishd = PathBuf::from(env!("CARGO_BIN_EXE_quishd"));
+    let quish = quishd.with_file_name("quish");
+    if !quish.exists() {
+        panic!(
+            "quish client binary not found at {}; run `cargo build --workspace` first",
+            quish.display()
+        );
+    }
+
+    // Client home with the dev server's ephemeral cert pre-trusted (TOFU seed),
+    // so the non-interactive run does not block on an unknown-host prompt.
+    let home = fresh_temp_dir("quish-client-home");
+    let kh_dir = home.join(".config/quish");
+    std::fs::create_dir_all(&kh_dir).unwrap();
+    std::fs::write(
+        kh_dir.join("known_hosts"),
+        format!("{} {}\n", server.addr, server.fingerprint),
+    )
+    .unwrap();
+
+    // A config aliasing `devbox` to the spawned server's host/port + user.
+    let cfg_path = home.join("config.toml");
+    std::fs::write(
+        &cfg_path,
+        format!(
+            "[hosts.devbox]\nhost = \"{}\"\nport = {}\nuser = \"testuser\"\n",
+            server.addr.ip(),
+            server.addr.port(),
+        ),
+    )
+    .unwrap();
+
+    let output = Command::new(&quish)
+        .args(["devbox", "echo", "hi"])
+        .env("HOME", &home)
+        .env("QUISH_CONFIG", &cfg_path)
+        .env("QUISH_PASSWORD", "x")
+        .output()
+        .expect("spawn quish client");
+
+    assert!(
+        output.status.success(),
+        "client did not exit successfully: {output:?}"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("hi"),
+        "unexpected stdout: {output:?}"
+    );
+}
