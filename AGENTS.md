@@ -28,17 +28,22 @@ Full design + milestones: `~/.claude/plans/plan-a-new-project-gentle-charm.md`.
 
 - `quish-proto` — wire types (`ChannelMessage`, `ChannelOpen`), postcard frame codec +
   size caps, header/status/version consts. Shared, no I/O.
-- `quish-auth` — `AuthBackend` trait, `Credentials`, the registry, `pam.rs`, `pubkey.rs`.
+- `quish-auth` — `AuthBackend` trait, `Credentials`, the registry, `pam.rs`, `pubkey.rs`,
+  `totp.rs` (RFC 6238 second factor). `Verdict` is `Allow`/`Deny`/`Challenge` (multi-round);
+  the registry also enforces the `UserPolicy` allow/deny-user filter at the verdict.
   Adding an auth method = new module impl'ing the trait + one registry match arm.
 - `quish-server` — `quishd`: `main` (sync mode dispatch), `monitor.rs`, `worker.rs`,
-  `session.rs` (dev-mode PTY/exec), `ipc.rs` (control + signing wire types/framing),
-  `privdrop.rs` (chroot/setuid + session helper), `signproxy.rs` (rustls signing
-  proxy), `transport.rs` (`Backend` seam), `ratelimit.rs` (per-IP DoS caps),
-  `config.rs` (TOML file; CLI flags override).
-- `quish-client` — `quish` CLI: `connect.rs` (cert verifier + TOFU pinning),
-  `terminal.rs` (raw mode + channel pump).
-- `dist/` — `systemd/quishd.service`, `pam.d/quish` (`pam_unix ... nodelay`),
-  `sysusers.d/quishd.conf`, `server.toml`.
+  `session.rs` (dev-mode PTY/exec, file transfer, port-forward pumps), `ipc.rs`
+  (control + signing wire types/framing), `privdrop.rs` (chroot/setuid + session
+  helper: shell/exec + read/write/mkdir transfer helpers, all post-setuid),
+  `signproxy.rs` (rustls signing proxy), `transport.rs` (`Backend` seam +
+  challenge store), `ratelimit.rs` (per-IP DoS caps), `config.rs` (TOML file;
+  CLI flags override).
+- `quish-client` — `quish` CLI: `connect.rs` (cert verifier + TOFU pinning +
+  challenge round), `terminal.rs` (raw mode + channel pump), `cp.rs` (scp-style
+  `quish cp` up/download). Subcommands: `keygen`, `totp generate`, `known-hosts`.
+- `dist/` — `systemd/quishd.service`, `pam.d/quish` (`pam_unix` auth/account +
+  `--features pam` session stack), `sysusers.d/quishd.conf`, `server.toml`.
 
 ## Architecture in one paragraph
 
@@ -50,7 +55,10 @@ enforcing seccomp-bpf syscall allowlist — `WORKER_SYSCALLS` in `privdrop.rs`,
 so adding a worker syscall may need an allowlist edit; `--no-seccomp` disables
 it) runs all quinn/h3/rustls
 and untrusted parsing, pre- and post-auth. The **monitor** (root parent) holds the
-auth registry (PAM needs root), the host key, and session spawning. They talk over
+auth registry (PAM needs root), the host key, session spawning, and — with
+`--features pam` — the per-login PAM session stack (`open_session`/`setcred`, held
+for the session, closed at logout). Auth verdicts also apply the allow/deny-user
+authorization policy. They talk over
 two `SOCK_SEQPACKET` socketpairs — a control RPC (auth / spawn / reap) and a
 dedicated signing channel — both request/response and blocking (run off the reactor
 via `spawn_blocking`); session PTY/pipe fds pass to the worker via `SCM_RIGHTS`.
@@ -68,9 +76,13 @@ are the real quish discriminators. Channel frames tunnel over H3 DATA on the CON
 stream (not raw QUIC streams). Auth rides
 the `Authorization` header: Basic → PAM password, Bearer → signed-token pubkey (OpenSSH
 ed25519, `~/.config/quish/authorized_keys`, channel-bound via TLS keying-material export
-+ timestamp). Each further channel (shell, exec) is its own Extended CONNECT on the same
-authed connection. Server identity: web PKI if the cert validates, else TOFU pinning
-(`~/.config/quish/known_hosts`, hard-fail on mismatch).
++ timestamp). An optional TOTP (RFC 6238) second factor runs as a challenge round: the
+first CONNECT `401`s with an opaque `quish-challenge` header, the client answers on a
+second CONNECT (`Verdict::Challenge`, connection-bound state, single-use, floored to
+`FAIL_DELAY` like any failure). Each further channel — shell, exec, file transfer
+(`ReadFile`/`WriteFile`/`MkDir`), `-L`/`-R` port forwarding — is its own Extended
+CONNECT on the same authed connection. Server identity: web PKI if the cert validates,
+else TOFU pinning (`~/.config/quish/known_hosts`, hard-fail on mismatch).
 
 ## Workflow (mandated)
 
@@ -91,8 +103,9 @@ authed connection. Server identity: web PKI if the cert validates, else TOFU pin
 ## Stack
 
 tokio, quinn, h3 (0.0.8, `enable_extended_connect`), h3-quinn, rustls, rustls-pki-types,
-rcgen, postcard, serde, ssh-key, pam-client, async-trait, nix, clap, toml, tracing,
-zeroize, rpassword.
+rcgen, postcard, serde, bytes, base64, ssh-key, ed25519-dalek, pam-client, hmac, sha1,
+sha2, base32, qrcode, seccompiler, async-trait, nix, rustix, libc, tokio-seqpacket,
+portable-pty, clap, toml, tracing, zeroize, rpassword.
 
 ## Git
 
@@ -100,6 +113,12 @@ Merge fast-forward only (`git merge --ff-only`); never create merge commits.
 
 ## v1 scope
 
-Interactive PTY shell + remote command exec. Deferred (protocol leaves room):
-`-L`/`-R` forwarding, file transfer, OIDC bearer auth, multi-round/challenge auth,
-seccomp on the worker, non-ed25519 keys.
+Delivered: interactive PTY shell + remote command exec; scp-style file transfer
+(`quish cp` up/download, recursive folders); local (`-L`) and remote (`-R`)
+loopback-only port forwarding (both off by default); pubkey (ed25519) + PAM-password
+auth with an optional TOTP second factor; PAM session lifecycle; server-side
+allow/deny-user authorization; worker seccomp-bpf sandbox; client credential tooling
+(`quish keygen`, `quish totp generate`, `quish known-hosts`).
+
+Deferred (protocol leaves room): OIDC bearer auth, non-ed25519 keys, a client config
+file (host aliases / per-host defaults).

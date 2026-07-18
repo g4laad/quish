@@ -124,6 +124,23 @@ makes password auth fail for root — an environment policy, not a quish
 restriction. For root logins prefer pubkey auth: put the ed25519 public key in
 `/root/.config/quish/authorized_keys`.
 
+## File transfer
+
+`quish cp` copies files and folders to or from a server, scp-style. Exactly one of
+SRC/DST is remote (`[user@]host:path`); a trailing `/` on the destination means
+"into that directory", and a local folder source uploads recursively (symlinks are
+skipped, never followed). Files are read and written **as the authenticated user** —
+the `open()`/`mkdir()` runs in the setuid'd session helper, never as root or the
+worker.
+
+```sh
+quish cp ./notes.txt user@host:notes.txt        # upload a file
+quish cp user@host:/etc/hostname ./hostname     # download a file
+quish cp ./project user@host:project/           # upload a folder (recursive)
+```
+
+Auth matches a shell login: password (or `QUISH_PASSWORD`), or `-i <key>` for pubkey.
+
 ## Port forwarding
 
 Both directions are **off by default** and **loopback-only** — a forward can only
