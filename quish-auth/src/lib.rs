@@ -42,6 +42,10 @@ pub enum Credentials {
     },
     /// HTTP Bearer → signed, channel-bound pubkey token.
     SignedToken(pubkey::Token),
+    /// HTTP Bearer carrying a compact JWT (contains `.`) — OIDC. Discriminated
+    /// from pubkey tokens by dot-presence: pubkey blobs are standard base64 (no
+    /// dots), a compact JWT is three base64url segments joined by two `.`.
+    Jwt(String),
 }
 
 /// The outcome of an authentication attempt. `Allow` carries the *authenticated*
@@ -231,7 +235,12 @@ fn parse_authorization(header: Option<&str>) -> Option<Credentials> {
             password: Zeroizing::new(pass.to_string()),
         })
     } else if let Some(rest) = header.strip_prefix("Bearer ") {
-        Some(Credentials::SignedToken(pubkey::parse_token(rest)?))
+        let rest = rest.trim();
+        if rest.contains('.') {
+            Some(Credentials::Jwt(rest.to_string()))
+        } else {
+            Some(Credentials::SignedToken(pubkey::parse_token(rest)?))
+        }
     } else {
         None
     }
@@ -399,5 +408,45 @@ mod tests {
         let start = Instant::now();
         assert_eq!(reg.authenticate(Some(&h), &conn()).await, Verdict::Deny);
         assert_eq!(start.elapsed(), Duration::from_millis(500));
+    }
+
+    #[test]
+    fn bearer_with_dots_parses_as_jwt() {
+        // A compact JWT is three base64url segments joined by two dots.
+        let jwt = "eyJhbGciOiJFZERTQSJ9.eyJzdWIiOiJhbGljZSJ9.c2ln";
+        let creds = parse_authorization(Some(&bearer_header(jwt))).unwrap();
+        match creds {
+            Credentials::Jwt(raw) => assert_eq!(raw, jwt),
+            _ => panic!("expected Jwt"),
+        }
+    }
+
+    #[test]
+    fn dotless_bearer_parses_as_signed_token() {
+        // A minted pubkey token is standard-base64 postcard — never contains a dot,
+        // so it must still route to the SignedToken arm.
+        let signing = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        let blob = pubkey::sign_token(&signing, "alice", &[0u8; 32], 42);
+        assert!(!blob.contains('.'), "pubkey blob must be dotless: {blob}");
+        let creds = parse_authorization(Some(&bearer_header(&blob))).unwrap();
+        match creds {
+            Credentials::SignedToken(tok) => assert_eq!(tok.username, "alice"),
+            _ => panic!("expected SignedToken"),
+        }
+    }
+
+    #[tokio::test]
+    async fn jwt_without_oidc_backend_denies() {
+        // No backend `supports` a Jwt credential, so dispatch falls through to Deny.
+        let reg = Registry::new(
+            vec![Box::new(DevInsecureBackend::new("alice".into()))],
+            Duration::from_millis(0),
+            UserPolicy::default(),
+        );
+        let jwt = "eyJhbGciOiJFZERTQSJ9.eyJzdWIiOiJhbGljZSJ9.c2ln";
+        assert_eq!(
+            reg.verdict(Some(&bearer_header(jwt)), &conn()).await,
+            Verdict::Deny
+        );
     }
 }
