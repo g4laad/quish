@@ -962,3 +962,74 @@ fn config_alias_connects() {
         "unexpected stdout: {output:?}"
     );
 }
+
+/// A host block's `path` is honored by `quish cp` (regression for the bug where
+/// cp always used the built-in `/quish` and ignored the block's `path`). The dev
+/// server listens on a non-default secret path; the alias block names that same
+/// path; the upload succeeds only if cp resolves `path` from the block.
+#[test]
+#[ignore]
+fn cp_honors_host_block_path() {
+    let server = DevServer::start_with_args("testuser", &["--path", "/custom"]);
+
+    let quishd = PathBuf::from(env!("CARGO_BIN_EXE_quishd"));
+    let quish = quishd.with_file_name("quish");
+    if !quish.exists() {
+        panic!(
+            "quish client binary not found at {}; run `cargo build --workspace` first",
+            quish.display()
+        );
+    }
+
+    // Client home: pre-trust the dev server's ephemeral cert (TOFU seed) so the
+    // non-interactive run does not block on an unknown-host prompt.
+    let home = fresh_temp_dir("quish-cp-path-home");
+    let kh_dir = home.join(".config/quish");
+    std::fs::create_dir_all(&kh_dir).unwrap();
+    std::fs::write(
+        kh_dir.join("known_hosts"),
+        format!("{} {}\n", server.addr, server.fingerprint),
+    )
+    .unwrap();
+
+    // Config aliasing `cpbox` to the server, INCLUDING the custom secret path.
+    let cfg_path = home.join("config.toml");
+    std::fs::write(
+        &cfg_path,
+        format!(
+            "[hosts.cpbox]\nhost = \"{}\"\nport = {}\nuser = \"testuser\"\npath = \"/custom\"\n",
+            server.addr.ip(),
+            server.addr.port(),
+        ),
+    )
+    .unwrap();
+
+    // Upload a file through the alias. dst dir is a fresh temp dir the dev-mode
+    // session (running as the current user, chdir'd to $HOME) can write to.
+    let src_dir = fresh_temp_dir("quish-cp-path-src");
+    let src_file = src_dir.join("payload.txt");
+    std::fs::write(&src_file, b"cp-path-ok").unwrap();
+    let dst_dir = fresh_temp_dir("quish-cp-path-dst");
+    let remote_dst = format!("cpbox:{}/", dst_dir.display());
+
+    let output = Command::new(&quish)
+        .args(["cp", src_file.to_str().unwrap(), &remote_dst])
+        .env("HOME", &home)
+        .env("QUISH_CONFIG", &cfg_path)
+        .env("QUISH_PASSWORD", "x")
+        .output()
+        .expect("spawn quish cp");
+
+    assert!(
+        output.status.success(),
+        "cp through alias with custom path did not succeed \
+         (host block `path` likely ignored): {output:?}"
+    );
+    let landed = dst_dir.join("payload.txt");
+    assert_eq!(
+        std::fs::read(&landed).unwrap(),
+        b"cp-path-ok",
+        "uploaded file did not land at {}",
+        landed.display()
+    );
+}
