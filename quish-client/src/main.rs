@@ -5,6 +5,7 @@
 //! Basic or channel-bound pubkey Bearer), then open a shell (interactive PTY) or
 //! exec channel and pump it to completion, exiting with the remote status.
 
+mod config;
 mod connect;
 mod cp;
 mod terminal;
