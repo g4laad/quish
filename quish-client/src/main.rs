@@ -123,10 +123,10 @@ pub(crate) struct Target {
 /// after alias resolution — never here.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RawTarget {
-    user: Option<String>,
-    host: String,
-    port: Option<u16>,
-    path: Option<String>,
+    pub(crate) user: Option<String>,
+    pub(crate) host: String,
+    pub(crate) port: Option<u16>,
+    pub(crate) path: Option<String>,
 }
 
 fn parse_target(s: &str) -> Result<RawTarget> {
@@ -186,7 +186,7 @@ pub(crate) struct Resolved {
 /// lookup on the bare host token, then field-by-field precedence
 /// (CLI → block → `[defaults]`/built-in). A miss means the token is a literal
 /// host and only `[defaults]` applies.
-fn resolve_target(raw: RawTarget, cfg: &config::ClientConfig) -> Resolved {
+pub(crate) fn resolve_target(raw: RawTarget, cfg: &config::ClientConfig) -> Resolved {
     let block = cfg.hosts.get(&raw.host);
     let host = block
         .map(|b| b.host.clone())

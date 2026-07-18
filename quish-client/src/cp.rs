@@ -23,9 +23,9 @@ pub(crate) struct CpArgs {
     /// OpenSSH ed25519 private key for pubkey auth (else password auth).
     #[arg(short, long)]
     pub(crate) identity: Option<std::path::PathBuf>,
-    /// Server UDP port.
-    #[arg(short = 'P', long, default_value_t = 4433)]
-    pub(crate) port: u16,
+    /// Server UDP port. [default: host block `port`, else 4433]
+    #[arg(short = 'P', long)]
+    pub(crate) port: Option<u16>,
     /// Secret HTTP/3 connect path the server was configured with.
     #[arg(long, default_value = quish_proto::DEFAULT_PATH)]
     pub(crate) connect_path: String,
@@ -155,13 +155,32 @@ fn part_path(final_path: &std::path::Path) -> std::path::PathBuf {
     parent.join(format!(".{name}.quish-part"))
 }
 
-fn build_target(user: Option<String>, host: String, args: &CpArgs) -> crate::Target {
-    crate::Target {
-        user: user.unwrap_or_else(crate::whoami),
+/// Resolve a cp remote spec (`user`/`host` + `--port`) through the config
+/// aliases (the same merge matrix as the connect path), and compute the
+/// identity chain (`-i` flag → block identity → `[defaults]` identity → none).
+/// `--port` is `Option<u16>` so a missing flag lets a host block's `port` win,
+/// with 4433 as the final fallback; `--connect-path` is the secret HTTP path.
+fn resolve_cp_target(
+    user: Option<String>,
+    host: String,
+    args: &CpArgs,
+    cfg: &crate::config::ClientConfig,
+) -> Result<(crate::Target, Option<std::path::PathBuf>)> {
+    let raw = crate::RawTarget {
+        user,
         host,
         port: args.port,
-        path: args.connect_path.clone(),
-    }
+        path: Some(args.connect_path.clone()),
+    };
+    let resolved = crate::resolve_target(raw, cfg);
+    let identity = match args.identity.clone() {
+        Some(p) => Some(p),
+        None => resolved
+            .identity
+            .map(|s| crate::config::expand_tilde(&s))
+            .transpose()?,
+    };
+    Ok((resolved.target, identity))
 }
 
 /// Entry point from `main()`. Parses both specs, enforces exactly-one-remote
@@ -171,6 +190,7 @@ fn build_target(user: Option<String>, host: String, args: &CpArgs) -> crate::Tar
 pub(crate) async fn run_cp(args: CpArgs) -> Result<i32> {
     let src = parse_cp_spec(&args.src)?;
     let dst = parse_cp_spec(&args.dst)?;
+    let cfg = crate::config::load()?;
 
     match (src, dst) {
         (CpSpec::Remote { .. }, CpSpec::Remote { .. }) => {
@@ -185,13 +205,13 @@ pub(crate) async fn run_cp(args: CpArgs) -> Result<i32> {
             },
             CpSpec::Local(local),
         ) => {
-            let target = build_target(user, host, &args);
+            let (target, identity) = resolve_cp_target(user, host, &args, &cfg)?;
             let dst_is_dir = std::fs::metadata(&local)
                 .map(|m| m.is_dir())
                 .unwrap_or(false);
             let final_path = resolve_local_dst(&local, dst_is_dir, &remote)?;
             let (mut send_request, drive, authorization) =
-                crate::establish(&target, args.identity.as_deref()).await?;
+                crate::establish(&target, identity.as_deref()).await?;
             let res = download_one(
                 &mut send_request,
                 &target,
@@ -215,7 +235,7 @@ pub(crate) async fn run_cp(args: CpArgs) -> Result<i32> {
             // Local source must exist before any network I/O.
             let meta = std::fs::metadata(&local)
                 .with_context(|| format!("cannot access local source {local}"))?;
-            let target = build_target(user, host, &args);
+            let (target, identity) = resolve_cp_target(user, host, &args, &cfg)?;
             if meta.is_dir() {
                 let root_mode = meta.permissions().mode() & 0o777;
                 let src_name = local_basename(&local);
@@ -223,7 +243,7 @@ pub(crate) async fn run_cp(args: CpArgs) -> Result<i32> {
                 // Collect the whole walk before any network op.
                 let walk = collect_walk(std::path::Path::new(&local))?;
                 let (mut send_request, drive, authorization) =
-                    crate::establish(&target, args.identity.as_deref()).await?;
+                    crate::establish(&target, identity.as_deref()).await?;
                 let res = upload_tree(
                     &mut send_request,
                     &target,
@@ -241,7 +261,7 @@ pub(crate) async fn run_cp(args: CpArgs) -> Result<i32> {
                 let src_name = local_basename(&local);
                 let remote_final = resolve_remote_dst(&remote, &src_name);
                 let (mut send_request, drive, authorization) =
-                    crate::establish(&target, args.identity.as_deref()).await?;
+                    crate::establish(&target, identity.as_deref()).await?;
                 let res = upload_one(
                     &mut send_request,
                     &target,
