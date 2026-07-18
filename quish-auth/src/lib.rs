@@ -14,6 +14,7 @@ use tokio::time::Instant;
 use zeroize::Zeroizing;
 
 pub mod pubkey;
+pub mod oidc;
 pub mod totp;
 
 #[cfg(feature = "pam")]
