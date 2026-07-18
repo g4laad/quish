@@ -117,15 +117,27 @@ pub(crate) struct Target {
     pub(crate) path: String,
 }
 
-fn parse_target(s: &str) -> Result<Target> {
+/// A parsed target with CLI *explicitness* preserved: a `None` field means "not
+/// given on the CLI", so a config-file value can win in [`resolve_target`]. The
+/// built-in defaults (`whoami()`, port 4433, `DEFAULT_PATH`) are applied there,
+/// after alias resolution — never here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RawTarget {
+    user: Option<String>,
+    host: String,
+    port: Option<u16>,
+    path: Option<String>,
+}
+
+fn parse_target(s: &str) -> Result<RawTarget> {
     let (user, rest) = match s.split_once('@') {
-        Some((u, r)) => (u.to_string(), r),
-        None => (whoami(), s),
+        Some((u, r)) => (Some(u.to_string()), r),
+        None => (None, s),
     };
     // Path is everything from the first '/'; the rest is host[:port].
     let (hostport, path) = match rest.split_once('/') {
-        Some((hp, p)) => (hp, format!("/{p}")),
-        None => (rest, quish_proto::DEFAULT_PATH.to_string()),
+        Some((hp, p)) => (hp, Some(format!("/{p}"))),
+        None => (rest, None),
     };
     let (host, port) = if let Some(rest) = hostport.strip_prefix('[') {
         // Bracketed IPv6: [addr] or [addr]:port
@@ -133,30 +145,80 @@ fn parse_target(s: &str) -> Result<Target> {
             .split_once(']')
             .context("missing closing ']' in IPv6 target")?;
         let port = match after.strip_prefix(':') {
-            Some(p) => p.parse().context("invalid port")?,
-            None if after.is_empty() => 4433,
+            Some(p) => Some(p.parse().context("invalid port")?),
+            None if after.is_empty() => None,
             None => bail!("unexpected text after ']' in target `{s}`"),
         };
         (addr.to_string(), port)
     } else if let Some((h, p)) = hostport.rsplit_once(':') {
         if h.contains(':') {
             // Bare IPv6 literal (multiple colons, no brackets): no port present.
-            (hostport.to_string(), 4433)
+            (hostport.to_string(), None)
         } else {
-            (h.to_string(), p.parse().context("invalid port")?)
+            (h.to_string(), Some(p.parse().context("invalid port")?))
         }
     } else {
-        (hostport.to_string(), 4433)
+        (hostport.to_string(), None)
     };
     if host.is_empty() {
         bail!("missing host in target `{s}`");
     }
-    Ok(Target {
+    Ok(RawTarget {
         user,
         host,
         port,
         path,
     })
+}
+
+/// A `RawTarget` merged with the config file: the connection `Target` plus the
+/// config-derived identity and forward lists. The CLI `-i` flag and `-L`/`-R`
+/// specs are layered on by the caller (they win / append respectively).
+pub(crate) struct Resolved {
+    pub(crate) target: Target,
+    /// Block identity → `[defaults]` identity, still unexpanded (`~/` intact).
+    pub(crate) identity: Option<String>,
+    pub(crate) local_forward: Vec<String>,
+    pub(crate) remote_forward: Vec<String>,
+}
+
+/// Apply the merge matrix (see `config.rs`): a case-sensitive `[hosts.<token>]`
+/// lookup on the bare host token, then field-by-field precedence
+/// (CLI → block → `[defaults]`/built-in). A miss means the token is a literal
+/// host and only `[defaults]` applies.
+fn resolve_target(raw: RawTarget, cfg: &config::ClientConfig) -> Resolved {
+    let block = cfg.hosts.get(&raw.host);
+    let host = block
+        .map(|b| b.host.clone())
+        .unwrap_or_else(|| raw.host.clone());
+    let user = raw
+        .user
+        .or_else(|| block.and_then(|b| b.user.clone()))
+        .unwrap_or_else(whoami);
+    let port = raw
+        .port
+        .or_else(|| block.and_then(|b| b.port))
+        .unwrap_or(4433);
+    let path = raw
+        .path
+        .or_else(|| block.and_then(|b| b.path.clone()))
+        .unwrap_or_else(|| quish_proto::DEFAULT_PATH.to_string());
+    let identity = block
+        .and_then(|b| b.identity.clone())
+        .or_else(|| cfg.defaults.identity.clone());
+    let local_forward = block.map(|b| b.local_forward.clone()).unwrap_or_default();
+    let remote_forward = block.map(|b| b.remote_forward.clone()).unwrap_or_default();
+    Resolved {
+        target: Target {
+            user,
+            host,
+            port,
+            path,
+        },
+        identity,
+        local_forward,
+        remote_forward,
+    }
 }
 
 /// A parsed `-L` local-forward spec: bind a local `bind:lport` and tunnel every
@@ -475,17 +537,34 @@ fn main() -> Result<()> {
         .connect
         .target
         .context("a target ([user@]host[:port]) is required")?;
-    let target = parse_target(&target_str)?;
+    let cfg = config::load()?;
+    let raw = parse_target(&target_str)?;
+    let resolved = resolve_target(raw, &cfg);
+
+    // CLI `-L`/`-R` append to the block's lists (both apply; ssh semantics).
+    let mut local_forward = resolved.local_forward;
+    let mut remote_forward = resolved.remote_forward;
+    local_forward.extend(args.connect.local_forward);
+    remote_forward.extend(args.connect.remote_forward);
+
+    // Identity chain: `-i` flag → block identity → `[defaults]` identity → none.
+    let identity = match args.connect.identity {
+        Some(p) => Some(p),
+        None => resolved
+            .identity
+            .map(|s| config::expand_tilde(&s))
+            .transpose()?,
+    };
 
     let code = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?
         .block_on(run(
-            target,
-            args.connect.identity,
+            resolved.target,
+            identity,
             args.connect.command,
-            args.connect.local_forward,
-            args.connect.remote_forward,
+            local_forward,
+            remote_forward,
         ))?;
     std::process::exit(code);
 }
@@ -1067,9 +1146,16 @@ mod tests {
         );
     }
 
+    /// Parse `s`, then resolve against an empty config — with a default config
+    /// the observable `Target` must be identical to the pre-config-file behavior
+    /// (the regression gate for the `RawTarget` refactor).
+    fn resolved_target(s: &str) -> Target {
+        resolve_target(parse_target(s).unwrap(), &config::ClientConfig::default()).target
+    }
+
     #[test]
     fn parses_full_target() {
-        let t = parse_target("alice@example.com:8443/secret").unwrap();
+        let t = resolved_target("alice@example.com:8443/secret");
         assert_eq!(
             t,
             Target {
@@ -1083,7 +1169,7 @@ mod tests {
 
     #[test]
     fn defaults_port_and_path() {
-        let t = parse_target("host").unwrap();
+        let t = resolved_target("host");
         assert_eq!(t.host, "host");
         assert_eq!(t.port, 4433);
         assert_eq!(t.path, quish_proto::DEFAULT_PATH);
@@ -1096,7 +1182,7 @@ mod tests {
 
     #[test]
     fn parses_bracketed_ipv6() {
-        let t = parse_target("alice@[2001:db8::1]:22/x").unwrap();
+        let t = resolved_target("alice@[2001:db8::1]:22/x");
         assert_eq!(t.user, "alice");
         assert_eq!(t.host, "2001:db8::1");
         assert_eq!(t.port, 22);
@@ -1105,14 +1191,14 @@ mod tests {
 
     #[test]
     fn bracketed_ipv6_default_port() {
-        let t = parse_target("[::1]").unwrap();
+        let t = resolved_target("[::1]");
         assert_eq!(t.host, "::1");
         assert_eq!(t.port, 4433);
     }
 
     #[test]
     fn bare_ipv6_defaults_port() {
-        let t = parse_target("::1").unwrap();
+        let t = resolved_target("::1");
         assert_eq!(t.host, "::1");
         assert_eq!(t.port, 4433);
     }
