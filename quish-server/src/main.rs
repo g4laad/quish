@@ -178,6 +178,8 @@ fn main() -> anyhow::Result<()> {
             args.deny_users
         },
     };
+    // OIDC is config-file only this slice (no CLI flags); resolve its defaults now.
+    let oidc = file.oidc.map(config::OidcConfig::into_backend);
 
     if let Some(dev_user) = args.dev_insecure_user {
         return run_dev(
@@ -189,6 +191,7 @@ fn main() -> anyhow::Result<()> {
             allow_forward,
             allow_remote_forward,
             policy,
+            oidc,
         );
     }
     monitor::run(monitor::Config {
@@ -209,6 +212,7 @@ fn main() -> anyhow::Result<()> {
         no_seccomp,
         totp,
         policy,
+        oidc,
     })
 }
 
@@ -223,6 +227,7 @@ fn run_dev(
     allow_forward: bool,
     allow_remote_forward: bool,
     policy: quish_auth::UserPolicy,
+    oidc: Option<quish_auth::oidc::OidcConfig>,
 ) -> anyhow::Result<()> {
     // With a dev TOTP secret, wrap the dev password backend so every password
     // login must clear a second factor (always-challenge). One vec entry either
@@ -238,10 +243,13 @@ fn run_dev(
         }
         None => Box::new(DevInsecureBackend::new(dev_user)),
     };
-    let backends: Vec<Box<dyn AuthBackend>> = vec![
+    let mut backends: Vec<Box<dyn AuthBackend>> = vec![
         password,
         Box::new(PubkeyBackend::new(authorized_keys_path()?)),
     ];
+    if let Some(oidc) = oidc {
+        backends.push(Box::new(quish_auth::oidc::OidcBackend::new(oidc)));
+    }
     let registry = Arc::new(Registry::new(backends, FAIL_DELAY, policy));
     let backend = Arc::new(transport::Backend::Dev {
         registry,

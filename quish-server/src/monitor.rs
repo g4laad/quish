@@ -40,6 +40,7 @@ pub struct Config {
     pub no_seccomp: bool,
     pub totp: bool,
     pub policy: quish_auth::UserPolicy,
+    pub oidc: Option<quish_auth::oidc::OidcConfig>,
 }
 
 /// Run the monitor: generate the host key, wire up sockets, launch the worker,
@@ -68,7 +69,7 @@ pub fn run(cfg: Config) -> Result<()> {
     spawn_sign_thread(sign_listener, signing_key, scheme);
 
     // Auth registry (pubkey per-user; PAM when compiled in).
-    let registry = build_registry(cfg.totp, cfg.policy);
+    let registry = build_registry(cfg.totp, cfg.policy, cfg.oidc);
     let exe = std::env::current_exe().context("current_exe")?;
 
     // Everything below needs the reactor (seqpacket listener registers with it).
@@ -190,11 +191,15 @@ fn generate_identity() -> Result<(CertificateDer<'static>, PrivateKeyDer<'static
     Ok((cert_der, key_der, key_bytes))
 }
 
-fn build_registry(totp: bool, policy: quish_auth::UserPolicy) -> Arc<Registry> {
+fn build_registry(
+    totp: bool,
+    policy: quish_auth::UserPolicy,
+    oidc: Option<quish_auth::oidc::OidcConfig>,
+) -> Arc<Registry> {
     let pubkey: Box<dyn AuthBackend> =
         Box::new(PubkeyBackend::with_resolver(Box::new(per_user_keys)));
     #[cfg(feature = "pam")]
-    let backends = {
+    let mut backends = {
         // With TOTP enabled, wrap PAM as the FIRST factor and require a per-user
         // TOTP code as the second (always-challenge — a bogus user is challenged
         // identically). Otherwise PAM stays single-shot. One vec entry either way.
@@ -209,7 +214,7 @@ fn build_registry(totp: bool, policy: quish_auth::UserPolicy) -> Arc<Registry> {
         vec![pubkey, password]
     };
     #[cfg(not(feature = "pam"))]
-    let backends = {
+    let mut backends = {
         if totp {
             warn!(
                 "totp is enabled but this build lacks the `pam` feature; there is \
@@ -218,6 +223,9 @@ fn build_registry(totp: bool, policy: quish_auth::UserPolicy) -> Arc<Registry> {
         }
         vec![pubkey]
     };
+    if let Some(oidc) = oidc {
+        backends.push(Box::new(quish_auth::oidc::OidcBackend::new(oidc)));
+    }
     Arc::new(Registry::new(backends, crate::FAIL_DELAY, policy))
 }
 

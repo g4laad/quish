@@ -371,6 +371,13 @@ fn build_authorization(
     identity: Option<&std::path::Path>,
     binding: &[u8; 32],
 ) -> Result<String> {
+    // An OIDC bearer token supplied by the environment takes precedence over
+    // `-i` (pubkey) and password auth.
+    if let Ok(token) = std::env::var("QUISH_OIDC_TOKEN")
+        && !token.is_empty()
+    {
+        return Ok(quish_auth::bearer_header(&token));
+    }
     match identity {
         Some(path) => {
             let key = std::fs::read(path)

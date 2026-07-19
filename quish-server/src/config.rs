@@ -52,6 +52,11 @@ pub struct FileConfig {
     /// Overridden wholesale by any `--deny-user` CLI flag. Takes effect in both
     /// dev and privsep (daemon) modes.
     pub deny_users: Option<Vec<String>>,
+    /// OIDC bearer auth (experimental). Config-file only — there are no CLI flags
+    /// for it this slice. When present, a validated JWT (a `Bearer` value
+    /// containing `.`) authenticates via a static, operator-provisioned JWKS
+    /// file; see [`OidcConfig`]. Takes effect in both dev and privsep modes.
+    pub oidc: Option<OidcConfig>,
 }
 
 impl FileConfig {
@@ -59,5 +64,40 @@ impl FileConfig {
         let text = std::fs::read_to_string(path)
             .with_context(|| format!("reading config {}", path.display()))?;
         toml::from_str(&text).with_context(|| format!("parsing config {}", path.display()))
+    }
+}
+
+/// The `[oidc]` config table. Converted into [`quish_auth::oidc::OidcConfig`]
+/// via [`OidcConfig::into_backend`], applying the built-in claim/age defaults.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OidcConfig {
+    /// Required `iss` claim value.
+    pub issuer: String,
+    /// Required `aud` claim value.
+    pub audience: String,
+    /// Path to a static JWKS document (JSON), re-read on each attempt.
+    pub jwks_file: PathBuf,
+    /// Claim mapped verbatim to the local username. Defaults to
+    /// `preferred_username`.
+    pub user_claim: Option<String>,
+    /// Max accepted token age (seconds), checked against `iat` when present.
+    /// Defaults to 300.
+    pub max_token_age_secs: Option<u64>,
+}
+
+impl OidcConfig {
+    pub fn into_backend(self) -> quish_auth::oidc::OidcConfig {
+        quish_auth::oidc::OidcConfig {
+            issuer: self.issuer,
+            audience: self.audience,
+            jwks_file: self.jwks_file,
+            user_claim: self
+                .user_claim
+                .unwrap_or_else(|| quish_auth::oidc::DEFAULT_USER_CLAIM.to_string()),
+            max_token_age_secs: self
+                .max_token_age_secs
+                .unwrap_or(quish_auth::oidc::DEFAULT_MAX_TOKEN_AGE_SECS),
+        }
     }
 }
