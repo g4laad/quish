@@ -63,7 +63,10 @@ impl JwtVerifier for EdVerifier {
     }
 }
 
-fn verifier_factory(alg: &Algorithm, key: &DecodingKey) -> jsonwebtoken::errors::Result<Box<dyn JwtVerifier>> {
+fn verifier_factory(
+    alg: &Algorithm,
+    key: &DecodingKey,
+) -> jsonwebtoken::errors::Result<Box<dyn JwtVerifier>> {
     if *alg != Algorithm::EdDSA {
         return Err(JwtError::from(ErrorKind::InvalidAlgorithm));
     }
@@ -77,7 +80,10 @@ fn verifier_factory(alg: &Algorithm, key: &DecodingKey) -> jsonwebtoken::errors:
     Ok(Box::new(EdVerifier(vk)))
 }
 
-fn signer_factory(_alg: &Algorithm, _key: &EncodingKey) -> jsonwebtoken::errors::Result<Box<dyn JwtSigner>> {
+fn signer_factory(
+    _alg: &Algorithm,
+    _key: &EncodingKey,
+) -> jsonwebtoken::errors::Result<Box<dyn JwtSigner>> {
     // The server only ever verifies OIDC tokens; signing is never wired.
     Err(JwtError::from(ErrorKind::InvalidAlgorithm))
 }
@@ -155,8 +161,10 @@ impl OidcBackend {
         validation.validate_exp = true;
         validation.validate_nbf = true;
         // `exp`, `iss`, `aud` are mandatory (a token without `exp` is refused).
-        validation.required_spec_claims =
-            ["exp", "iss", "aud"].into_iter().map(str::to_string).collect();
+        validation.required_spec_claims = ["exp", "iss", "aud"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
 
         let data = decode::<serde_json::Value>(token, &key, &validation).ok()?;
         let claims = data.claims;
@@ -237,9 +245,13 @@ mod tests {
             r#"{{"keys":[{{"kty":"OKP","crv":"Ed25519","use":"sig","alg":"EdDSA","kid":"{kid}","x":"{}"}}]}}"#,
             b64url(&pubkey)
         );
+        // Unique per call so a test that rewrites its JWKS (e.g. the garbage-file
+        // case) can't race a sibling reading the same path under parallel runs.
+        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         let dir = std::env::temp_dir().join(format!(
-            "quish-oidc-test-{}-{kid}",
-            std::process::id()
+            "quish-oidc-test-{}-{kid}-{}",
+            std::process::id(),
+            N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
         std::fs::create_dir_all(&dir).unwrap();
         let jwks_path = dir.join("jwks.json");

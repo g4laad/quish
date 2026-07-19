@@ -90,3 +90,7 @@ workspace = true
 
 [features]
 pam = ["quish-auth/pam"]
+
+[dev-dependencies]
+ed25519-dalek = "3"
+serde_json = "1.0.150"

@@ -1033,3 +1033,260 @@ fn cp_honors_host_block_path() {
         landed.display()
     );
 }
+
+// ---- OIDC bearer (plan 027) ------------------------------------------------
+
+/// The fixed issuer/audience/kid the test IdP mints under; the server config
+/// (written by [`oidc_setup`]) must echo them, and every minted claim set too.
+const OIDC_ISS: &str = "https://issuer.example";
+const OIDC_AUD: &str = "quish";
+const OIDC_KID: &str = "k1";
+
+/// base64url without padding, the encoding the OIDC backend (and JWTs) expect.
+fn oidc_b64url(bytes: &[u8]) -> String {
+    use base64::prelude::{BASE64_URL_SAFE_NO_PAD, Engine};
+    BASE64_URL_SAFE_NO_PAD.encode(bytes)
+}
+
+/// Seconds since the Unix epoch, for `iat`/`exp` claims.
+fn oidc_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+}
+
+/// A hand-minted compact EdDSA JWT. Deliberately hand-rolled — no `jsonwebtoken`
+/// signer (the server's custom EdDSA provider deliberately has none): build the
+/// header + claims JSON, base64url each, sign the `header.payload` bytes with
+/// `ed25519-dalek`, then append base64url(sig). Mirrors the minting technique in
+/// `quish-auth/src/oidc.rs`'s test module.
+fn mint_jwt(signing: &ed25519_dalek::SigningKey, kid: &str, claims: &serde_json::Value) -> String {
+    use ed25519_dalek::Signer;
+    let header = serde_json::json!({"alg": "EdDSA", "typ": "JWT", "kid": kid});
+    let h = oidc_b64url(&serde_json::to_vec(&header).unwrap());
+    let p = oidc_b64url(&serde_json::to_vec(claims).unwrap());
+    let signing_input = format!("{h}.{p}");
+    let sig = signing.sign(signing_input.as_bytes());
+    format!("{h}.{p}.{}", oidc_b64url(&sig.to_bytes()))
+}
+
+/// Provision a one-key OKP JWKS file plus a server TOML config carrying a
+/// matching `[oidc]` table, and return `(config_path, signing_key)`. The server
+/// re-reads the JWKS on every attempt, so the file must outlive the daemon — it
+/// lives in a fresh temp dir that persists for the test.
+fn oidc_setup() -> (PathBuf, ed25519_dalek::SigningKey) {
+    let dir = fresh_temp_dir("quishd-oidc");
+    let signing = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+    let pubkey = signing.verifying_key().to_bytes();
+    let jwks = format!(
+        r#"{{"keys":[{{"kty":"OKP","crv":"Ed25519","use":"sig","alg":"EdDSA","kid":"{OIDC_KID}","x":"{}"}}]}}"#,
+        oidc_b64url(&pubkey)
+    );
+    let jwks_path = dir.join("jwks.json");
+    std::fs::write(&jwks_path, jwks).unwrap();
+    let cfg_path = dir.join("server.toml");
+    std::fs::write(
+        &cfg_path,
+        format!(
+            "[oidc]\nissuer = \"{OIDC_ISS}\"\naudience = \"{OIDC_AUD}\"\njwks_file = \"{}\"\n",
+            jwks_path.display()
+        ),
+    )
+    .unwrap();
+    (cfg_path, signing)
+}
+
+/// Like [`run_client`] but supplies `QUISH_OIDC_TOKEN` (the bearer) in place of a
+/// password and returns the elapsed wall time (to assert the anti-enumeration
+/// floor). Mirrors `run_client`'s known-hosts seeding.
+fn run_client_oidc(server: &DevServer, args: &[&str], token: &str) -> (Output, Duration) {
+    let quishd = PathBuf::from(env!("CARGO_BIN_EXE_quishd"));
+    let quish = quishd.with_file_name("quish");
+    assert!(
+        quish.exists(),
+        "quish client binary not found; run `cargo build --workspace` first"
+    );
+    let home = fresh_temp_dir("quish-client-home");
+    let kh_dir = home.join(".config/quish");
+    std::fs::create_dir_all(&kh_dir).unwrap();
+    std::fs::write(
+        kh_dir.join("known_hosts"),
+        format!("{} {}\n", server.addr, server.fingerprint),
+    )
+    .unwrap();
+    let mut cmd = Command::new(&quish);
+    cmd.args(args)
+        .env("HOME", &home)
+        .env("QUISH_OIDC_TOKEN", token);
+    let start = Instant::now();
+    let out = cmd.output().expect("spawn quish client");
+    (out, start.elapsed())
+}
+
+/// A valid bearer token whose `preferred_username` maps to the current OS user
+/// authenticates a login and runs the remote command. The dev server is started
+/// with `--dev-insecure-user $USER` AND `--config <toml>`, proving the `[oidc]`
+/// table is honored in dev mode.
+#[test]
+#[ignore]
+fn oidc_login_succeeds() {
+    let user = std::env::var("USER").expect("USER env set");
+    let (cfg, signing) = oidc_setup();
+    let server = DevServer::start_with_args(&user, &["--config", cfg.to_str().unwrap()]);
+    let target = format!("{user}@{}", server.addr);
+
+    let claims = serde_json::json!({
+        "iss": OIDC_ISS,
+        "aud": OIDC_AUD,
+        "sub": "abc",
+        "preferred_username": user,
+        "iat": oidc_now(),
+        "exp": oidc_now() + 60,
+    });
+    let token = mint_jwt(&signing, OIDC_KID, &claims);
+
+    let (out, _) = run_client_oidc(&server, &[&target, "echo", "hi"], &token);
+    assert!(out.status.success(), "OIDC bearer login failed: {out:?}");
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("hi"),
+        "remote command output missing after OIDC login: {out:?}"
+    );
+}
+
+/// A bad bearer token fails exactly like a bad credential: the same generic
+/// `authentication failed`, never a token-specific reason, and the constant-time
+/// floor still applies. Both an EXPIRED token and a WRONG-AUDIENCE token are
+/// checked — the two most likely to tempt a distinguishable error. Mirrors
+/// `totp_wrong_code_fails_uniformly_and_is_floored`.
+#[test]
+#[ignore]
+fn oidc_bad_token_fails_uniformly() {
+    let user = std::env::var("USER").expect("USER env set");
+    let (cfg, signing) = oidc_setup();
+    let server = DevServer::start_with_args(&user, &["--config", cfg.to_str().unwrap()]);
+    let target = format!("{user}@{}", server.addr);
+
+    // Baseline: a wrong credential (login as a user the dev backend won't accept)
+    // yields the generic failure the bad tokens must match verbatim.
+    let (baseline, _) = run_client_2fa(
+        &server,
+        &[&format!("ghost@{}", server.addr), "echo", "x"],
+        "pw",
+        None,
+    );
+    assert!(!baseline.status.success());
+    let baseline_err = String::from_utf8_lossy(&baseline.stderr).trim().to_string();
+    assert!(
+        baseline_err.contains("authentication failed"),
+        "baseline wrong-credential error unexpected: {baseline_err}"
+    );
+
+    let expired = mint_jwt(
+        &signing,
+        OIDC_KID,
+        &serde_json::json!({
+            "iss": OIDC_ISS,
+            "aud": OIDC_AUD,
+            "sub": "abc",
+            "preferred_username": user,
+            "iat": oidc_now() - 7200,
+            "exp": oidc_now() - 3600,
+        }),
+    );
+    let wrong_aud = mint_jwt(
+        &signing,
+        OIDC_KID,
+        &serde_json::json!({
+            "iss": OIDC_ISS,
+            "aud": "someone-else",
+            "sub": "abc",
+            "preferred_username": user,
+            "iat": oidc_now(),
+            "exp": oidc_now() + 60,
+        }),
+    );
+
+    for (label, token) in [("expired", &expired), ("wrong-audience", &wrong_aud)] {
+        let (out, elapsed) = run_client_oidc(&server, &[&target, "echo", "nope"], token);
+        assert!(!out.status.success(), "{label} token must fail: {out:?}");
+        assert!(
+            !String::from_utf8_lossy(&out.stdout).contains("nope"),
+            "{label}: command output leaked despite failed auth: {out:?}"
+        );
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(
+            err.trim(),
+            baseline_err,
+            "{label}: error differs from the generic wrong-credential failure (leak)"
+        );
+        let lower = err.to_lowercase();
+        assert!(
+            !lower.contains("expired")
+                && !lower.contains("audience")
+                && !lower.contains("issuer")
+                && !lower.contains("jwt")
+                && !lower.contains("token"),
+            "{label}: error leaked the token failure cause: {err}"
+        );
+        assert!(
+            elapsed >= Duration::from_secs(1),
+            "{label}: failure was not floored (elapsed {elapsed:?})"
+        );
+    }
+}
+
+/// Regression: enabling `[oidc]` must not eat pubkey logins. The JWT
+/// dot-discrimination only diverts `Bearer` values containing a `.`; an `-i`
+/// pubkey login against the SAME `[oidc]`-enabled server config still succeeds.
+/// Models `keygen_key_logs_in`, adding `--config`.
+#[test]
+#[ignore]
+fn pubkey_still_works_with_oidc_enabled() {
+    let quishd = PathBuf::from(env!("CARGO_BIN_EXE_quishd"));
+    let quish = quishd.with_file_name("quish");
+    assert!(
+        quish.exists(),
+        "quish client binary not found; run `cargo build --workspace` first"
+    );
+
+    let server_home = fresh_temp_dir("quishd-home");
+    let key_path = server_home.join(".config/quish/id_ed25519");
+
+    let keygen = Command::new(&quish)
+        .args(["keygen", "-o", key_path.to_str().unwrap()])
+        .output()
+        .expect("spawn quish keygen");
+    assert!(keygen.status.success(), "keygen failed: {keygen:?}");
+    let pub_line = String::from_utf8_lossy(&keygen.stdout)
+        .lines()
+        .next()
+        .expect("keygen printed a public line")
+        .to_string();
+
+    let ak = server_home.join(".config/quish/authorized_keys");
+    std::fs::create_dir_all(ak.parent().unwrap()).unwrap();
+    std::fs::write(&ak, format!("{pub_line}\n")).unwrap();
+
+    let (cfg, _signing) = oidc_setup();
+    let server = DevServer::start_full(
+        "testuser",
+        &["--config", cfg.to_str().unwrap()],
+        &server_home,
+    );
+    let target = format!("testuser@{}", server.addr);
+    let output = run_client(
+        &server,
+        &["-i", key_path.to_str().unwrap(), &target, "echo", "hi"],
+        None,
+    );
+
+    assert!(
+        output.status.success(),
+        "pubkey login failed with [oidc] enabled: {output:?}"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("hi"),
+        "unexpected stdout: {output:?}"
+    );
+}

@@ -115,6 +115,45 @@ password, and a nonexistent user all end in the same generic `401`, padded to th
 same constant-time floor (the floor covers both the challenge round and the
 terminal denial), so an attacker cannot tell which — if any — account exists.
 
+### OIDC bearer (experimental)
+
+quish can accept a short-lived OIDC **bearer token** (a compact JWT) in place of a
+password or key. The client sends it from the `QUISH_OIDC_TOKEN` environment
+variable; a `Bearer` value containing a `.` is discriminated as a JWT and routed
+to the OIDC backend (dotless bearers stay pubkey tokens, so this never disturbs
+key logins):
+
+```sh
+QUISH_OIDC_TOKEN="$(get-my-id-token)" quish user@host 'echo hi'
+```
+
+The server validates the token against an operator-provisioned **static JWKS
+file** — there is deliberately no network I/O; the monitor never fetches keys or
+reaches an IdP. Configure it with an `[oidc]` table (config-file only this slice;
+no CLI flags):
+
+```toml
+[oidc]
+issuer = "https://issuer.example"        # required `iss` claim value
+audience = "quish"                       # required `aud` claim value
+jwks_file = "/etc/quish/jwks.json"       # static JWKS, re-read every attempt
+# user_claim = "preferred_username"      # claim mapped to the local user (default)
+# max_token_age_secs = 300               # reject tokens older than this by `iat`
+```
+
+A validated token maps the `user_claim` (default `preferred_username`) verbatim to
+the local login user. Every failure — bad signature, wrong `iss`/`aud`, expired,
+stale `iat`, unknown user — returns the same generic, constant-time-floored `401`
+as any other bad credential.
+
+**This slice is EdDSA-only** (Ed25519 / OKP keys); RS256 is a recorded follow-up.
+
+**Replay caveat:** an OIDC token is not channel-bound; keep lifetimes short. A
+captured token is replayable until it expires, so mint narrow, short-lived tokens
+and prefer a small `max_token_age_secs`. Pair OIDC with `allow_users` (see
+[Hardening](#hardening)) so an entire IdP tenant cannot log in by default — scope
+logins to the accounts you actually intend to grant.
+
 ### Root logins
 
 Root is a first-class login: shell, exec, upload, download, and both auth

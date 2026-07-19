@@ -66,3 +66,19 @@ max_auth_fails = 6
 # by the repeatable `--allow-user` / `--deny-user` CLI flags. Both modes.
 # allow_users = []
 # deny_users = []
+
+# OIDC bearer auth (experimental). Accept a short-lived JWT (a `Bearer` value
+# containing a `.`, sent by the client via QUISH_OIDC_TOKEN) validated against a
+# static, operator-provisioned JWKS file — NO network I/O, the monitor never
+# reaches an IdP. A validated token maps `user_claim` verbatim to the local user;
+# every failure is the same floored 401 as a bad credential. EdDSA-only this
+# slice (RS256 is a follow-up). Config-file only (no CLI flags). Both modes.
+# Tokens are not channel-bound: keep lifetimes short and pair with `allow_users`
+# above so a whole IdP tenant can't log in by default. Uncomment the table to
+# enable; issuer/audience/jwks_file are required.
+# [oidc]
+# issuer = "https://issuer.example"        # required `iss` claim value
+# audience = "quish"                       # required `aud` claim value
+# jwks_file = "/etc/quish/jwks.json"       # static JWKS document, re-read per attempt
+# user_claim = "preferred_username"        # claim mapped to the local user (default)
+# max_token_age_secs = 300                 # reject tokens older than this by `iat` (default 300)
