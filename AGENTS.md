@@ -7,8 +7,6 @@ format — no interop with the reference ssh3 implementation.
 
 Linux only, both sides. Cargo workspace, edition 2024.
 
-Full design + milestones: `~/.claude/plans/plan-a-new-project-gentle-charm.md`.
-
 ## Hard invariants (do not violate)
 
 - **`unsafe_code = "deny"` workspace-wide.** Zero `unsafe` in our crates. PAM's C API
